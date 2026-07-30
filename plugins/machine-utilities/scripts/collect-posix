@@ -106,29 +106,45 @@ sha256_stream() {
 }
 
 file_mode() {
-  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf unknown
+  value=$(stat -f %Lp "$1" 2>/dev/null) ||
+    value=$(stat -c %a "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
 }
 
 file_owner() {
-  stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf unknown
+  value=$(stat -f %Su "$1" 2>/dev/null) ||
+    value=$(stat -c %U "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
 }
 
 file_size() {
-  stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || printf 0
+  value=$(stat -f %z "$1" 2>/dev/null) ||
+    value=$(stat -c %s "$1" 2>/dev/null) ||
+    value=0
+  printf '%s\n' "$value"
 }
 
 file_mtime() {
-  stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null ||
-    stat -c %y "$1" 2>/dev/null | awk '{print $1"T"$2"Z"}' || printf unknown
+  value=$(stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null) || {
+    raw=$(stat -c %y "$1" 2>/dev/null) || raw=
+    if [ -n "$raw" ]; then
+      value=$(printf '%s\n' "$raw" | awk '{print $1"T"$2"Z"}')
+    else
+      value=unknown
+    fi
+  }
+  printf '%s\n' "$value"
 }
 
 directory_birth_time() {
-  value=$(stat -f %SB -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null || true)
+  value=$(stat -f %SB -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null) || value=
   if [ -n "$value" ]; then
     printf '%s\n' "$value"
     return
   fi
-  epoch=$(stat -c %W "$1" 2>/dev/null || printf 0)
+  epoch=$(stat -c %W "$1" 2>/dev/null) || epoch=0
   case $epoch in
     ''|0|-1|*[!0-9]*) return ;;
   esac

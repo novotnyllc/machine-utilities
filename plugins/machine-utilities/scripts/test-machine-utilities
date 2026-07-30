@@ -511,6 +511,21 @@ fi
 if [ "${1:-}" = -c ] && [ "${2:-}" = %a ]; then
   exec "$REAL_STAT" -f %Lp "$3" 2>/dev/null || exec "$REAL_STAT" -c %a "$3"
 fi
+if [ "${1:-}" = -c ] && [ "${2:-}" = %s ]; then
+  exec "$REAL_STAT" -f %z "$3" 2>/dev/null || exec "$REAL_STAT" -c %s "$3"
+fi
+if [ "${1:-}" = -c ] && [ "${2:-}" = %y ]; then
+  printf '2026-01-01 00:00:00.000000000 +0000\n'
+  exit
+fi
+if [ "${1:-}" = -c ] && [ "${2:-}" = %W ]; then
+  printf '0\n'
+  exit
+fi
+if [ "${1:-}" = -f ]; then
+  printf '  File: fake GNU stat filesystem report\n'
+  exit 1
+fi
 exec "$REAL_STAT" "$@"
 SH
 chmod +x "$tmp/gnu-stat-bin/stat"
@@ -518,6 +533,9 @@ REAL_STAT="$real_stat" PATH="$tmp/gnu-stat-bin:$PATH" \
   "$cli" executor-status "$tmp/gnu-stat-executor.json"
 [ "$(jq -r '.verified' "$tmp/gnu-stat-executor.json")" = true ] ||
   fail "executor status captured failed GNU stat output as the file owner"
+REAL_STAT="$real_stat" PATH="$tmp/gnu-stat-bin:$PATH" \
+  "$cli" collect --target test-host --section auth --output "$tmp/gnu-stat-auth.jsonl"
+"$cli" validate "$tmp/gnu-stat-auth.jsonl"
 jq '.files[0].sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
   "$tmp/executor.json" >"$tmp/stale-executor.json"
 if "$cli" verify-executor "$tmp/stale-executor.json" >/dev/null 2>&1; then
