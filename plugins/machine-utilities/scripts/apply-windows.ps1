@@ -25,13 +25,6 @@ $PluginRoot = Split-Path -Parent $PSScriptRoot
 $CollectScript = Join-Path $PSScriptRoot "collect-windows.ps1"
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw "Windows apply requires PowerShell 7 or newer" }
 
-trap {
-    if ($env:MACHINE_UTILITIES_SELFTEST_TRACE -eq "1") {
-        [Console]::Error.WriteLine("machine-utilities self-test stack: $($_.ScriptStackTrace)")
-    }
-    throw $_
-}
-
 function Assert-RegularFile([string]$Path, [string]$Label, [long]$MaximumBytes = 10485760) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Label is not a regular file" }
     $Item = Get-Item -LiteralPath $Path -Force
@@ -94,6 +87,7 @@ function Test-BoundedStrings([object]$Value) {
     if ($Value -is [string]) {
         return $Value.Length -le 8192 -and $Value -notmatch "[\x00-\x1f\x7f-\x9f]"
     }
+    if ($Value -is [ValueType]) { return $true }
     if ($Value -is [Collections.IDictionary]) {
         foreach ($Key in $Value.Keys) {
             if (-not (Test-BoundedStrings $Key) -or -not (Test-BoundedStrings $Value[$Key])) { return $false }
@@ -809,6 +803,9 @@ if ($SelfTest) {
                 throw "Control-string self-test failed"
             }
         }
+        if (-not (Test-BoundedStrings ([DateTime]::UtcNow))) {
+            throw "JSON scalar self-test failed"
+        }
 
         $Operation = [pscustomobject]@{
             type = "package-upgrade"
@@ -1104,10 +1101,8 @@ if ($SelfTest) {
             )
             $FixturePlanFileDigest = Get-FileSha256 $FixturePlanPath
             $PriorNativePreference = $PSNativeCommandUseErrorActionPreference
-            $PriorSelfTestTrace = $env:MACHINE_UTILITIES_SELFTEST_TRACE
             try {
                 $PSNativeCommandUseErrorActionPreference = $false
-                $env:MACHINE_UTILITIES_SELFTEST_TRACE = "1"
                 $FixtureApplyOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File $PSCommandPath `
                     -ConfigPath $FixtureConfigPath `
                     -PlanPath $FixturePlanPath `
@@ -1120,7 +1115,6 @@ if ($SelfTest) {
                 $FixtureApplyExitCode = $LASTEXITCODE
             } finally {
                 $PSNativeCommandUseErrorActionPreference = $PriorNativePreference
-                $env:MACHINE_UTILITIES_SELFTEST_TRACE = $PriorSelfTestTrace
             }
             if ($FixtureApplyExitCode -ne 70 -or
                 -not (Test-Path -LiteralPath $FixtureApplyResultPath -PathType Leaf)) {

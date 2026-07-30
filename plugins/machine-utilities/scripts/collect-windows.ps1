@@ -189,6 +189,7 @@ function Test-BoundedStrings([object]$Value) {
     if ($Value -is [string]) {
         return $Value.Length -le 8192 -and $Value -notmatch "[\x00-\x1f\x7f-\x9f]"
     }
+    if ($Value -is [ValueType]) { return $true }
     if ($Value -is [Collections.IDictionary]) {
         foreach ($Key in $Value.Keys) {
             if (-not (Test-BoundedStrings $Key) -or -not (Test-BoundedStrings $Value[$Key])) { return $false }

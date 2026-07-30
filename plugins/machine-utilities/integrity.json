@@ -10,7 +10,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "3765726c74bd7abcc71507fb30e49f31985570e1ee28567ff1bc8e280ae0db7c"
+      "sha256": "746b326fa743f899bd244b4ba8af704d9e7e959787efdadc75f99347c084fb9c"
     },
     {
       "path": "scripts/collect-posix",
@@ -18,7 +18,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "5cbb962866fe8878ade9d9748479820b8539993d3279c825d88a22c4b3bdf29f"
+      "sha256": "b04bc52f4c074f4781123deb9be875afd6a48a18f25b0e7ae954daeb082984ba"
     },
     {
       "path": "scripts/machine-utilities",
