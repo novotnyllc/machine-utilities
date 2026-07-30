@@ -10,7 +10,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "746b326fa743f899bd244b4ba8af704d9e7e959787efdadc75f99347c084fb9c"
+      "sha256": "e17a8e187aebd5927f88ec80cc6fdfe8e2e2a9dfde8af3c7f3e709fb165d81d9"
     },
     {
       "path": "scripts/collect-posix",
