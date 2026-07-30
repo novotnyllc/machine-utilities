@@ -338,10 +338,9 @@ if (Test-Section "packages") {
         } else {
             $Temp = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-winget-" + [Guid]::NewGuid().ToString("N") + ".json")
             try {
-                $WingetOutput = @(& winget export --output $Temp --include-versions --accept-source-agreements --disable-interactivity)
+                $null = & winget export --output $Temp --include-versions --accept-source-agreements --disable-interactivity
                 $WingetSucceeded = $?
                 $WingetExitCode = $LASTEXITCODE
-                $WingetOutput | Out-Null
                 if (-not $WingetSucceeded -or ($null -ne $WingetExitCode -and $WingetExitCode -ne 0)) {
                     throw "winget export failed"
                 }
