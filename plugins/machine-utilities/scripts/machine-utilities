@@ -1,0 +1,845 @@
+#!/usr/bin/env bash
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+schema=machine-utilities.inventory
+schema_version=1
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  machine-utilities validate-config
+  machine-utilities check-mutation-config
+  machine-utilities collect [--target HOST] [--section SECTION]... [--output FILE|-]
+  machine-utilities validate SNAPSHOT.jsonl|-
+  machine-utilities render [--format human|json|jsonl] SNAPSHOT.jsonl|-
+  machine-utilities compare LEFT.jsonl RIGHT.jsonl
+  machine-utilities record-codex-readiness SNAPSHOT.jsonl METADATA.json OUTPUT.jsonl
+  machine-utilities seal-plan DRAFT.json SNAPSHOT.jsonl PLAN.json
+  machine-utilities verify-preconditions PLAN.json CURRENT-SNAPSHOT.jsonl
+EOF
+  exit 64
+}
+
+config_path() {
+  if [ -n "${MACHINE_UTILITIES_CONFIG:-}" ]; then
+    printf '%s\n' "$MACHINE_UTILITIES_CONFIG"
+  else
+    printf '%s/machine-utilities/config.json\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+  fi
+}
+
+require_jq() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'machine-utilities: jq is required; inventory unavailable\n' >&2
+    exit 69
+  fi
+}
+
+validate_config_file() {
+  require_jq
+  path=$(config_path)
+  [ -f "$path" ] || {
+    printf 'machine-utilities: configuration not found: %s\n' "$path" >&2
+    exit 64
+  }
+  jq -e '
+    .version == 1 and
+    (.machines | type == "object") and
+    (.machines | length > 0) and
+    ([.machines | keys[] | test("^[A-Za-z0-9._-]+$")] | all) and
+    ([.machines[] |
+      (.platform | IN("macos","linux","wsl","windows")) and
+      (.transport | IN("local","ssh","codex-remote-control")) and
+      ((.codex_host // null) == null or (.codex_host | type == "string" and length > 0)) and
+      (if .platform == "windows" then .transport == "codex-remote-control" else true end) and
+      (if .transport == "codex-remote-control" then
+        .platform == "windows" and (.codex_host | type == "string" and length > 0)
+      else true end) and
+      (if .transport == "ssh" then
+        (.ssh_alias | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
+      else true end) and
+      ((.groups // []) | type == "array") and
+      ([.groups[]? | type == "string" and test("^[A-Za-z0-9._-]+$")] | all) and
+      ((.package_managers // []) | type == "array") and
+      ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget")] | all) and
+      (if any(.package_managers[]?; . == "winget") then .platform == "windows" else true end) and
+      (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end)
+    ] | all) and
+    ((.projects // {}) | type == "object") and
+    ([.projects // {} | to_entries[] |
+      (.key | test("^[A-Za-z0-9._-]+$")) and
+      (.value.source | type == "string" and length > 0) and
+      (.value.source | contains("?") | not) and
+      (.value.source | test("^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@") | not) and
+      (.value.path | type == "string" and length > 0) and
+      (.value.path | startswith("/") | not) and
+      (.value.path | contains("\\") | not) and
+      (.value.path | test("^[A-Za-z]:") | not) and
+      (.value.path | test("(^|/)\\.\\.(/|$)") | not)
+    ] | all) and
+    ((.capabilities // {}) | type == "object") and
+    ([.capabilities // {} | to_entries[] |
+      (.key | test("^[A-Za-z0-9._-]+$")) and
+      ((.value.groups // []) | type == "array") and
+      ([.value.groups[]? | type == "string" and test("^[A-Za-z0-9._-]+$")] | all) and
+      ([.value | to_entries[] | select(.key == "codex" or .key == "claude") |
+        (.value | type == "object") and
+        (.value.provider | IN("plugin","skills-cli","jsm","manual","plugin-source")) and
+        (.value.source | type == "string" and length > 0) and
+        (.value.source | contains("?") | not) and
+        (.value.source | test("^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@") | not) and
+        (if .value.provider == "plugin" then
+          (.value.source | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and (.value.source != ".") and (.value.source != "..")
+        else true end) and
+        ((.value.skill // null) == null or (.value.skill | type == "string" and test("^[A-Za-z0-9._-]+$"))) and
+        ((.value.name // null) == null or (.value.name | type == "string" and test("^[A-Za-z0-9._-]+$")))
+      ] | all) and
+      ([.value | keys[] | select(. == "codex" or . == "claude")] | length > 0)
+    ] | all) and
+    ((.skill_roots // []) | type == "array") and
+    ((.skill_roots // [] | map(.id) | unique | length) == (.skill_roots // [] | length)) and
+    ([.skill_roots[]? |
+      (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+      (.path | type == "string" and length > 0) and
+      ((.manager // "manual") | IN("manual","mixed","skills-cli","jsm","plugin-source")) and
+      ((.agents // []) | type == "array") and
+      ([.agents[]? | IN("codex","claude")] | all) and
+      ((.groups // []) | type == "array")
+    ] | all) and
+    ((.agent_artifacts // []) | type == "array") and
+    ((.agent_artifacts // [] | map(.id) | unique | length) == (.agent_artifacts // [] | length)) and
+    ([.agent_artifacts[]? |
+      (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+      (.path | type == "string" and length > 0) and
+      (.kind | IN("agent-definition","instruction","config")) and
+      ((.agents // []) | type == "array") and
+      ([.agents[]? | IN("codex","claude")] | all) and
+      ((.groups // []) | type == "array") and
+      ([.groups[]? | type == "string" and test("^[A-Za-z0-9._-]+$")] | all)
+    ] | all) and
+    ((.auth_artifacts // {}) | type == "object") and
+    ([.auth_artifacts // {} | to_entries[] |
+      (.key | test("^[A-Za-z0-9._-]+$")) and
+      (.value.path | type == "string" and length > 0) and
+      ((.value.paths // {}) | type == "object") and
+      ([.value.paths // {} | to_entries[] |
+        (.key | test("^[A-Za-z0-9._-]+$")) and (.value | type == "string" and length > 0)
+      ] | all) and
+      ((.value.strategy // "ignore") | IN("chezmoi","encrypted-install","reauth","ignore")) and
+      ((.value.portability // "per-machine") | IN(
+        "declarative","secret-reference","portable-session","native-store","per-machine","regenerable-cache"
+      )) and
+      ((.value.verify // []) | type == "array") and
+      ((.value.verify // []) | length <= 32) and
+      (if ((.value.verify // []) | length) > 0 then
+        (.value.verify[0] | type == "string" and test("^[A-Za-z0-9._+-]+$")) and
+        ([.value.verify[] | type == "string"] | all)
+      else true end)
+    ] | all) and
+    ([.. | strings | length <= 8192] | all)
+  ' "$path" >/dev/null || {
+    printf 'machine-utilities: invalid version 1 configuration: %s\n' "$path" >&2
+    exit 64
+  }
+}
+
+file_mode() {
+  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf unknown
+}
+
+file_owner() {
+  stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf unknown
+}
+
+check_private_owned_file() {
+  path=$1
+  label=$2
+  [ -f "$path" ] && [ ! -L "$path" ] || {
+    printf 'machine-utilities: %s must be a regular non-symlink file\n' "$label" >&2
+    exit 64
+  }
+  [ "$(file_owner "$path")" = "$(id -un)" ] || {
+    printf 'machine-utilities: %s is not owned by the current user\n' "$label" >&2
+    exit 64
+  }
+  mode=$(file_mode "$path")
+  permissions=$(printf '%s' "$mode" | sed 's/.*\(...\)$/\1/')
+  group=$(printf '%s' "$permissions" | cut -c 2)
+  world=$(printf '%s' "$permissions" | cut -c 3)
+  case $group$world in
+    *2*|*3*|*6*|*7*)
+      printf 'machine-utilities: %s is group/world writable\n' "$label" >&2
+      exit 64
+      ;;
+  esac
+}
+
+check_mutation_config() {
+  validate_config_file
+  check_private_owned_file "$(config_path)" "mutation configuration"
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print tolower($NF)}'
+  fi
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 | awk '{print tolower($NF)}'
+  fi
+}
+
+sanitize_remote() {
+  sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#^[^/@]+@([^:]+:.*)$#\1#; s#[?].*$##'
+}
+
+safe_output() {
+  source_file=$1
+  destination=$2
+  if [ "$destination" = - ]; then
+    cat "$source_file"
+    return
+  fi
+  [ ! -L "$destination" ] || {
+    printf 'machine-utilities: refusing symlink output: %s\n' "$destination" >&2
+    exit 64
+  }
+  directory=$(dirname "$destination")
+  [ -d "$directory" ] || {
+    printf 'machine-utilities: output directory does not exist: %s\n' "$directory" >&2
+    exit 64
+  }
+  temporary=$(mktemp "$directory/.machine-utilities.XXXXXX")
+  (
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    chmod 600 "$temporary"
+    cp "$source_file" "$temporary"
+    mv -f "$temporary" "$destination"
+    trap - EXIT HUP INT TERM
+  )
+}
+
+make_error_record_without_jq() {
+  printf '%s\n' '{"schema":"machine-utilities.inventory","schema_version":1,"snapshot_id":"unavailable","host_id":"unknown","kind":"error","id":"prerequisite:jq","observed_at":null,"status":"unavailable","confidence":"high","data":{},"evidence":[],"errors":[{"code":"jq_missing","severity":"error","retryable":false,"message":"jq is required on the selected POSIX host"}]}'
+}
+
+collect_command() {
+  target=
+  sections=
+  output=-
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --target) [ $# -ge 2 ] || usage; target=$2; shift 2 ;;
+      --section)
+        [ $# -ge 2 ] || usage
+        case $2 in
+          all|host|packages|agents|auth|projects|startup|chezmoi) ;;
+          *) printf 'machine-utilities: unsupported section: %s\n' "$2" >&2; exit 64 ;;
+        esac
+        if [ -n "$sections" ]; then sections="$sections,$2"; else sections=$2; fi
+        shift 2
+        ;;
+      --output) [ $# -ge 2 ] || usage; output=$2; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [ -n "$sections" ] || sections=all
+
+  if ! command -v jq >/dev/null 2>&1; then
+    make_error_record_without_jq
+    return 2
+  fi
+  validate_config_file
+  config=$(config_path)
+  check_private_owned_file "$config" "collection configuration"
+  if [ -z "$target" ]; then
+    target=$(jq -r '.machines | to_entries[] | select(.value.transport == "local") | .key' "$config" | head -1)
+  fi
+  if [ -z "$target" ] || ! jq -e --arg host "$target" '.machines[$host] != null' "$config" >/dev/null; then
+    printf 'machine-utilities: unknown target: %s\n' "${target:-<none>}" >&2
+    exit 64
+  fi
+
+  transport=$(jq -r --arg host "$target" '.machines[$host].transport' "$config")
+  observed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  snapshot_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
+  config_digest=$(sha256_file "$config")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  records="$tmp/records.jsonl"
+  jq -cn \
+    --arg schema "$schema" --argjson schema_version "$schema_version" \
+    --arg snapshot_id "$snapshot_id" --arg host_id "$target" \
+    --arg observed_at "$observed" --arg config_digest "$config_digest" \
+    --arg sections "$sections" \
+    '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"snapshot",id:"snapshot",observed_at:$observed_at,status:"present",confidence:"high",data:{configuration_digest:{algorithm:"sha256",value:$config_digest,scope:"raw-bytes"},sections:($sections|split(","))},evidence:[],errors:[]}' \
+    >"$records"
+
+  rc=0
+  operation_status=completed
+  operation_envelope_status=present
+  case $transport in
+    local)
+      MACHINE_UTILITIES_OBSERVED_AT="$observed" "$script_dir/collect-posix" "$config" "$target" "$snapshot_id" "$sections" >>"$records" || {
+        rc=2
+        operation_status=partial
+        operation_envelope_status=partial
+      }
+      ;;
+    ssh)
+      alias=$(jq -r --arg host "$target" '.machines[$host].ssh_alias // empty' "$config")
+      [ -n "$alias" ] || {
+        printf 'machine-utilities: ssh target %s has no ssh_alias\n' "$target" >&2
+        exit 64
+      }
+      remote_dir=$(ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none "$alias" \
+        'umask 077; mktemp -d "${TMPDIR:-/tmp}/machine-utilities.XXXXXX"') || {
+          rc=2
+          operation_status=partial
+          operation_envelope_status=partial
+        }
+      if [ "$rc" -ne 0 ] || [ -z "${remote_dir:-}" ]; then
+        jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
+          --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
+          '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"transport:ssh",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"ssh"},evidence:[],errors:[{code:"ssh_unreachable",severity:"error",retryable:true,message:"SSH target did not create a remote workspace"}]}' >>"$records"
+      else
+        printf '%s\n' "$remote_dir" |
+          LC_ALL=C grep -Eq '^(/private)?/tmp/machine-utilities\.[A-Za-z0-9]{6,64}$' || {
+            printf 'machine-utilities: unsafe remote temporary path\n' >&2
+            exit 70
+          }
+        jq --arg host "$target" --arg sections "$sections" '
+          ($sections | split(",")) as $requested |
+          def wanted($name): (($requested | index("all")) != null or ($requested | index($name)) != null);
+          {
+            version,
+            machines:{($host):.machines[$host]},
+            projects:(if wanted("projects") then (.projects // {}) else {} end),
+            capabilities:(if wanted("agents") then (.capabilities // {}) else {} end),
+            skill_roots:(if wanted("agents") then (.skill_roots // []) else [] end),
+            agent_artifacts:(if wanted("agents") then (.agent_artifacts // []) else [] end),
+            auth_artifacts:(if wanted("auth") then
+              ((.auth_artifacts // {}) | map_values(del(.secret_ref)))
+            else {} end)
+          }' \
+          "$config" >"$tmp/config.json"
+        chmod 600 "$tmp/config.json"
+        scp -q -o BatchMode=yes "$script_dir/collect-posix" "$tmp/config.json" "$alias:$remote_dir/" || {
+            rc=2
+            operation_status=partial
+            operation_envelope_status=partial
+          }
+        if [ "$rc" -eq 0 ]; then
+          ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none "$alias" \
+            "'$remote_dir/collect-posix' '$remote_dir/config.json' '$target' '$snapshot_id' '$sections'" >>"$records" || {
+              rc=2
+              operation_status=partial
+              operation_envelope_status=partial
+            }
+        fi
+        ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none "$alias" "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+      fi
+      ;;
+    codex-remote-control)
+      error=$(jq -cn '[{code:"codex_task_required",severity:"warning",retryable:true,message:"Use the fleet skill to create a visible task on the saved Codex Desktop project"}]')
+      jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
+        --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
+        --argjson errors "$error" \
+        '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"transport:codex-remote-control",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"codex-remote-control"},evidence:[],errors:$errors}' >>"$records"
+      rc=2
+      operation_status=blocked
+      operation_envelope_status=unavailable
+      ;;
+    *)
+      printf 'machine-utilities: transport not supported by this command: %s\n' "$transport" >&2
+      exit 69
+      ;;
+  esac
+
+  if [ "$rc" -eq 0 ] &&
+    jq -e 'select(.status == "partial" or .status == "unavailable" or .status == "error")' "$records" >/dev/null; then
+    rc=2
+    operation_status=partial
+    operation_envelope_status=partial
+  fi
+
+  jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
+    --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
+    --arg transport "$transport" --arg sections "$sections" \
+    --arg status "$operation_envelope_status" --arg operation_status "$operation_status" \
+    '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"operation",id:"collect",observed_at:$observed_at,status:$status,confidence:"high",data:{run_id:$snapshot_id,host_id:$host_id,scope:($sections|split(",")),phase:"collect",operation_status:$operation_status,transport:$transport,task_id:null,correlation_id:null},evidence:[],errors:[]}' \
+    >>"$records"
+
+  jq -sc 'sort_by(.host_id,.kind,.id)[]' "$records" >"$tmp/sorted.jsonl"
+  validate_file "$tmp/sorted.jsonl"
+  safe_output "$tmp/sorted.jsonl" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+validate_file() {
+  input=$1
+  require_jq
+  [ -f "$input" ] || { printf 'machine-utilities: snapshot not found: %s\n' "$input" >&2; exit 64; }
+  LC_ALL=C awk 'length($0) > 65536 { exit 1 }' "$input" || {
+    printf 'machine-utilities: record exceeds 65536 bytes\n' >&2
+    exit 70
+  }
+  jq -e -s --arg schema "$schema" --argjson version "$schema_version" '
+    length > 0 and
+    (map(.snapshot_id) | unique | length == 1) and
+    ((map([.host_id,.kind,.id] | @json) | unique | length) == length) and
+    (map(
+      type == "object" and
+      .schema == $schema and
+      .schema_version == $version and
+      (.snapshot_id | type == "string" and length > 0) and
+      (.host_id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+      (.kind | type == "string" and length > 0) and
+      (.id | type == "string" and length > 0) and
+      (.status | IN("present","absent","partial","unavailable","error")) and
+      (.confidence | IN("high","medium","low","unknown")) and
+      (.data | type == "object") and
+      (.evidence | type == "array") and
+      (.errors | type == "array") and
+      (if .kind == "operation" then
+        (.data.run_id | type == "string" and length > 0) and
+        (.data.host_id == .host_id) and
+        (.data.scope | type == "array") and
+        (.data.phase | type == "string" and length > 0) and
+        (.data.operation_status | IN("queued","running","partial","blocked","failed","completed")) and
+        (.data.transport | type == "string" and length > 0)
+      else true end) and
+      ([.. | strings | length <= 8192] | all)
+    ) | all)
+  ' "$input" >/dev/null
+}
+
+materialize_input() {
+  requested_input=$1
+  input_tmp=
+  if [ "$requested_input" = - ]; then
+    input_tmp=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-input.XXXXXX")
+    trap 'rm -f "$input_tmp"' EXIT HUP INT TERM
+    cat >"$input_tmp"
+    resolved_input=$input_tmp
+  else
+    resolved_input=$requested_input
+  fi
+}
+
+cleanup_input() {
+  if [ -n "${input_tmp:-}" ]; then
+    rm -f "$input_tmp"
+    input_tmp=
+    trap - EXIT HUP INT TERM
+  fi
+}
+
+validate_stream() {
+  materialize_input "$1"
+  validate_file "$resolved_input"
+  cleanup_input
+}
+
+render_command() {
+  format=human
+  input=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --format) [ $# -ge 2 ] || usage; format=$2; shift 2 ;;
+      *) [ -z "$input" ] || usage; input=$1; shift ;;
+    esac
+  done
+  input=${input:--}
+  materialize_input "$input"
+  validate_file "$resolved_input"
+  case $format in
+    jsonl) cat "$resolved_input" ;;
+    json) jq -sc '{schema:"machine-utilities.inventory",schema_version:1,snapshot_id:.[0].snapshot_id,records:.}' "$resolved_input" ;;
+    human)
+      jq -rs '
+        (["HOST","KIND","ID","STATUS","SUMMARY"] | @tsv),
+        (.[] | [
+          .host_id,
+          .kind,
+          .id,
+          .status,
+          (.data.installed_version // .data.version // .data.path // .data.hostname // .data.manager // "")
+        ] | @tsv)
+      ' "$resolved_input"
+      ;;
+    *) usage ;;
+  esac
+  cleanup_input
+}
+
+compare_command() {
+  left=$1
+  right=$2
+  validate_stream "$left"
+  validate_stream "$right"
+  jq -n --slurpfile left "$left" --slurpfile right "$right" '
+    def stable: select(.kind != "operation") | del(.snapshot_id,.observed_at,.data.codex_checked_at);
+    def keyed($rows): reduce ($rows[] | stable) as $r ({}; .[([$r.host_id,$r.kind,$r.id] | @json)] = $r);
+    (keyed($left)) as $l | (keyed($right)) as $r |
+    (($l|keys) + ($r|keys) | unique) |
+    map(select(($l[.] // null) != ($r[.] // null)) | {key:.,left:($l[.]//null),right:($r[.]//null)})
+  '
+}
+
+record_codex_readiness_command() {
+  snapshot=$1
+  metadata=$2
+  output=$3
+  validate_file "$snapshot"
+  [ -f "$metadata" ] && [ ! -L "$metadata" ] || {
+    printf 'machine-utilities: Codex readiness metadata must be a regular non-symlink file\n' >&2
+    exit 64
+  }
+  check_private_owned_file "$metadata" "Codex readiness metadata"
+  metadata_mode=$(file_mode "$metadata")
+  [ "$(printf '%s' "$metadata_mode" | sed 's/.*\(...\)$/\1/')" = 600 ] || {
+    printf 'machine-utilities: Codex readiness metadata must have mode 0600\n' >&2
+    exit 64
+  }
+  jq -e '
+    type == "object" and
+    (.host_id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.project | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.status | IN("available","missing","unreachable")) and
+    (.codex_host | type == "string" and length > 0) and
+    (.native_path | type == "string" and length > 0) and
+    (.expected_source | type == "string" and length > 0) and
+    ((.codex_project_id // null) == null or (.codex_project_id | type == "string" and length > 0)) and
+    ((.task_id // null) == null or (.task_id | type == "string" and length > 0)) and
+    ((.correlation_id // null) == null or (.correlation_id | type == "string" and length > 0)) and
+    (if .status == "available" then (.codex_project_id | type == "string" and length > 0) else true end) and
+    ([.. | strings | length <= 8192] | all)
+  ' "$metadata" >/dev/null || {
+    printf 'machine-utilities: invalid Codex readiness metadata\n' >&2
+    exit 64
+  }
+  project=$(jq -r '.project' "$metadata")
+  jq -e --arg project "$project" 'select(.kind == "project" and .id == $project)' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: snapshot has no configured project record: %s\n' "$project" >&2
+    exit 65
+  }
+  target=$(jq -r 'select(.kind == "snapshot") | .host_id' "$snapshot")
+  config=$(config_path)
+  validate_config_file
+  check_private_owned_file "$config" "collection configuration"
+  snapshot_config_digest=$(jq -r 'select(.kind == "snapshot") | .data.configuration_digest.value' "$snapshot")
+  [ "$snapshot_config_digest" = "$(sha256_file "$config")" ] || {
+    printf 'machine-utilities: snapshot configuration digest does not match the current controller config\n' >&2
+    exit 65
+  }
+  jq -e --arg target "$target" --slurpfile metadata "$metadata" '
+    $metadata[0] as $m |
+    $m.host_id == $target and
+    .machines[$target] != null and
+    (.machines[$target].codex_host // $target) == $m.codex_host
+  ' "$config" >/dev/null || {
+    printf 'machine-utilities: Codex readiness metadata does not match configured host/project identity\n' >&2
+    exit 65
+  }
+  configured_source=$(jq -r --arg project "$project" '.projects[$project].source // empty' "$config" | sanitize_remote)
+  [ -n "$configured_source" ] && [ "$configured_source" = "$(jq -r '.expected_source' "$metadata")" ] || {
+    printf 'machine-utilities: Codex readiness metadata does not match configured project source\n' >&2
+    exit 65
+  }
+  jq -e --arg project "$project" --slurpfile metadata "$metadata" '
+    $metadata[0] as $m |
+    select(.kind == "project" and .id == $project) |
+    .data.path == $m.native_path and .data.expected_source == $m.expected_source
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: Codex readiness metadata does not match the observed native checkout\n' >&2
+    exit 65
+  }
+  checked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-codex-readiness.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -cS --slurpfile metadata "$metadata" --arg checked_at "$checked_at" '
+    $metadata[0] as $m |
+    if .kind == "project" and .id == $m.project then
+      .data += {
+        codex_saved_project_status:$m.status,
+        codex_host:$m.codex_host,
+        codex_host_reachable:($m.status != "unreachable"),
+        codex_project_id:($m.codex_project_id // null),
+        codex_checked_at:$checked_at
+      }
+    elif .kind == "operation" and .id == "collect" then
+      .data.task_id = ($m.task_id // .data.task_id) |
+      .data.correlation_id = ($m.correlation_id // .data.correlation_id)
+    else . end
+  ' "$snapshot" | jq -sc 'sort_by(.host_id,.kind,.id)[]' >"$tmp/enriched.jsonl"
+  validate_file "$tmp/enriched.jsonl"
+  safe_output "$tmp/enriched.jsonl" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+}
+
+snapshot_digest() {
+  snapshot=$1
+  validate_file "$snapshot"
+  jq -cS -s '
+    map(select(.kind != "operation") | del(.snapshot_id,.observed_at,.data.codex_checked_at)) |
+    sort_by(.host_id,.kind,.id)[]' "$snapshot" | sha256_stream
+}
+
+seal_plan_command() {
+  draft=$1
+  snapshot=$2
+  output=$3
+  require_jq
+  [ -f "$draft" ] && [ ! -L "$draft" ] || {
+    printf 'machine-utilities: plan draft must be a regular non-symlink file\n' >&2
+    exit 64
+  }
+  jq -e '
+    type == "object" and
+    (.domain | IN("updates","agents","auth","chezmoi","projects")) and
+    (.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.operations | type == "array" and length > 0) and
+    ([.operations[] |
+      type == "object" and
+      (.type | IN(
+        "package-metadata-refresh","package-upgrade","package-cleanup",
+        "agent-install","agent-update","agent-remove",
+        "auth-reauth","auth-install",
+        "chezmoi-pull","chezmoi-add","chezmoi-apply",
+        "project-clone","project-update"
+      )) and
+      (.kind | IN("package","agent_runtime","plugin","skill","capability","skill_root","agent_artifact","auth_artifact","file","project")) and
+      (.id | type == "string" and length > 0) and
+      (.argv | type == "array" and length > 0 and length <= 64) and
+      ([.argv[] | type == "string" and length > 0] | all)
+    ] | all) and
+    (if .domain == "updates" then
+       [.operations[] | .kind == "package" and (.type | startswith("package-"))] | all
+     elif .domain == "agents" then
+       [.operations[] | (.kind | IN("agent_runtime","plugin","skill","capability","skill_root","agent_artifact")) and (.type | startswith("agent-"))] | all
+     elif .domain == "auth" then
+       [.operations[] | .kind == "auth_artifact" and (.type | startswith("auth-"))] | all
+     elif .domain == "chezmoi" then
+       [.operations[] | .kind == "file" and (.id | startswith("chezmoi:")) and (.type | startswith("chezmoi-"))] | all
+     elif .domain == "projects" then
+       [.operations[] | .kind == "project" and (.type | startswith("project-"))] | all
+     else false end) and
+    ([.. | strings | length <= 8192] | all)
+  ' "$draft" >/dev/null || {
+    printf 'machine-utilities: invalid plan draft\n' >&2
+    exit 64
+  }
+  validate_file "$snapshot"
+  target=$(jq -r '.target' "$draft")
+  domain=$(jq -r '.domain' "$draft")
+  case $domain in
+    updates) required_section=packages ;;
+    agents) required_section=agents ;;
+    auth) required_section=auth ;;
+    chezmoi) required_section=chezmoi ;;
+    projects) required_section=projects ;;
+  esac
+  config=$(config_path)
+  validate_config_file
+  jq -e --arg target "$target" '.machines[$target] != null' "$config" >/dev/null || {
+    printf 'machine-utilities: plan target is not configured: %s\n' "$target" >&2
+    exit 64
+  }
+  jq -e -s --arg target "$target" 'map(.host_id) | unique == [$target]' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: snapshot does not exclusively describe plan target %s\n' "$target" >&2
+    exit 64
+  }
+  jq -e -s --arg section "$required_section" '
+    any(.[]; .kind == "snapshot" and
+      ((.data.sections | index("all")) != null or (.data.sections | index($section)) != null)) and
+    any(.[]; .kind == "operation" and .status == "present" and .data.operation_status == "completed")
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: snapshot does not contain a completed %s inventory\n' "$required_section" >&2
+    exit 65
+  }
+  jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+    [$draft[0].operations[] | ([.kind,.id] | @json)] as $wanted |
+    [$records[] | select(.kind != "snapshot" and .kind != "operation" and
+      (.status == "present" or .status == "absent")) | ([.kind,.id] | @json)] as $observed |
+    ($wanted - $observed) | length == 0
+  ' >/dev/null || {
+    printf 'machine-utilities: plan operations are not covered by usable snapshot records\n' >&2
+    exit 65
+  }
+
+  precondition_digest=$(snapshot_digest "$snapshot")
+  config_digest=$(sha256_file "$config")
+  planning_snapshot_id=$(jq -r 'select(.kind == "snapshot") | .snapshot_id' "$snapshot")
+  planning_observed_at=$(jq -r 'select(.kind == "snapshot") | .observed_at' "$snapshot")
+  created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-plan.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S -n \
+    --slurpfile draft "$draft" \
+    --arg created_at "$created_at" \
+    --arg config_digest "$config_digest" \
+    --arg precondition_digest "$precondition_digest" \
+    --arg required_section "$required_section" \
+    --arg planning_snapshot_id "$planning_snapshot_id" \
+    --arg planning_observed_at "$planning_observed_at" '
+      {
+        schema:"machine-utilities.plan",
+        schema_version:1,
+        created_at:$created_at,
+        domain:$draft[0].domain,
+        target:$draft[0].target,
+        operations:$draft[0].operations,
+        required_section:$required_section,
+        planning_snapshot_id:$planning_snapshot_id,
+        planning_observed_at:$planning_observed_at,
+        configuration_digest:{algorithm:"sha256",value:$config_digest},
+        precondition_digest:{algorithm:"sha256",value:$precondition_digest}
+      }' >"$tmp/base.json"
+  plan_digest=$(jq -cS . "$tmp/base.json" | sha256_stream)
+  plan_id="plan-$(printf '%s' "$plan_digest" | cut -c 1-16)"
+  jq -S --arg plan_id "$plan_id" --arg plan_digest "$plan_digest" \
+    '. + {plan_id:$plan_id,plan_digest:{algorithm:"sha256",value:$plan_digest}}' \
+    "$tmp/base.json" >"$tmp/plan.json"
+  safe_output "$tmp/plan.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+}
+
+verify_preconditions_command() {
+  plan=$1
+  snapshot=$2
+  require_jq
+  check_mutation_config
+  check_private_owned_file "$plan" "apply plan"
+  jq -e '
+    .schema == "machine-utilities.plan" and
+    .schema_version == 1 and
+    (.plan_id | type == "string" and test("^plan-[0-9a-f]{16}$")) and
+    (.domain | IN("updates","agents","auth","chezmoi","projects")) and
+    (.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.operations | type == "array" and length > 0) and
+    ([.operations[] |
+      (.type | IN(
+        "package-metadata-refresh","package-upgrade","package-cleanup",
+        "agent-install","agent-update","agent-remove",
+        "auth-reauth","auth-install",
+        "chezmoi-pull","chezmoi-add","chezmoi-apply",
+        "project-clone","project-update"
+      )) and
+      (.kind | IN("package","agent_runtime","plugin","skill","capability","skill_root","agent_artifact","auth_artifact","file","project")) and
+      (.id | type == "string" and length > 0) and
+      (.argv | type == "array" and length > 0 and length <= 64) and
+      ([.argv[] | type == "string" and length > 0] | all)
+    ] | all) and
+    (if .domain == "updates" then
+       [.operations[] | .kind == "package" and (.type | startswith("package-"))] | all
+     elif .domain == "agents" then
+       [.operations[] | (.kind | IN("agent_runtime","plugin","skill","capability","skill_root","agent_artifact")) and (.type | startswith("agent-"))] | all
+     elif .domain == "auth" then
+       [.operations[] | .kind == "auth_artifact" and (.type | startswith("auth-"))] | all
+     elif .domain == "chezmoi" then
+       [.operations[] | .kind == "file" and (.id | startswith("chezmoi:")) and (.type | startswith("chezmoi-"))] | all
+     elif .domain == "projects" then
+       [.operations[] | .kind == "project" and (.type | startswith("project-"))] | all
+     else false end) and
+    (.required_section | IN("packages","agents","auth","chezmoi","projects")) and
+    (.planning_snapshot_id | type == "string" and length > 0) and
+    (.planning_observed_at | type == "string" and fromdateiso8601 > 0) and
+    (.configuration_digest.algorithm == "sha256") and
+    (.configuration_digest.value | test("^[0-9a-f]{64}$")) and
+    (.precondition_digest.algorithm == "sha256") and
+    (.precondition_digest.value | test("^[0-9a-f]{64}$")) and
+    (.plan_digest.algorithm == "sha256") and
+    (.plan_digest.value | test("^[0-9a-f]{64}$")) and
+    ([.. | strings | length <= 8192] | all)
+  ' "$plan" >/dev/null || {
+    printf 'machine-utilities: invalid apply plan\n' >&2
+    exit 64
+  }
+  expected_plan_digest=$(jq -cS 'del(.plan_id,.plan_digest)' "$plan" | sha256_stream)
+  actual_plan_digest=$(jq -r '.plan_digest.value' "$plan")
+  [ "$expected_plan_digest" = "$actual_plan_digest" ] || {
+    printf 'machine-utilities: apply plan integrity check failed\n' >&2
+    exit 65
+  }
+  expected_plan_id="plan-$(printf '%s' "$actual_plan_digest" | cut -c 1-16)"
+  [ "$(jq -r '.plan_id' "$plan")" = "$expected_plan_id" ] || {
+    printf 'machine-utilities: apply plan ID does not match its digest\n' >&2
+    exit 65
+  }
+  config=$(config_path)
+  [ "$(jq -r '.configuration_digest.value' "$plan")" = "$(sha256_file "$config")" ] || {
+    printf 'machine-utilities: configuration changed after planning; create a new plan\n' >&2
+    exit 65
+  }
+  target=$(jq -r '.target' "$plan")
+  validate_file "$snapshot"
+  jq -e -s --arg target "$target" 'map(.host_id) | unique == [$target]' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: current snapshot does not exclusively describe plan target %s\n' "$target" >&2
+    exit 64
+  }
+  planning_snapshot_id=$(jq -r '.planning_snapshot_id' "$plan")
+  jq -e -s --arg planning_snapshot_id "$planning_snapshot_id" '
+    any(.[]; .kind == "snapshot" and .snapshot_id != $planning_snapshot_id and
+      (.observed_at | fromdateiso8601) as $observed |
+      (now - $observed) >= 0 and (now - $observed) <= 900)
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: apply requires a distinct inventory captured within the last 15 minutes\n' >&2
+    exit 65
+  }
+  required_section=$(jq -r '.required_section' "$plan")
+  jq -e -s --arg section "$required_section" '
+    any(.[]; .kind == "snapshot" and
+      ((.data.sections | index("all")) != null or (.data.sections | index($section)) != null)) and
+    any(.[]; .kind == "operation" and .status == "present" and .data.operation_status == "completed")
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: current snapshot lacks a completed %s inventory\n' "$required_section" >&2
+    exit 65
+  }
+  jq -e -n --slurpfile plan "$plan" --slurpfile records "$snapshot" '
+    [$plan[0].operations[] | ([.kind,.id] | @json)] as $wanted |
+    [$records[] | select(.kind != "snapshot" and .kind != "operation" and
+      (.status == "present" or .status == "absent")) | ([.kind,.id] | @json)] as $observed |
+    ($wanted - $observed) | length == 0
+  ' >/dev/null || {
+    printf 'machine-utilities: current snapshot does not cover every planned operation\n' >&2
+    exit 65
+  }
+  [ "$(jq -r '.precondition_digest.value' "$plan")" = "$(snapshot_digest "$snapshot")" ] || {
+    printf 'machine-utilities: target state changed after planning; create a new plan\n' >&2
+    exit 65
+  }
+  jq -cn --arg plan_id "$expected_plan_id" --arg target "$target" \
+    '{verified:true,plan_id:$plan_id,target:$target}'
+}
+
+command=${1:-}
+[ -n "$command" ] || usage
+shift
+case $command in
+  validate-config) [ $# -eq 0 ] || usage; validate_config_file ;;
+  check-mutation-config) [ $# -eq 0 ] || usage; check_mutation_config ;;
+  collect) collect_command "$@" ;;
+  validate) [ $# -eq 1 ] || usage; validate_stream "$1" ;;
+  render) render_command "$@" ;;
+  compare) [ $# -eq 2 ] || usage; compare_command "$1" "$2" ;;
+  record-codex-readiness) [ $# -eq 3 ] || usage; record_codex_readiness_command "$1" "$2" "$3" ;;
+  seal-plan) [ $# -eq 3 ] || usage; seal_plan_command "$1" "$2" "$3" ;;
+  verify-preconditions) [ $# -eq 2 ] || usage; verify_preconditions_command "$1" "$2" ;;
+  *) usage ;;
+esac

@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "machines": {
+    "local": {
+      "platform": "macos",
+      "transport": "local",
+      "codex_host": "saved-local-host",
+      "groups": ["development"],
+      "package_managers": ["homebrew"],
+      "dev_root": "~/dev"
+    },
+    "windows": {
+      "platform": "windows",
+      "transport": "codex-remote-control",
+      "codex_host": "saved-windows-host",
+      "groups": ["development"],
+      "package_managers": ["winget"],
+      "dev_root": "~/dev"
+    }
+  },
+  "projects": {
+    "example": {
+      "source": "owner/example",
+      "path": "example",
+      "groups": ["development"],
+      "codex": true
+    }
+  },
+  "capabilities": {
+    "last30days": {
+      "groups": ["development"],
+      "codex": {
+        "provider": "skills-cli",
+        "source": "mvanhorn/last30days-skill"
+      },
+      "claude": {
+        "provider": "skills-cli",
+        "source": "mvanhorn/last30days-skill"
+      }
+    },
+    "compound-engineering": {
+      "groups": ["development"],
+      "codex": {
+        "provider": "plugin",
+        "source": "compound-engineering"
+      },
+      "claude": {
+        "provider": "plugin",
+        "source": "compound-engineering"
+      }
+    }
+  },
+  "skill_roots": [
+    {
+      "id": "shared-agents",
+      "path": "~/.agents/skills",
+      "manager": "mixed",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "codex",
+      "path": "~/.codex/skills",
+      "manager": "mixed",
+      "agents": ["codex"],
+      "groups": ["development"]
+    },
+    {
+      "id": "claude",
+      "path": "~/.claude/skills",
+      "manager": "mixed",
+      "agents": ["claude"],
+      "groups": ["development"]
+    }
+  ],
+  "agent_artifacts": [
+    {
+      "id": "codex-instructions",
+      "path": "~/.codex/AGENTS.md",
+      "kind": "instruction",
+      "agents": ["codex"],
+      "groups": ["development"]
+    },
+    {
+      "id": "claude-instructions",
+      "path": "~/.claude/CLAUDE.md",
+      "kind": "instruction",
+      "agents": ["claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "shared-agents",
+      "path": "~/.agents/agents",
+      "kind": "agent-definition",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    }
+  ],
+  "auth_artifacts": {
+    "github-cli": {
+      "path": "~/.config/gh/hosts.yml",
+      "paths": {
+        "windows": "~/AppData/Roaming/GitHub CLI/hosts.yml"
+      },
+      "strategy": "reauth",
+      "portability": "per-machine",
+      "mode": "0600",
+      "verify": ["gh", "auth", "status"]
+    },
+    "codex": {
+      "path": "~/.codex/auth.json",
+      "strategy": "reauth",
+      "portability": "portable-session",
+      "mode": "0600",
+      "verify": ["codex", "login", "status"]
+    },
+    "xurl": {
+      "path": "~/.xurl/auth.yml",
+      "strategy": "encrypted-install",
+      "portability": "secret-reference",
+      "secret_ref": "configure-in-your-secret-manager",
+      "mode": "0600",
+      "verify": ["xurl", "auth", "status"]
+    }
+  },
+  "policy": {
+    "updates": {
+      "cleanup": false,
+      "autoremove": false
+    },
+    "projects": {
+      "update": "ff-only"
+    }
+  }
+}

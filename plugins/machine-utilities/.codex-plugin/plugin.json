@@ -1,0 +1,43 @@
+{
+  "name": "machine-utilities",
+  "version": "0.1.0",
+  "description": "Inventory and reconcile packages, agent tooling, projects, dotfiles, remote Macs, SSH, startup tasks, and portable authentication across mixed-machine fleets.",
+  "author": {
+    "name": "Machine Utilities Contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "claude-code",
+    "fleet",
+    "homebrew",
+    "chezmoi",
+    "macos",
+    "wsl",
+    "windows",
+    "ssh",
+    "skills",
+    "projects"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Machine Utilities",
+    "shortDescription": "Inventory and reconcile machines, agent capabilities, projects, and updates",
+    "longDescription": "Machine Utilities provides configuration-driven fleet inventory and maintenance for Homebrew, APT, winget, chezmoi, Codex, Claude, plugins and standalone skills, project placement and Codex readiness, remote Mac and SSH diagnostics, startup automation, and deliberate credential portability without embedding private machine inventory.",
+    "developerName": "Machine Utilities Contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Inventory packages, skills, plugins, and startup tasks across my fleet.",
+      "Plan package updates across Homebrew, APT, and winget.",
+      "Reconcile Codex, Claude, standalone skills, JSM, and chezmoi.",
+      "Ensure a project is cloned and ready for Codex work on selected hosts.",
+      "Diagnose SSH or Remote Login on a configured Mac."
+    ],
+    "brandColor": "#475569"
+  }
+}

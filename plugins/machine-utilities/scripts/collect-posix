@@ -1,0 +1,841 @@
+#!/usr/bin/env bash
+set -eu
+
+config=${1:?config path required}
+host_id=${2:?host id required}
+snapshot_id=${3:?snapshot id required}
+sections=${4:-all}
+observed_at=${MACHINE_UTILITIES_OBSERVED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+
+has_section() {
+  [ "$sections" = all ] || case ",$sections," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+
+clip() {
+  LC_ALL=C cut -c 1-8192
+}
+
+emit() {
+  kind=$1
+  entity_id=$(printf '%s' "$2" | clip)
+  status=$3
+  confidence=$4
+  data=$5
+  evidence=${6:-[]}
+  errors=${7:-[]}
+  jq -cn \
+    --arg schema machine-utilities.inventory \
+    --argjson schema_version 1 \
+    --arg snapshot_id "$snapshot_id" \
+    --arg host_id "$host_id" \
+    --arg kind "$kind" \
+    --arg id "$entity_id" \
+    --arg observed_at "$observed_at" \
+    --arg status "$status" \
+    --arg confidence "$confidence" \
+    --argjson data "$data" \
+    --argjson evidence "$evidence" \
+    --argjson errors "$errors" \
+    '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:$kind,id:$id,observed_at:$observed_at,status:$status,confidence:$confidence,data:$data,evidence:$evidence,errors:$errors}'
+}
+
+emit_package_lines() {
+  manager=$1
+  method=$2
+  jq -Rcn \
+    --arg schema machine-utilities.inventory \
+    --argjson schema_version 1 \
+    --arg snapshot_id "$snapshot_id" \
+    --arg host_id "$host_id" \
+    --arg observed_at "$observed_at" \
+    --arg manager "$manager" \
+    --arg method "$method" '
+      inputs | split("\t") as $fields |
+      select(($fields | length) >= 2 and $fields[0] != "") |
+      ($fields[0][0:8192]) as $name |
+      ($fields[1][0:8192]) as $version |
+      {
+        schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+        host_id:$host_id,kind:"package",id:(($manager+":"+$name)[0:8192]),
+        observed_at:$observed_at,status:"present",confidence:"high",
+        data:{manager:$manager,name:$name,installed_version:$version},
+        evidence:[{source:"package-manager",method:$method}],errors:[]
+      }'
+}
+
+expand_home() {
+  case $1 in
+    "~") printf '%s\n' "$HOME" ;;
+    \~/*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print tolower($NF)}'
+  fi
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 | awk '{print tolower($NF)}'
+  fi
+}
+
+file_mode() {
+  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf unknown
+}
+
+file_owner() {
+  stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf unknown
+}
+
+file_size() {
+  stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || printf 0
+}
+
+file_mtime() {
+  stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null ||
+    stat -c %y "$1" 2>/dev/null | awk '{print $1"T"$2"Z"}' || printf unknown
+}
+
+directory_birth_time() {
+  value=$(stat -f %SB -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null || true)
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return
+  fi
+  epoch=$(stat -c %W "$1" 2>/dev/null || printf 0)
+  case $epoch in
+    ''|0|-1|*[!0-9]*) return ;;
+  esac
+  date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true
+}
+
+directory_digest() {
+  root=$1
+  # ponytail: newline-bearing file names are unsupported; skill trees use portable names.
+  find "$root" -type f -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort |
+    while IFS= read -r file; do
+      printf '%s\t%s\n' "${file#"$root"/}" "$(sha256_file "$file")"
+    done | sha256_stream
+}
+
+sanitize_remote() {
+  sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#^[^/@]+@([^:]+:.*)$#\1#; s#[?].*$##'
+}
+
+canonical_git_source() {
+  canonical=$(sanitize_remote |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E 's#^[a-z][a-z0-9+.-]*://##; s#^git@##; s#^([^/]+):#\1/#; s#/*$##; s#[.]git$##')
+  case $canonical in
+    */*/*) printf '%s\n' "$canonical" ;;
+    */*) printf 'github.com/%s\n' "$canonical" ;;
+    *) printf '%s\n' "$canonical" ;;
+  esac
+}
+
+run_auth_health() {
+  entry=$1
+  auth_health_status=not-run
+  auth_health_exit=null
+  verify_count=$(printf '%s' "$entry" | jq '.value.verify // [] | length')
+  [ "$verify_count" -gt 0 ] || {
+    auth_health_status=not-configured
+    return
+  }
+  verify_command=$(printf '%s' "$entry" | jq -r '.value.verify[0]')
+  if ! command -v "$verify_command" >/dev/null 2>&1; then
+    auth_health_status=unavailable
+    return
+  fi
+  args_file=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-auth-args.XXXXXX")
+  chmod 600 "$args_file"
+  printf '%s' "$entry" | jq -j '.value.verify[1:][]? | . + "\u0000"' >"$args_file"
+  xargs -0 "$verify_command" <"$args_file" >/dev/null 2>&1 &
+  verify_pid=$!
+  ticks=0
+  while kill -0 "$verify_pid" >/dev/null 2>&1; do
+    if [ "$ticks" -ge 50 ]; then
+      kill "$verify_pid" >/dev/null 2>&1 || true
+      if wait "$verify_pid" >/dev/null 2>&1; then :; fi
+      auth_health_status=timeout
+      auth_health_exit=124
+      rm -f "$args_file"
+      return
+    fi
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  if wait "$verify_pid" >/dev/null 2>&1; then
+    auth_health_status=healthy
+    auth_health_exit=0
+  else
+    auth_health_exit=$?
+    auth_health_status=unhealthy
+  fi
+  rm -f "$args_file"
+}
+
+capability_matches() {
+  match_agent=$1
+  match_provider=$2
+  match_source=$3
+  match_name=$4
+  case $match_provider in
+    plugin)
+      case $match_agent in
+        codex) match_cache="$HOME/.codex/plugins/cache" ;;
+        claude) match_cache="$HOME/.claude/plugins/cache" ;;
+        *) return ;;
+      esac
+      [ -d "$match_cache" ] || return
+      match_plugin=$(basename "$match_source")
+      find "$match_cache" -mindepth 2 -maxdepth 2 -type d -name "$match_plugin" 2>/dev/null |
+        LC_ALL=C sort | while IFS= read -r plugin_dir; do
+          find "$plugin_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort |
+            while IFS= read -r version_dir; do
+              printf 'plugin:%s:%s:%s:%s\n' "$match_agent" \
+                "$(basename "$(dirname "$plugin_dir")")" "$match_plugin" "$(basename "$version_dir")"
+            done
+        done
+      ;;
+    skills-cli)
+      match_lock="$HOME/.agents/.skill-lock.json"
+      [ -f "$match_lock" ] && jq -e '(.skills // .) | type == "object"' "$match_lock" >/dev/null 2>&1 || return
+      jq -r --arg name "$match_name" --arg source "$match_source" '
+        (.skills // .) | to_entries[] |
+        select(.key == $name or .value.source == $source or .value.sourceUrl == $source) |
+        "skills-cli:"+.key' "$match_lock"
+      ;;
+    jsm)
+      [ -n "${jsm_inventory:-}" ] || return
+      printf '%s\n' "$jsm_inventory" | jq -r --arg name "$match_name" --arg source "$match_source" '
+        .skills[]? | select(.name == $name or .name == $source) | "jsm:"+.name'
+      ;;
+    manual|plugin-source)
+      jq -c --arg agent "$match_agent" --argjson host_groups "$capability_host_groups" '
+        (.skill_roots // [])[] |
+        select((.agents // []) | index($agent) != null) |
+        select(
+          (.groups // []) as $groups |
+          ($groups | length) == 0 or
+          any($groups[]; . as $group | $host_groups | index($group) != null)
+        )' "$config" | while IFS= read -r match_root; do
+          match_root_id=$(printf '%s' "$match_root" | jq -r '.id')
+          match_root_path=$(expand_home "$(printf '%s' "$match_root" | jq -r '.path')")
+          [ -f "$match_root_path/$match_name/SKILL.md" ] &&
+            printf 'standalone:%s:%s\n' "$match_root_id" "$match_name"
+        done
+      ;;
+  esac
+}
+
+if has_section host; then
+  hostname_value=$(hostname 2>/dev/null | clip || printf unknown)
+  user_value=$(id -un 2>/dev/null | clip || printf unknown)
+  os_value=$(uname -s 2>/dev/null | clip || printf unknown)
+  kernel_value=$(uname -r 2>/dev/null | clip || printf unknown)
+  arch_value=$(uname -m 2>/dev/null | clip || printf unknown)
+  data=$(jq -cn \
+    --arg configured_name "$host_id" \
+    --arg hostname "$hostname_value" \
+    --arg user "$user_value" \
+    --arg home "$HOME" \
+    --arg os "$os_value" \
+    --arg kernel "$kernel_value" \
+    --arg architecture "$arch_value" \
+    '{configured_name:$configured_name,hostname:$hostname,user:$user,home:$home,os:$os,kernel:$kernel,architecture:$architecture}')
+  emit host "$host_id" present high "$data" '[{"source":"system","method":"uname+hostname"}]'
+fi
+
+if has_section packages; then
+  managers=$(jq -r --arg host "$host_id" '.machines[$host].package_managers[]? // empty' "$config")
+  for manager in $managers; do
+    case $manager in
+      homebrew|linuxbrew)
+        if command -v brew >/dev/null 2>&1; then
+          if brew_packages=$(brew list --versions 2>/dev/null); then
+            printf '%s\n' "$brew_packages" |
+              awk 'NF >= 2 { print $1 "\t" $2 }' |
+              emit_package_lines "$manager" list-installed
+          else
+            emit error "packages:$manager" unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew package inventory failed"}]'
+          fi
+          if casks=$(brew list --cask --versions 2>/dev/null); then
+            printf '%s\n' "$casks" |
+              awk 'NF >= 2 { print $1 "\t" $2 }' |
+              emit_package_lines "$manager-cask" list-installed-casks
+          else
+            emit error "packages:$manager-cask" unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew cask inventory failed"}]'
+          fi
+        else
+          emit error "packages:$manager" unavailable high '{}' '[]' \
+            "$(jq -cn --arg manager "$manager" '[{code:"manager_missing",severity:"warning",retryable:false,message:($manager+" is not installed")} ]')"
+        fi
+        ;;
+      apt)
+        if command -v dpkg-query >/dev/null 2>&1; then
+          if apt_packages=$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null); then
+            printf '%s\n' "$apt_packages" | emit_package_lines apt dpkg-query
+          else
+            emit error packages:apt unavailable high '{}' '[]' \
+              '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"dpkg-query package inventory failed"}]'
+          fi
+        else
+          emit error packages:apt unavailable high '{}' '[]' \
+            '[{"code":"manager_missing","severity":"warning","retryable":false,"message":"dpkg-query is not installed"}]'
+        fi
+        ;;
+    esac
+  done
+fi
+
+if has_section agents; then
+  for runtime in codex claude; do
+    if command -v "$runtime" >/dev/null 2>&1; then
+      executable=$(command -v "$runtime")
+      version=$("$runtime" --version 2>/dev/null | head -1 | clip || printf unknown)
+      data=$(jq -cn --arg runtime "$runtime" --arg executable "$executable" --arg version "$version" \
+        '{runtime:$runtime,executable:$executable,version:$version}')
+      emit agent_runtime "$runtime" present high "$data" '[{"source":"runtime","method":"--version"}]'
+    else
+      emit agent_runtime "$runtime" absent high "$(jq -cn --arg runtime "$runtime" '{runtime:$runtime}')"
+    fi
+  done
+
+  lock="$HOME/.agents/.skill-lock.json"
+  if [ -f "$lock" ]; then
+    if jq -e '(.skills // .) | type == "object"' "$lock" >/dev/null 2>&1; then
+      jq -c \
+      --arg schema machine-utilities.inventory \
+      --argjson schema_version 1 \
+      --arg snapshot_id "$snapshot_id" \
+      --arg host_id "$host_id" \
+      --arg observed_at "$observed_at" '
+        (.skills // .) | to_entries[]? |
+        (.key[0:8192]) as $name |
+        {
+          schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+          host_id:$host_id,kind:"skill",id:(("skills-cli:"+$name)[0:8192]),
+          observed_at:$observed_at,status:"present",confidence:"high",
+          data:{
+            manager:"skills-cli",name:$name,
+            source:((.value.source // null) |
+              if type == "string" then
+                (split("?")[0] | if contains("@") then split("@")[-1] else . end)[0:8192]
+              else null end),
+            source_type:((.value.sourceType // null) | if type == "string" then .[0:8192] else null end),
+            source_url:((.value.sourceUrl // null) |
+              if type == "string" then
+                (split("?")[0] | if contains("@") then split("@")[-1] else . end)[0:8192]
+              else null end),
+            skill_path:((.value.skillPath // null) | if type == "string" then .[0:8192] else null end),
+            folder_hash:((.value.skillFolderHash // null) | if type == "string" then .[0:8192] else null end),
+            installed_at:((.value.installedAt // null) | if type == "string" then .[0:8192] else null end),
+            updated_at:((.value.updatedAt // null) | if type == "string" then .[0:8192] else null end)
+          },
+          evidence:[{source:"manager-lock",method:"skills-v3-lock"}],errors:[]
+          }' "$lock" 2>/dev/null
+    else
+      emit error agents:skills-cli-lock unavailable high '{}' '[]' \
+        '[{"code":"manager_lock_invalid","severity":"warning","retryable":false,"message":"skills-cli lock file is invalid"}]'
+    fi
+  fi
+
+  jsm_inventory=
+  if command -v jsm >/dev/null 2>&1; then
+    if jsm_inventory=$(jsm --json --offline list 2>/dev/null) &&
+      printf '%s\n' "$jsm_inventory" | jq -e '
+        (.skills | type == "array") and
+        ([.skills[] |
+          type == "object" and
+          (.name | type == "string" and length > 0) and
+          ((.version // null) | type | IN("null","string","number")) and
+          ((.installed_at // null) | type | IN("null","string")) and
+          ((.pinned // false) | type == "boolean") and
+          ((.update_available // null) | type | IN("null","boolean")) and
+          ((.latest_version // null) | type | IN("null","string","number")) and
+          ((.is_saved // null) | type | IN("null","boolean")) and
+          ((.is_jeffreys // null) | type | IN("null","boolean")) and
+          ((.tags // []) | type == "array" and length <= 128) and
+          ([.tags[]? | type | IN("string","number","boolean")] | all)
+        ] | all)
+      ' >/dev/null 2>&1; then
+      printf '%s\n' "$jsm_inventory" | jq -c \
+        --arg schema machine-utilities.inventory \
+        --argjson schema_version 1 \
+        --arg snapshot_id "$snapshot_id" \
+        --arg host_id "$host_id" \
+        --arg observed_at "$observed_at" '
+          .skills[]? |
+          (.name[0:8192]) as $name |
+          {
+            schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
+            host_id:$host_id,kind:"skill",id:(("jsm:"+$name)[0:8192]),
+            observed_at:$observed_at,status:"present",confidence:"high",
+            data:{
+              manager:"jsm",name:$name,
+              version:((.version // null) | if . == null then null else tostring[0:8192] end),
+              installed_at:((.installed_at // null) | if type == "string" then .[0:8192] else null end),
+              pinned:(if (.pinned | type) == "boolean" then .pinned else false end),
+              update_available:(if (.update_available | type) == "boolean" then .update_available else null end),
+              latest_version:((.latest_version // null) | if . == null then null else tostring[0:8192] end),
+              is_saved:(if (.is_saved | type) == "boolean" then .is_saved else null end),
+              is_jeffreys:(if (.is_jeffreys | type) == "boolean" then .is_jeffreys else null end),
+              tags:((.tags // [])[0:128] | map(tostring[0:256]))
+            },
+            evidence:[{source:"manager-cli",method:"jsm-offline-list"}],errors:[]
+          }'
+    else
+      emit error agents:jsm unavailable medium '{}' '[]' \
+        '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"jsm offline inventory failed"}]'
+    fi
+  fi
+
+  capability_host_groups=$(jq -c --arg host "$host_id" '.machines[$host].groups // []' "$config")
+  jq -c --argjson host_groups "$capability_host_groups" '
+    (.capabilities // {}) | to_entries[]? |
+    select(
+      (.value.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )' "$config" | while IFS= read -r capability; do
+    capability_name=$(printf '%s' "$capability" | jq -r '.key' | clip)
+    providers='[]'
+    desired_count=0
+    observed_count=0
+    duplicate_count=0
+    for capability_agent in codex claude; do
+      provider=$(printf '%s' "$capability" | jq -r --arg agent "$capability_agent" '.value[$agent].provider // empty')
+      [ -n "$provider" ] || continue
+      source=$(printf '%s' "$capability" | jq -r --arg agent "$capability_agent" '.value[$agent].source')
+      safe_source=$(printf '%s\n' "$source" | sanitize_remote | clip)
+      expected_name=$(printf '%s' "$capability" | jq -r --arg agent "$capability_agent" --arg name "$capability_name" \
+        '.value[$agent].skill // .value[$agent].name // $name' | clip)
+      matches=$(capability_matches "$capability_agent" "$provider" "$source" "$expected_name" || true)
+      matches_json=$(printf '%s\n' "$matches" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
+      match_count=$(printf '%s' "$matches_json" | jq 'length')
+      desired_count=$((desired_count + 1))
+      [ "$match_count" -eq 0 ] || observed_count=$((observed_count + 1))
+      [ "$match_count" -le 1 ] || duplicate_count=$((duplicate_count + 1))
+      providers=$(printf '%s' "$providers" | jq -c \
+        --arg agent "$capability_agent" --arg provider "$provider" --arg source "$safe_source" \
+        --arg expected_name "$expected_name" --argjson matches "$matches_json" \
+        '. + [{agent:$agent,provider:$provider,source:$source,expected_name:$expected_name,
+          observed:(($matches|length)>0),matches:$matches,duplicate:(($matches|length)>1)}]')
+    done
+    capability_status=absent
+    capability_consistent=false
+    if [ "$desired_count" -gt 0 ] && [ "$observed_count" -eq "$desired_count" ] && [ "$duplicate_count" -eq 0 ]; then
+      capability_status=present
+      capability_consistent=true
+    elif [ "$observed_count" -gt 0 ]; then
+      capability_status=partial
+    fi
+    data=$(jq -cn --arg name "$capability_name" --argjson providers "$providers" \
+      --argjson consistent "$capability_consistent" \
+      '{name:$name,available:([$providers[].observed]|all),consistent:$consistent,providers:$providers}')
+    emit capability "$capability_name" "$capability_status" high "$data" \
+      '[{"source":"configuration+filesystem","method":"logical-provider-reconciliation"}]'
+  done
+
+  jq -c --argjson host_groups "$capability_host_groups" '
+    (.skill_roots // [])[] |
+    select(
+      (.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )' "$config" | while IFS= read -r root_entry; do
+    root_id=$(printf '%s' "$root_entry" | jq -r '.id' | clip)
+    root_path=$(expand_home "$(printf '%s' "$root_entry" | jq -r '.path')")
+    root_manager=$(printf '%s' "$root_entry" | jq -r '.manager // "manual"' | clip)
+    root_agents=$(printf '%s' "$root_entry" | jq -c '.agents // []')
+    if [ ! -d "$root_path" ]; then
+      emit skill_root "$root_id" absent high \
+        "$(jq -cn --arg id "$root_id" --arg path "$root_path" '{id:$id,path:$path}')"
+      continue
+    fi
+    [ ! -f "$root_path/.SKILLS_MANAGED_BY_JSM" ] || root_manager=jsm
+    find "$root_path" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort |
+      while IFS= read -r skill_path; do
+        [ -f "$skill_path/SKILL.md" ] || continue
+        name=$(basename "$skill_path" | clip)
+        digest=$(directory_digest "$skill_path")
+        origin=$(git -C "$skill_path" remote get-url origin 2>/dev/null | sanitize_remote | clip || true)
+        data=$(jq -cn \
+          --arg name "$name" --arg root "$root_id" --arg path "$skill_path" \
+          --arg manager "$root_manager" --arg origin "$origin" \
+          --arg mtime "$(file_mtime "$skill_path/SKILL.md")" --arg digest "$digest" \
+          --argjson agents "$root_agents" \
+          '{name:$name,root:$root,path:$path,manager:$manager,agent_exposure:$agents,
+            origin:(if $origin=="" then null else $origin end),updated_at:$mtime,
+            digest:{algorithm:"sha256",value:$digest,scope:"directory-files"}}')
+        emit skill "standalone:$root_id:$name" present medium "$data" \
+          '[{"source":"filesystem","method":"configured-skill-root+directory-sha256"}]'
+      done
+  done
+
+  jq -c --argjson host_groups "$capability_host_groups" '
+    (.agent_artifacts // [])[] |
+    select(
+      (.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )' "$config" | while IFS= read -r artifact; do
+    artifact_id=$(printf '%s' "$artifact" | jq -r '.id' | clip)
+    artifact_path=$(expand_home "$(printf '%s' "$artifact" | jq -r '.path')")
+    artifact_kind=$(printf '%s' "$artifact" | jq -r '.kind' | clip)
+    artifact_agents=$(printf '%s' "$artifact" | jq -c '.agents // []')
+    if [ -L "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" partial medium \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent artifact path is a symlink"}]'
+    elif [ -f "$artifact_path" ]; then
+      data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+        --arg digest "$(sha256_file "$artifact_path")" --arg mtime "$(file_mtime "$artifact_path")" \
+        --argjson agents "$artifact_agents" \
+        '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,updated_at:$mtime,
+          digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"}}')
+      emit agent_artifact "$artifact_id" present high "$data" '[{"source":"filesystem","method":"configured-file+sha256"}]'
+    elif [ -d "$artifact_path" ]; then
+      data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+        --arg digest "$(directory_digest "$artifact_path")" --argjson agents "$artifact_agents" \
+        '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,
+          digest:{algorithm:"sha256",value:$digest,scope:"directory-files"}}')
+      emit agent_artifact "$artifact_id" present medium "$data" '[{"source":"filesystem","method":"configured-directory+sha256"}]'
+    else
+      emit agent_artifact "$artifact_id" absent high \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')"
+    fi
+  done
+
+  for agent in codex claude; do
+    case $agent in
+      codex) cache="$HOME/.codex/plugins/cache" ;;
+      claude) cache="$HOME/.claude/plugins/cache" ;;
+    esac
+    [ -d "$cache" ] || continue
+    find "$cache" -mindepth 3 -maxdepth 5 -type f \
+      \( -path '*/.codex-plugin/plugin.json' -o -path '*/.claude-plugin/plugin.json' \) \
+      2>/dev/null | while IFS= read -r manifest; do
+        dirname "$(dirname "$manifest")"
+      done | sort -u | while IFS= read -r path; do
+      version=$(basename "$path" | clip)
+      plugin=$(basename "$(dirname "$path")" | clip)
+      marketplace=$(basename "$(dirname "$(dirname "$path")")" | clip)
+      inferred=$(directory_birth_time "$path")
+      data=$(jq -cn --arg agent "$agent" --arg marketplace "$marketplace" --arg plugin "$plugin" --arg version "$version" --arg path "$path" \
+        --arg inferred "$inferred" \
+        '{agent:$agent,marketplace:$marketplace,name:$plugin,installed_version:$version,path:$path,installed_at:null,inferred_installed_at:(if $inferred=="" then null else $inferred end),inferred_installed_at_evidence:(if $inferred=="" then null else "filesystem_birthtime" end),inferred_installed_at_confidence:(if $inferred=="" then "unknown" else "low" end)}')
+      emit plugin "$agent:$marketplace:$plugin:$version" present medium "$data" '[{"source":"filesystem","method":"directory-observation+birthtime-inference"}]'
+    done
+  done
+fi
+
+if has_section auth; then
+  jq -c '.auth_artifacts // {} | to_entries[]' "$config" | while IFS= read -r entry; do
+    name=$(printf '%s' "$entry" | jq -r '.key' | clip)
+    configured_path=$(printf '%s' "$entry" | jq -r --arg host "$host_id" '.value.paths[$host] // .value.path // empty')
+    strategy=$(printf '%s' "$entry" | jq -r '.value.strategy // "ignore"' | clip)
+    portability=$(printf '%s' "$entry" | jq -r '.value.portability // "per-machine"' | clip)
+    path=$(expand_home "$configured_path")
+    auth_health_status=not-run
+    auth_health_exit=null
+    if [ -L "$path" ]; then
+      data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
+        --arg health "$auth_health_status" \
+        '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,type:"symlink",health:$health,verify_exit_code:null}')
+      emit auth_artifact "$name" partial medium "$data" '[{"source":"filesystem","method":"lstat"}]' \
+        '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"credential path is a symlink"}]'
+    elif [ -f "$path" ]; then
+      run_auth_health "$entry"
+      digest=$(sha256_file "$path")
+      data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
+        --arg mode "$(file_mode "$path")" --arg owner "$(file_owner "$path")" \
+        --argjson size "$(file_size "$path")" --arg mtime "$(file_mtime "$path")" --arg digest "$digest" \
+        --arg health "$auth_health_status" --argjson verify_exit_code "$auth_health_exit" \
+        '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,type:"file",mode:$mode,owner:$owner,size:$size,mtime:$mtime,
+          digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"},health:$health,verify_exit_code:$verify_exit_code}')
+      emit auth_artifact "$name" present medium "$data" '[{"source":"filesystem","method":"metadata+sha256"}]'
+    else
+      data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
+        '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,health:"not-run",verify_exit_code:null}')
+      emit auth_artifact "$name" absent medium "$data"
+    fi
+  done
+fi
+
+if has_section projects; then
+  dev_root=$(jq -r --arg host "$host_id" '.machines[$host].dev_root // empty' "$config")
+  if [ -z "$dev_root" ]; then
+    emit error projects:dev-root unavailable high '{}' '[]' \
+      '[{"code":"dev_root_missing","severity":"error","retryable":false,"message":"project inventory requires a configured dev_root"}]'
+  else
+    dev_root=$(expand_home "$dev_root")
+    host_groups=$(jq -c --arg host "$host_id" '.machines[$host].groups // []' "$config")
+    jq -c --argjson host_groups "$host_groups" '
+    .projects // {} | to_entries[] |
+    select(
+      (.value.groups // []) as $groups |
+      ($groups | length) == 0 or
+      any($groups[]; . as $group | $host_groups | index($group) != null)
+    )
+    ' "$config" | while IFS= read -r entry; do
+    name=$(printf '%s' "$entry" | jq -r '.key' | clip)
+    relative=$(printf '%s' "$entry" | jq -r '.value.path' | clip)
+    expected=$(printf '%s' "$entry" | jq -r '.value.source' | sanitize_remote | clip)
+    codex_required=$(printf '%s' "$entry" | jq '.value.codex // false')
+    path="$dev_root/$relative"
+    if [ -d "$path/.git" ] || git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      head=$(git -C "$path" rev-parse HEAD 2>/dev/null | clip || printf unknown)
+      tree=$(git -C "$path" rev-parse 'HEAD^{tree}' 2>/dev/null | clip || printf unknown)
+      branch=$(git -C "$path" symbolic-ref --short -q HEAD 2>/dev/null | clip || printf detached)
+      origin=$(git -C "$path" remote get-url origin 2>/dev/null | sanitize_remote | clip || printf unknown)
+      dirty=$(GIT_OPTIONAL_LOCKS=0 git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      expected_identity=$(printf '%s\n' "$expected" | canonical_git_source | clip)
+      origin_identity=$(printf '%s\n' "$origin" | canonical_git_source | clip)
+      origin_matches=false
+      [ -n "$expected_identity" ] && [ "$expected_identity" = "$origin_identity" ] && origin_matches=true
+      upstream=$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null | clip || true)
+      ahead=0
+      behind=0
+      sync_state=no-upstream
+      if [ -n "$upstream" ]; then
+        counts=$(git -C "$path" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || printf '0 0')
+        ahead=$(printf '%s\n' "$counts" | awk '{print $1+0}')
+        behind=$(printf '%s\n' "$counts" | awk '{print $2+0}')
+        if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+          sync_state=diverged
+        elif [ "$ahead" -gt 0 ]; then
+          sync_state=ahead
+        elif [ "$behind" -gt 0 ]; then
+          sync_state=behind
+        else
+          sync_state=up-to-date
+        fi
+      fi
+      repository_readiness=ready
+      [ "$dirty" -eq 0 ] || repository_readiness=dirty
+      [ "$origin_matches" = true ] || repository_readiness=wrong-origin
+      [ "$branch" != detached ] || repository_readiness=detached
+      [ "$sync_state" != diverged ] || repository_readiness=diverged
+      status=present
+      [ "$repository_readiness" = ready ] || status=partial
+      data=$(jq -cn --arg name "$name" --arg path "$path" --arg expected_source "$expected" \
+        --arg origin "$origin" --arg head "$head" --arg tree "$tree" --arg branch "$branch" \
+        --arg upstream "$upstream" --arg sync_state "$sync_state" --arg readiness "$repository_readiness" \
+        --argjson dirty_count "$dirty" --argjson ahead "$ahead" --argjson behind "$behind" \
+        --argjson origin_matches "$origin_matches" --argjson codex_required "$codex_required" \
+        '{name:$name,path:$path,expected_source:$expected_source,origin:$origin,
+          origin_matches:$origin_matches,head:$head,tree:$tree,branch:$branch,
+          upstream:(if $upstream=="" then null else $upstream end),ahead:$ahead,behind:$behind,
+          sync_state:$sync_state,dirty_count:$dirty_count,repository_readiness:$readiness,
+          codex_required:$codex_required,
+          codex_saved_project_status:(if $codex_required then "requires-controller-check" else "not-required" end)}')
+      emit project "$name" "$status" high "$data" '[{"source":"git","method":"rev-parse+status"}]'
+    elif [ -e "$path" ]; then
+      emit project "$name" partial high "$(jq -cn --arg name "$name" --arg path "$path" --arg expected "$expected" '{name:$name,path:$path,expected_source:$expected}')" \
+        '[]' '[{"code":"not_git_repository","severity":"error","retryable":false,"message":"configured project path exists but is not a Git checkout"}]'
+    else
+      emit project "$name" absent high "$(jq -cn --arg name "$name" --arg path "$path" --arg expected "$expected" '{name:$name,path:$path,expected_source:$expected}')"
+    fi
+    done
+  fi
+fi
+
+if has_section startup; then
+  case $(uname -s 2>/dev/null || printf unknown) in
+    Darwin)
+      for startup_spec in \
+        "launchd-user|user|$HOME/Library/LaunchAgents" \
+        "launchd-system-agent|system|/Library/LaunchAgents" \
+        "launchd-system-daemon|system|/Library/LaunchDaemons"; do
+        scheduler=${startup_spec%%|*}
+        startup_remainder=${startup_spec#*|}
+        scope=${startup_remainder%%|*}
+        directory=${startup_remainder#*|}
+        [ -d "$directory" ] || continue
+        find "$directory" -maxdepth 1 -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort |
+          while IFS= read -r path; do
+            digest=$(sha256_file "$path")
+            mtime=$(file_mtime "$path")
+            definition='{}'
+            if command -v plutil >/dev/null 2>&1; then
+              definition=$(plutil -convert json -o - "$path" 2>/dev/null | jq -c '{
+                label:(.Label // null),
+                program:(.Program // .ProgramArguments[0] // null),
+                run_at_load:(.RunAtLoad // false),
+                keep_alive:(.KeepAlive // false),
+                start_interval:(.StartInterval // null),
+                start_calendar_interval:(.StartCalendarInterval // null),
+                working_directory:(.WorkingDirectory // null)
+              }' 2>/dev/null || printf '{}')
+            fi
+            label=$(printf '%s' "$definition" | jq -r '.label // empty' | clip)
+            [ -n "$label" ] || label=$(basename "$path" .plist | clip)
+            loaded=false
+            launch_domain=system
+            [ "$scope" = user ] && launch_domain="gui/$(id -u)"
+            launch_state=$(launchctl print "$launch_domain/$label" 2>/dev/null || true)
+            [ -z "$launch_state" ] || loaded=true
+            last_exit=$(printf '%s\n' "$launch_state" | awk -F'= ' '/last exit code =/ {gsub(/[^0-9-]/,"",$2); print $2; exit}')
+            case $last_exit in ''|*[!0-9-]*) last_exit=null ;; esac
+            data=$(jq -cn --arg scheduler "$scheduler" --arg scope "$scope" \
+              --arg path "$path" --arg label "$label" --arg digest "$digest" --arg mtime "$mtime" \
+              --argjson loaded "$loaded" --argjson last_exit "$last_exit" --argjson definition "$definition" \
+              '{scheduler:$scheduler,scope:$scope,label:$label,enabled:null,active:$loaded,
+                last_result:$last_exit,source_definition_path:$path,definition_mtime:$mtime,
+                definition_digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"}} + $definition')
+            emit startup_task "$scheduler:$label" present high "$data" \
+              '[{"source":"launchd+filesystem","method":"launchctl-print+plist"}]'
+          done
+      done
+      ;;
+    Linux)
+      for scope in user system; do
+        scheduler="systemd-$scope"
+        systemd_ok=true
+        if ! command -v systemctl >/dev/null 2>&1; then
+          systemd_ok=false
+          units=
+        elif [ "$scope" = user ]; then
+          units=$(systemctl --user list-unit-files --type=service,timer --state=enabled --no-legend --no-pager 2>/dev/null) || systemd_ok=false
+        else
+          units=$(systemctl list-unit-files --type=service,timer --state=enabled --no-legend --no-pager 2>/dev/null) || systemd_ok=false
+        fi
+        if [ "$systemd_ok" = false ]; then
+          emit error "startup:$scheduler" unavailable high '{}' '[]' \
+            "$(jq -cn --arg scheduler "$scheduler" \
+              '[{code:"scheduler_query_failed",severity:"warning",retryable:true,message:($scheduler+" inventory failed")} ]')"
+          continue
+        fi
+        [ -n "$units" ] || continue
+        printf '%s\n' "$units" | awk 'NF {print $1}' | LC_ALL=C sort -u |
+          while IFS= read -r unit; do
+            if [ "$scope" = user ]; then
+              active=$(systemctl --user is-active "$unit" 2>/dev/null || printf inactive)
+              path=$(systemctl --user show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
+              action_line=$(systemctl --user show "$unit" -p ExecStart --value 2>/dev/null | head -1)
+              working_directory=$(systemctl --user show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
+              restart_policy=$(systemctl --user show "$unit" -p Restart --value 2>/dev/null | head -1)
+              next_run=$(systemctl --user show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | head -1)
+              last_run=$(systemctl --user show "$unit" -p LastTriggerUSec --value 2>/dev/null | head -1)
+            else
+              active=$(systemctl is-active "$unit" 2>/dev/null || printf inactive)
+              path=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
+              action_line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null | head -1)
+              working_directory=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
+              restart_policy=$(systemctl show "$unit" -p Restart --value 2>/dev/null | head -1)
+              next_run=$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | head -1)
+              last_run=$(systemctl show "$unit" -p LastTriggerUSec --value 2>/dev/null | head -1)
+            fi
+            action=$(printf '%s\n' "$action_line" | sed -nE 's#.*path=([^ ;}]+).*#\1#p' | head -1 | clip)
+            action_digest=
+            [ -z "$action_line" ] || action_digest=$(printf '%s' "$action_line" | sha256_stream)
+            digest=
+            mtime=
+            if [ -n "$path" ] && [ -f "$path" ]; then
+              digest=$(sha256_file "$path")
+              mtime=$(file_mtime "$path")
+            fi
+            data=$(jq -cn --arg scheduler "$scheduler" --arg scope "$scope" --arg unit "$unit" \
+              --arg path "$path" --arg digest "$digest" --arg mtime "$mtime" \
+              --arg active "$active" --arg action "$action" --arg action_digest "$action_digest" \
+              --arg working_directory "$working_directory" --arg restart_policy "$restart_policy" \
+              --arg next_run "$next_run" --arg last_run "$last_run" \
+              '{scheduler:$scheduler,scope:$scope,label:$unit,enabled:"enabled",active:$active,
+                action:(if $action=="" then null else $action end),
+                action_arguments_digest:(if $action_digest=="" then null else {algorithm:"sha256",value:$action_digest} end),
+                working_directory:(if $working_directory=="" then null else $working_directory end),
+                restart_policy:(if $restart_policy=="" then null else $restart_policy end),
+                next_run:(if $next_run=="" then null else $next_run end),
+                last_run:(if $last_run=="" then null else $last_run end),
+                source_definition_path:(if $path=="" then null else $path end),
+                definition_mtime:(if $mtime=="" then null else $mtime end),
+                definition_digest:(if $digest=="" then null else {algorithm:"sha256",value:$digest,scope:"raw-bytes"} end)}')
+            emit startup_task "$scheduler:$unit" present high "$data" \
+              '[{"source":"systemd","method":"list-unit-files+show"}]'
+          done
+      done
+      ;;
+  esac
+  if command -v crontab >/dev/null 2>&1; then
+    cron_file=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-cron.XXXXXX")
+    chmod 600 "$cron_file"
+    if crontab -l >"$cron_file" 2>/dev/null; then
+      cron_entries=$(awk 'NF && $1 !~ /^#/ {count++} END {print count+0}' "$cron_file")
+      data=$(jq -cn --argjson entry_count "$cron_entries" --arg digest "$(sha256_file "$cron_file")" \
+        '{scheduler:"cron",scope:"user",label:"user-crontab",entry_count:$entry_count,
+          definition_digest:{algorithm:"sha256",value:$digest,scope:"crontab-bytes"}}')
+      emit startup_task cron:user present high "$data" '[{"source":"cron","method":"crontab-list-hash"}]'
+    else
+      emit startup_task cron:user absent high '{"scheduler":"cron","scope":"user","label":"user-crontab"}'
+    fi
+    rm -f "$cron_file"
+  fi
+fi
+
+if has_section chezmoi; then
+  source_path=${CHEZMOI_SOURCE_DIR:-}
+  if [ -z "$source_path" ] && command -v chezmoi >/dev/null 2>&1; then
+    source_path=$(chezmoi source-path 2>/dev/null | head -1 | clip || true)
+  fi
+  source_path=${source_path:-"$HOME/.local/share/chezmoi"}
+  source_path=$(expand_home "$source_path")
+  if [ -d "$source_path" ]; then
+    if head=$(git -C "$source_path" rev-parse HEAD 2>/dev/null | clip) && [ -n "$head" ]; then
+      dirty=$(GIT_OPTIONAL_LOCKS=0 git -C "$source_path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      status=present
+      [ "$dirty" -eq 0 ] || status=partial
+      data=$(jq -cn --arg path "$source_path" --arg head "$head" --argjson dirty_count "$dirty" \
+        '{role:"chezmoi-source",path:$path,head:$head,dirty_count:$dirty_count}')
+      emit file chezmoi:source "$status" medium "$data" '[{"source":"git","method":"rev-parse+status"}]'
+    else
+      emit file chezmoi:source partial medium \
+        "$(jq -cn --arg path "$source_path" '{role:"chezmoi-source",path:$path}')" '[]' \
+        '[{"code":"not_git_repository","severity":"warning","retryable":false,"message":"chezmoi source is not a readable Git checkout"}]'
+    fi
+  else
+    emit file chezmoi:source absent medium "$(jq -cn --arg path "$source_path" '{role:"chezmoi-source",path:$path}')"
+  fi
+  if command -v chezmoi >/dev/null 2>&1; then
+    chezmoi_status=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-chezmoi.XXXXXX")
+    chmod 600 "$chezmoi_status"
+    if chezmoi status >"$chezmoi_status" 2>/dev/null; then
+      drift_count=$(awk 'NF {count++} END {print count+0}' "$chezmoi_status")
+      status_digest=$(sha256_file "$chezmoi_status")
+      status_codes=$(awk 'NF {code=substr($0,1,2); counts[code]++} END {
+        for (code in counts) print code "\t" counts[code]
+      }' "$chezmoi_status" | LC_ALL=C sort | jq -Rsc '
+        split("\n") | map(select(length > 0) | split("\t") | {code:.[0],count:(.[1]|tonumber)})')
+      drift_status=present
+      [ "$drift_count" -eq 0 ] || drift_status=partial
+      data=$(jq -cn --arg source_path "$source_path" --arg digest "$status_digest" \
+        --argjson drift_count "$drift_count" --argjson codes "$status_codes" \
+        '{source_path:$source_path,drift_count:$drift_count,status_codes:$codes,
+          status_digest:{algorithm:"sha256",value:$digest,scope:"chezmoi-status-output"}}')
+      emit chezmoi_state live "$drift_status" high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
+    else
+      emit chezmoi_state live unavailable high "$(jq -cn --arg source_path "$source_path" '{source_path:$source_path}')" \
+        '[]' '[{"code":"chezmoi_status_failed","severity":"warning","retryable":true,"message":"chezmoi status failed"}]'
+    fi
+    rm -f "$chezmoi_status"
+  else
+    emit chezmoi_state live absent high '{"tool_available":false}'
+  fi
+fi

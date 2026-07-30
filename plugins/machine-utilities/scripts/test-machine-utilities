@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+cli="$script_dir/machine-utilities"
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-test.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+mkdir -p "$tmp/home/dev/example" "$tmp/bin"
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+assert_contains() {
+  case $1 in
+    *"$2"*) ;;
+    *) fail "expected output to contain: $2" ;;
+  esac
+}
+
+cat >"$tmp/config.json" <<'JSON'
+{
+  "version": 1,
+  "machines": {
+    "test-host": {
+      "platform": "macos",
+      "transport": "local",
+      "codex_host": "test-codex-host",
+      "groups": ["development"],
+      "package_managers": ["homebrew"],
+      "dev_root": "~/dev"
+    },
+    "test-windows": {
+      "platform": "windows",
+      "transport": "codex-remote-control",
+      "codex_host": "test-windows-host",
+      "groups": ["development"],
+      "package_managers": ["winget"],
+      "dev_root": "~/dev"
+    },
+    "test-ssh": {
+      "platform": "macos",
+      "transport": "ssh",
+      "ssh_alias": "fake-host",
+      "groups": ["development"],
+      "package_managers": [],
+      "dev_root": "~/dev"
+    }
+  },
+  "projects": {
+    "example": {
+      "source": "git@github.com:owner/example.git",
+      "path": "example",
+      "groups": ["development"],
+      "codex": true
+    }
+  },
+  "capabilities": {
+    "example-research": {
+      "groups": ["development"],
+      "codex": {"provider": "plugin", "source": "example"},
+      "claude": {"provider": "skills-cli", "source": "example-source", "skill": "capability-example"}
+    },
+    "other-group": {
+      "groups": ["other"],
+      "codex": {"provider": "plugin", "source": "must-not-appear"}
+    }
+  },
+  "skill_roots": [
+    {
+      "id": "manual",
+      "path": "~/.agents/skills",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    }
+  ],
+  "agent_artifacts": [
+    {
+      "id": "shared-agent-definition",
+      "path": "~/.agents/agents/example.md",
+      "kind": "agent-definition",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "empty-agent-definitions",
+      "path": "~/.agents/empty-agents",
+      "kind": "agent-definition",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    }
+  ],
+  "auth_artifacts": {
+    "test-auth": {
+      "path": "~/.test-auth",
+      "strategy": "encrypted-install",
+      "secret_ref": "not-a-secret-value",
+      "verify": ["auth-check", "login", "status"]
+    }
+  }
+}
+JSON
+chmod 600 "$tmp/config.json"
+config_hash=$(shasum -a 256 "$tmp/config.json" | awk '{print $1}')
+printf 'super-secret-value\n' >"$tmp/home/.test-auth"
+chmod 600 "$tmp/home/.test-auth"
+mkdir -p "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin" \
+  "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.claude-plugin" \
+  "$tmp/home/.agents/skills/manual-example" "$tmp/home/.agents/agents" "$tmp/home/.agents/empty-agents"
+printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.claude-plugin/plugin.json"
+printf '%s\n' '---' 'name: manual-example' 'description: Manual skill fixture.' '---' >"$tmp/home/.agents/skills/manual-example/SKILL.md"
+printf '%s\n' '# Example agent' >"$tmp/home/.agents/agents/example.md"
+printf '%s\n' '{"skills":{"locked-example":{"source":"https://user:lock-secret@example.invalid/repo","sourceUrl":"https://user:lock-secret@example.invalid/repo","skillPath":"skills/example","skillFolderHash":"abc","installedAt":"2026-01-01","updatedAt":"2026-01-02"},"capability-example":{"source":"example-source","sourceUrl":"example-source","skillPath":"skills/example","skillFolderHash":"def","installedAt":"2026-01-01","updatedAt":"2026-01-02"}}}' \
+  >"$tmp/home/.agents/.skill-lock.json"
+
+cat >"$tmp/bin/brew" <<'SH'
+#!/usr/bin/env bash
+[ "${BREW_FAIL:-0}" != 1 ] || exit 1
+if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ "${3:-}" = --versions ]; then
+  [ "${BREW_CASK_FAIL:-0}" != 1 ] || exit 1
+  printf 'visual-tool 1.0.0\n'
+  exit 0
+fi
+if [ "${1:-}" = list ] && [ "${2:-}" = --versions ]; then
+  printf 'git 2.50.0\njq 1.7.1\n'
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$tmp/bin/brew"
+
+cat >"$tmp/bin/jsm" <<'SH'
+#!/usr/bin/env bash
+[ "${JSM_INVALID:-0}" != 1 ] || { printf '{invalid\n'; exit 0; }
+[ "${JSM_INVALID_SHAPE:-0}" != 1 ] || { printf '%s\n' '{"skills":{"name":"bogus"}}'; exit 0; }
+printf '%s\n' '{"workspace":"default","skills":[{"name":"example-jsm","version":2,"installed_at":"2026-01-02","pinned":false,"update_available":false,"latest_version":null,"tags":["ctx-testing"],"is_jeffreys":true,"is_saved":true}]}'
+SH
+chmod +x "$tmp/bin/jsm"
+
+cat >"$tmp/bin/auth-check" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = login ] && [ "${2:-}" = status ]
+SH
+chmod +x "$tmp/bin/auth-check"
+
+cat >"$tmp/bin/ssh" <<'SH'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) shift 2 ;;
+    *) shift; break ;;
+  esac
+done
+[ $# -eq 1 ] || exit 64
+TMPDIR=/tmp sh -c "$1"
+SH
+chmod +x "$tmp/bin/ssh"
+
+cat >"$tmp/bin/scp" <<'SH'
+#!/usr/bin/env bash
+while [ $# -gt 3 ]; do
+  case $1 in
+    -q) shift ;;
+    -o) shift 2 ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 3 ] || exit 64
+destination=${3#*:}
+cp "$1" "$2" "$destination/"
+SH
+chmod +x "$tmp/bin/scp"
+
+git -C "$tmp/home/dev/example" init -q
+git -C "$tmp/home/dev/example" config user.email test@example.invalid
+git -C "$tmp/home/dev/example" config user.name Test
+printf 'ok\n' >"$tmp/home/dev/example/file.txt"
+git -C "$tmp/home/dev/example" add file.txt
+git -C "$tmp/home/dev/example" -c commit.gpgsign=false commit -qm initial
+git -C "$tmp/home/dev/example" remote add origin ssh://user:secret@github.com/owner/example.git
+
+export HOME="$tmp/home"
+export PATH="$tmp/bin:/usr/bin:/bin"
+export MACHINE_UTILITIES_CONFIG="$tmp/config.json"
+
+"$cli" validate-config
+"$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
+[ "$(stat -f %Lp "$tmp/snapshot.jsonl" 2>/dev/null || stat -c %a "$tmp/snapshot.jsonl")" = 600 ] ||
+  fail "snapshot mode is not 600"
+"$cli" validate "$tmp/snapshot.jsonl"
+
+json=$("$cli" render --format json "$tmp/snapshot.jsonl")
+human=$("$cli" render --format human "$tmp/snapshot.jsonl")
+assert_contains "$json" '"kind":"package"'
+assert_contains "$json" '"id":"homebrew:git"'
+assert_contains "$json" '"id":"homebrew-cask:visual-tool"'
+assert_contains "$json" '"kind":"project"'
+assert_contains "$json" '"origin_matches":true'
+assert_contains "$json" '"codex_saved_project_status":"requires-controller-check"'
+assert_contains "$json" '"kind":"operation"'
+assert_contains "$json" '"operation_status":"completed"'
+assert_contains "$json" '"id":"jsm:example-jsm"'
+[ "$(printf '%s' "$json" | jq -r '.records[] | select(.id == "jsm:example-jsm") | .data.version | type')" = string ] ||
+  fail "POSIX JSM version was not normalized to a string"
+assert_contains "$json" '"id":"example-research"'
+assert_contains "$json" '"consistent":true'
+if printf '%s' "$json" | grep -q 'other-group'; then fail "capability group filter leaked another group"; fi
+assert_contains "$json" '"id":"standalone:manual:manual-example"'
+assert_contains "$json" '"id":"shared-agent-definition"'
+assert_contains "$json" '"id":"empty-agent-definitions"'
+assert_contains "$json" '"scope":"directory-files"'
+assert_contains "$json" '"manager":"manual"'
+assert_contains "$json" '"health":"healthy"'
+assert_contains "$json" '"portability":"per-machine"'
+assert_contains "$json" '"id":"codex:test-market:example:1.2.3"'
+assert_contains "$json" '"inferred_installed_at_evidence":"filesystem_birthtime"'
+assert_contains "$json" '"inferred_installed_at_confidence":"low"'
+assert_contains "$json" '"algorithm":"sha256"'
+assert_contains "$human" 'test-host'
+assert_contains "$human" "$(printf 'HOST\tKIND')"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.id == "codex:test-market:example:1.2.3")] | length')" -eq 1 ] ||
+  fail "dual manifests produced duplicate plugin records"
+
+stdin_human=$("$cli" render --format human - <"$tmp/snapshot.jsonl")
+assert_contains "$stdin_human" 'test-host'
+
+if grep -q 'super-secret-value' "$tmp/snapshot.jsonl"; then
+  fail "secret value leaked into inventory"
+fi
+if grep -q 'user:secret' "$tmp/snapshot.jsonl"; then
+  fail "authenticated Git remote leaked into inventory"
+fi
+if grep -q 'lock-secret' "$tmp/snapshot.jsonl"; then
+  fail "authenticated skills lock URL leaked into inventory"
+fi
+assert_contains "$json" '"origin":"ssh://github.com/owner/example.git"'
+
+cat >"$tmp/codex-readiness.json" <<JSON
+{
+  "host_id": "test-host",
+  "project": "example",
+  "status": "available",
+  "codex_host": "test-codex-host",
+  "native_path": "$tmp/home/dev/example",
+  "expected_source": "github.com:owner/example.git",
+  "codex_project_id": "project-opaque-id",
+  "task_id": "task-opaque-id",
+  "correlation_id": "correlation-opaque-id"
+}
+JSON
+chmod 600 "$tmp/codex-readiness.json"
+"$cli" record-codex-readiness "$tmp/snapshot.jsonl" "$tmp/codex-readiness.json" "$tmp/enriched.jsonl"
+"$cli" validate "$tmp/enriched.jsonl"
+[ "$(jq -r 'select(.kind == "project" and .id == "example") | .data.codex_saved_project_status' "$tmp/enriched.jsonl")" = available ] ||
+  fail "Codex saved-project readiness was not recorded"
+[ "$(jq -r 'select(.kind == "operation") | .data.task_id' "$tmp/enriched.jsonl")" = task-opaque-id ] ||
+  fail "Codex task correlation was not recorded"
+sleep 1
+"$cli" record-codex-readiness "$tmp/snapshot.jsonl" "$tmp/codex-readiness.json" "$tmp/enriched-2.jsonl"
+"$cli" compare "$tmp/enriched.jsonl" "$tmp/enriched-2.jsonl" >"$tmp/enriched-compare.json"
+[ "$(jq 'length' "$tmp/enriched-compare.json")" -eq 0 ] ||
+  fail "volatile Codex readiness check time reported as drift"
+jq '.host_id = "wrong-host"' "$tmp/codex-readiness.json" >"$tmp/wrong-readiness.json"
+chmod 600 "$tmp/wrong-readiness.json"
+if "$cli" record-codex-readiness "$tmp/snapshot.jsonl" "$tmp/wrong-readiness.json" "$tmp/wrong-enriched.jsonl" >/dev/null 2>&1; then
+  fail "Codex readiness metadata for the wrong host was accepted"
+fi
+cp "$tmp/codex-readiness.json" "$tmp/public-readiness.json"
+chmod 644 "$tmp/public-readiness.json"
+if "$cli" record-codex-readiness "$tmp/snapshot.jsonl" "$tmp/public-readiness.json" "$tmp/public-enriched.jsonl" >/dev/null 2>&1; then
+  fail "non-0600 Codex readiness metadata was accepted"
+fi
+
+"$cli" compare "$tmp/snapshot.jsonl" "$tmp/snapshot.jsonl" >"$tmp/compare.json"
+[ "$(jq 'length' "$tmp/compare.json")" -eq 0 ] || fail "identical snapshot comparison reported drift"
+
+sleep 1
+"$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
+"$cli" compare "$tmp/snapshot.jsonl" "$tmp/snapshot-2.jsonl" >"$tmp/compare-2.json"
+[ "$(jq 'length' "$tmp/compare-2.json")" -eq 0 ] || fail "timestamps and run IDs reported as inventory drift"
+
+"$cli" collect --target test-ssh --section host --output "$tmp/ssh.jsonl"
+"$cli" validate "$tmp/ssh.jsonl"
+[ "$(jq -r 'select(.kind == "operation") | .data.transport' "$tmp/ssh.jsonl")" = ssh ] ||
+  fail "SSH transport did not complete through the remote collector"
+
+set +e
+BREW_FAIL=1 "$cli" collect --target test-host --section packages --output "$tmp/brew-failed.jsonl"
+brew_failed_rc=$?
+set -e
+[ "$brew_failed_rc" -eq 2 ] || fail "failed brew query did not produce partial inventory"
+assert_contains "$(cat "$tmp/brew-failed.jsonl")" '"code":"manager_query_failed"'
+
+set +e
+BREW_CASK_FAIL=1 "$cli" collect --target test-host --section packages --output "$tmp/brew-cask-failed.jsonl"
+brew_cask_failed_rc=$?
+set -e
+[ "$brew_cask_failed_rc" -eq 2 ] || fail "failed brew cask query did not produce partial inventory"
+assert_contains "$(cat "$tmp/brew-cask-failed.jsonl")" '"id":"packages:homebrew-cask"'
+
+jq --arg marker "$tmp/untrusted-config-executed" \
+  '.auth_artifacts["test-auth"].verify = ["touch", $marker]' "$tmp/config.json" >"$tmp/untrusted-config.json"
+chmod 666 "$tmp/untrusted-config.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/untrusted-config.json" "$cli" collect --target test-host --section auth >/dev/null 2>&1; then
+  fail "collection accepted a group/world-writable executable config"
+fi
+[ ! -e "$tmp/untrusted-config-executed" ] || fail "untrusted auth verification command executed"
+
+mkdir -p "$tmp/home/.local/share/chezmoi"
+set +e
+"$cli" collect --target test-host --section chezmoi --output "$tmp/partial.jsonl"
+partial_rc=$?
+set -e
+[ "$partial_rc" -eq 2 ] || fail "partial inventory did not exit 2"
+"$cli" validate "$tmp/partial.jsonl"
+[ "$(jq -r 'select(.kind == "operation") | .data.operation_status' "$tmp/partial.jsonl")" = partial ] ||
+  fail "partial record did not mark operation partial"
+rm -rf "$tmp/home/.local/share/chezmoi"
+
+cp "$tmp/snapshot.jsonl" "$tmp/invalid.jsonl"
+printf '%s\n' '{"schema":"machine-utilities.inventory","schema_version":99}' >>"$tmp/invalid.jsonl"
+if "$cli" validate "$tmp/invalid.jsonl" >/dev/null 2>&1; then
+  fail "invalid schema version passed validation"
+fi
+
+jq -sc '.[0].snapshot_id = "other-snapshot" | .[]' "$tmp/snapshot.jsonl" >"$tmp/mixed.jsonl"
+if "$cli" validate "$tmp/mixed.jsonl" >/dev/null 2>&1; then
+  fail "mixed snapshot IDs passed validation"
+fi
+
+{ cat "$tmp/snapshot.jsonl"; sed -n '1p' "$tmp/snapshot.jsonl"; } >"$tmp/duplicate-record.jsonl"
+if "$cli" validate "$tmp/duplicate-record.jsonl" >/dev/null 2>&1; then
+  fail "duplicate entity records passed validation"
+fi
+
+jq -cn '{
+  schema:"machine-utilities.inventory",schema_version:1,snapshot_id:"large",host_id:"test-host",
+  kind:"file",id:"large",observed_at:null,status:"present",confidence:"high",
+  data:{a:("é"*8192),b:("é"*8192),c:("é"*8192),d:("é"*8192)},evidence:[],errors:[]
+}' >"$tmp/multibyte-oversized.jsonl"
+if "$cli" validate "$tmp/multibyte-oversized.jsonl" >/dev/null 2>&1; then
+  fail "multibyte record over the byte limit passed validation"
+fi
+
+if "$cli" collect --target test-host --section "host';echo injected" >/dev/null 2>&1; then
+  fail "unsupported section passed validation"
+fi
+
+jq '.machines["test-host"].transport = "wsl-powershell"' "$tmp/config.json" >"$tmp/wsl-transport.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/wsl-transport.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "unsupported WSL bridge transport passed validation"
+fi
+
+jq '.machines["test-windows"].transport = "local"' "$tmp/config.json" >"$tmp/windows-local.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/windows-local.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "Windows host passed validation without direct Codex transport"
+fi
+
+jq '.machines.bad = {"platform":"linux","transport":"ssh","ssh_alias":"-oProxyCommand=bad","groups":[],"package_managers":["apt"]}' \
+  "$tmp/config.json" >"$tmp/option-alias.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/option-alias.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "option-shaped SSH alias passed validation"
+fi
+
+jq '.projects.example.path = "..\\\\outside"' "$tmp/config.json" >"$tmp/windows-escape.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/windows-escape.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "Windows parent traversal project path passed validation"
+fi
+
+jq '.capabilities["example-research"].claude.skill = "../escape"' "$tmp/config.json" >"$tmp/capability-escape.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/capability-escape.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "capability skill traversal passed validation"
+fi
+
+jq '.skill_roots += [.skill_roots[0]]' "$tmp/config.json" >"$tmp/duplicate-root.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/duplicate-root.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "duplicate skill root ID passed validation"
+fi
+
+jq '.capabilities.oversized = {"value":("x" * 9000)}' "$tmp/config.json" >"$tmp/oversized.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/oversized.json" "$cli" validate-config >/dev/null 2>&1; then
+  fail "oversized nested configuration string passed validation"
+fi
+
+printf '{invalid\n' >"$tmp/home/.agents/.skill-lock.json"
+set +e
+"$cli" collect --target test-host --section agents --output "$tmp/invalid-lock-posix.jsonl"
+invalid_lock_rc=$?
+set -e
+[ "$invalid_lock_rc" -eq 2 ] || fail "invalid skills lock did not produce partial POSIX inventory"
+"$cli" validate "$tmp/invalid-lock-posix.jsonl"
+assert_contains "$(cat "$tmp/invalid-lock-posix.jsonl")" '"id":"agents:skills-cli-lock"'
+rm -f "$tmp/home/.agents/.skill-lock.json"
+
+set +e
+JSM_INVALID=1 "$cli" collect --target test-host --section agents --output "$tmp/invalid-jsm.jsonl"
+invalid_jsm_rc=$?
+set -e
+[ "$invalid_jsm_rc" -eq 2 ] || fail "invalid JSM JSON did not produce partial inventory"
+assert_contains "$(cat "$tmp/invalid-jsm.jsonl")" '"id":"agents:jsm"'
+
+if command -v pwsh >/dev/null 2>&1; then
+  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents >"$tmp/windows.jsonl"
+  "$cli" validate "$tmp/windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "operation")) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector did not emit one operation record"
+  [ "$(jq -s 'map(select(.kind == "plugin" and .data.inferred_installed_at_confidence == "low")) | length' "$tmp/windows.jsonl")" -ge 1 ] ||
+    fail "Windows collector did not emit inferred plugin creation time"
+  [ "$(jq -r 'select(.kind == "operation") | .data.transport' "$tmp/windows.jsonl")" = codex-remote-control ] ||
+    fail "Windows operation did not preserve configured transport"
+  [ "$(jq -r 'select(.id == "jsm:example-jsm") | .data.version | type' "$tmp/windows.jsonl")" = string ] ||
+    fail "Windows JSM version was not normalized to a string"
+  [ "$(jq -r 'select(.kind == "snapshot") | .data.configuration_digest.value' "$tmp/windows.jsonl")" = "$config_hash" ] ||
+    fail "Windows snapshot did not preserve controller config digest"
+  posix_skill_hash=$(jq -r 'select(.id == "standalone:manual:manual-example") | .data.digest.value' "$tmp/snapshot.jsonl")
+  windows_skill_hash=$(jq -r 'select(.id == "standalone:manual:manual-example") | .data.digest.value' "$tmp/windows.jsonl")
+  [ "$posix_skill_hash" = "$windows_skill_hash" ] ||
+    fail "standalone skill digest is not cross-platform canonical"
+
+  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections auth -AllowAuthVerify >"$tmp/windows-auth.jsonl"
+  "$cli" validate "$tmp/windows-auth.jsonl"
+  [ "$(jq -r 'select(.id == "test-auth") | .data.health' "$tmp/windows-auth.jsonl")" = healthy ] ||
+    fail "Windows native auth health check was not healthy"
+
+  JSM_INVALID_SHAPE=1 HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents >"$tmp/windows-invalid-jsm.jsonl"
+  "$cli" validate "$tmp/windows-invalid-jsm.jsonl"
+  assert_contains "$(cat "$tmp/windows-invalid-jsm.jsonl")" '"id":"agents:jsm"'
+
+  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections chezmoi >"$tmp/windows-chezmoi.jsonl"
+  "$cli" validate "$tmp/windows-chezmoi.jsonl"
+  [ "$(jq -s 'map(select(.id == "chezmoi:source")) | length' "$tmp/windows-chezmoi.jsonl")" -eq 1 ] ||
+    fail "Windows chezmoi section emitted no state"
+
+  printf '{invalid\n' >"$tmp/home/.agents/.skill-lock.json"
+  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents >"$tmp/invalid-lock-windows.jsonl"
+  "$cli" validate "$tmp/invalid-lock-windows.jsonl"
+  assert_contains "$(cat "$tmp/invalid-lock-windows.jsonl")" '"id":"agents:skills-cli-lock"'
+  rm -f "$tmp/home/.agents/.skill-lock.json"
+
+  jq '.projects.example.path = "../escape"' "$tmp/config.json" >"$tmp/invalid-worker-config.json"
+  invalid_worker_hash=$(shasum -a 256 "$tmp/invalid-worker-config.json" | awk '{print $1}')
+  if HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/invalid-worker-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$invalid_worker_hash" -Sections projects >/dev/null 2>&1; then
+    fail "Windows worker accepted a traversal project path"
+  fi
+fi
+
+cat >"$tmp/plan-draft.json" <<JSON
+{
+  "domain": "updates",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "package-upgrade",
+      "kind": "package",
+      "id": "homebrew:git",
+      "argv": ["touch", "$tmp/plan-must-stay-inert"]
+    }
+  ]
+}
+JSON
+jq '.operations[0].kind = "project"' "$tmp/plan-draft.json" >"$tmp/wrong-kind-plan-draft.json"
+if "$cli" seal-plan "$tmp/wrong-kind-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/wrong-kind-plan.json" >/dev/null 2>&1; then
+  fail "update plan sealed against an unrelated same-ID entity kind"
+fi
+"$cli" seal-plan "$tmp/plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/plan.json"
+[ "$(stat -f %Lp "$tmp/plan.json" 2>/dev/null || stat -c %a "$tmp/plan.json")" = 600 ] ||
+  fail "sealed plan mode is not 600"
+verification=$("$cli" verify-preconditions "$tmp/plan.json" "$tmp/snapshot-2.jsonl")
+assert_contains "$verification" '"verified":true'
+[ ! -e "$tmp/plan-must-stay-inert" ] || fail "plan text was executed"
+
+if "$cli" verify-preconditions "$tmp/plan.json" "$tmp/snapshot.jsonl" >/dev/null 2>&1; then
+  fail "planning snapshot was accepted as a fresh recapture"
+fi
+
+"$cli" collect --target test-host --section host --output "$tmp/host-only.jsonl"
+if "$cli" seal-plan "$tmp/plan-draft.json" "$tmp/host-only.jsonl" "$tmp/host-only-plan.json" >/dev/null 2>&1; then
+  fail "update plan sealed without package inventory"
+fi
+
+jq '.operations[0].id = "homebrew:tampered"' "$tmp/plan.json" >"$tmp/tampered-plan.json"
+chmod 600 "$tmp/tampered-plan.json"
+if "$cli" verify-preconditions "$tmp/tampered-plan.json" "$tmp/snapshot-2.jsonl" >/dev/null 2>&1; then
+  fail "tampered plan passed integrity check"
+fi
+
+jq -c 'if .kind == "package" and .id == "homebrew:git" then .data.installed_version = "9.9.9" else . end' \
+  "$tmp/snapshot-2.jsonl" >"$tmp/drifted-snapshot.jsonl"
+if "$cli" verify-preconditions "$tmp/plan.json" "$tmp/drifted-snapshot.jsonl" >/dev/null 2>&1; then
+  fail "changed preconditions passed apply authorization"
+fi
+
+chmod 666 "$tmp/config.json"
+if "$cli" check-mutation-config >/dev/null 2>&1; then
+  fail "writable mutation config passed integrity check"
+fi
+
+printf 'PASS: machine-utilities self-check\n'

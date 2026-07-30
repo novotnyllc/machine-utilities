@@ -1,0 +1,31 @@
+{
+  "name": "machine-utilities",
+  "version": "0.1.0",
+  "description": "Inventory and reconcile packages, agent tooling, projects, dotfiles, remote Macs, SSH, startup tasks, and portable authentication across mixed-machine fleets.",
+  "author": {
+    "name": "Machine Utilities Contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "claude-code",
+    "fleet",
+    "homebrew",
+    "chezmoi",
+    "macos",
+    "wsl",
+    "windows",
+    "skills",
+    "projects"
+  ],
+  "skills": [
+    "./skills/fleet-inventory",
+    "./skills/fleet-update",
+    "./skills/fleet-agents",
+    "./skills/fleet-auth",
+    "./skills/fleet-chezmoi",
+    "./skills/fleet-projects",
+    "./skills/remote-mac",
+    "./skills/ssh-doctor"
+  ]
+}
