@@ -505,10 +505,11 @@ if [ "${1:-}" = -c ] && [ "${2:-}" = %U ]; then
   exit
 fi
 if [ "${1:-}" = -f ] && [ "${2:-}" = %Lp ]; then
-  if "$REAL_STAT" -f %Lp "$3" >/dev/null 2>&1; then
-    exec "$REAL_STAT" -f %Lp "$3"
-  fi
-  exec "$REAL_STAT" -c %a "$3"
+  printf '  File: fake GNU stat filesystem report\n'
+  exit 1
+fi
+if [ "${1:-}" = -c ] && [ "${2:-}" = %a ]; then
+  exec "$REAL_STAT" -f %Lp "$3" 2>/dev/null || exec "$REAL_STAT" -c %a "$3"
 fi
 exec "$REAL_STAT" "$@"
 SH

@@ -203,7 +203,10 @@ validate_config_file() {
 }
 
 file_mode() {
-  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf unknown
+  mode=$(stat -f %Lp "$1" 2>/dev/null) ||
+    mode=$(stat -c %a "$1" 2>/dev/null) ||
+    mode=unknown
+  printf '%s\n' "$mode"
 }
 
 file_owner() {
