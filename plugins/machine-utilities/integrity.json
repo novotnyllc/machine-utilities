@@ -1,0 +1,33 @@
+{
+  "files": [
+    {
+      "path": ".claude-plugin/plugin.json",
+      "sha256": "a838c8ba88a66edfa46ae81e995c7606f21403d67db14026d367f3e440b037d8"
+    },
+    {
+      "path": ".codex-plugin/plugin.json",
+      "sha256": "99db8ce7bbd21978cce8f011fd9e36ea3ff909131f4fb51ae27d5968e3b26ae7"
+    },
+    {
+      "path": "scripts/apply-windows.ps1",
+      "sha256": "3e713584aa1ecf6893dcdbf1c722daffcd90dcbfde1ddae786388f2f4dabe0ae"
+    },
+    {
+      "path": "scripts/collect-posix",
+      "sha256": "accb00f0918dcf396312c86b07d2684cd0b5e2d76cc3ff83498da34df27fb916"
+    },
+    {
+      "path": "scripts/collect-windows.ps1",
+      "sha256": "5cbb962866fe8878ade9d9748479820b8539993d3279c825d88a22c4b3bdf29f"
+    },
+    {
+      "path": "scripts/machine-utilities",
+      "sha256": "6de04e617827f376288ad71aed69b40c03625ba03203b65b0c81008e5208246d"
+    }
+  ],
+  "marketplace": "novotnyllc",
+  "plugin": "machine-utilities",
+  "schema": "machine-utilities.integrity",
+  "schema_version": 1,
+  "version": "0.2.0"
+}

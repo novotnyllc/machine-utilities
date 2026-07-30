@@ -15,14 +15,17 @@ Treat inventory as routing hints until `hostname`, `id -un`, `sw_vers`, and
 Use non-interactive SSH for one-shot checks:
 
 ```bash
-ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none ALIAS 'hostname; id -un; sw_vers'
+ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
+  -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+  ALIAS 'hostname; id -un; sw_vers'
 ```
 
 Override aliases that auto-attach tmux or run a remote command. Use a login
 shell only when checking developer tools that depend on shell initialization:
 
 ```bash
-ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none ALIAS \
+ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
+  -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 ALIAS \
   'zsh -lc "command -v brew; command -v pnpm; command -v node"'
 ```
 

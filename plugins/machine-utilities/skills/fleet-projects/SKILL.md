@@ -29,8 +29,12 @@ the exact source/path operations with
 `"$CLI" seal-plan DRAFT SNAPSHOT PLAN`. Recapture project inventory and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. Obtain
 separate approval, execute only the sealed argv, and inventory again afterward.
-For a local target use `"$CLI" apply-plan PLAN CURRENT-SNAPSHOT PLAN-ID
-OUTPUT`; remote targets run the sealed scope inside the matching saved project.
+For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH use
+`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; native Windows uses the
+remote-control worker contract. Apply recaptures trusted preflight itself and
+preserves authoritative partial output after a failed operation or
+postcondition when post-inventory remains available. SSH uses bounded
+connection/keepalive timeouts and verifies the configured native hostname/user.
 
 For Codex readiness, discover saved projects and match both host and native
 path. The controller does not need that path locally. If missing, tell the user

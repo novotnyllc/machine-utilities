@@ -30,9 +30,14 @@ platform identity, recapture package inventory, and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. This binds
 config, plan integrity, and preconditions without executing plan text. Then
 obtain separate user approval and execute only the exact argv sealed in the
-plan. For a local target use `"$CLI" apply-plan PLAN CURRENT-SNAPSHOT PLAN-ID
-OUTPUT`; this enforces the manager command shape and returns post-change
-inventory. Never infer apply permission from a request to inspect or plan.
+plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
+use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`. Both recapture trusted
+preflight and enforce the same executor, identity, manager-command,
+fresh-precondition, and semantic post-state checks. If an operation or
+postcondition fails, preserve the authoritative partial result emitted when
+post-inventory remains available. SSH uses bounded connection/keepalive
+timeouts and verifies the configured native hostname/user. Never infer apply
+permission from a request to inspect or plan.
 
 Run each native manager directly on local/SSH hosts. For Windows, Codex reads
 and follows `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude

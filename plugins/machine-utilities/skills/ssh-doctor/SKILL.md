@@ -20,6 +20,7 @@ sudo launchctl print system/com.openssh.sshd
 sudo lsof -nP -iTCP:22 -sTCP:LISTEN
 nc -vz 127.0.0.1 22
 ssh -4 -F /dev/null -o RequestTTY=no -o RemoteCommand=none \
+  -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
   USER@127.0.0.1 'hostname; id -un'
 ```
 

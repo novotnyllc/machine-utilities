@@ -2,6 +2,7 @@
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+plugin_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
 schema=machine-utilities.inventory
 schema_version=1
 
@@ -10,14 +11,19 @@ usage() {
 Usage:
   machine-utilities validate-config
   machine-utilities check-mutation-config
-  machine-utilities collect [--target HOST] [--section SECTION]... [--output FILE|-]
+  machine-utilities worker-config HOST DOMAIN OUTPUT.json
+  machine-utilities collect [--target HOST] [--native-target] [--section SECTION]... [--output FILE|-]
   machine-utilities validate SNAPSHOT.jsonl|-
   machine-utilities render [--format human|json|jsonl] SNAPSHOT.jsonl|-
   machine-utilities compare LEFT.jsonl RIGHT.jsonl
+  machine-utilities executor-status [OUTPUT.json|-]
+  machine-utilities verify-executor [REQUIREMENT.json]
   machine-utilities record-codex-readiness SNAPSHOT.jsonl METADATA.json OUTPUT.jsonl
   machine-utilities seal-plan DRAFT.json SNAPSHOT.jsonl PLAN.json
   machine-utilities verify-preconditions PLAN.json CURRENT-SNAPSHOT.jsonl
-  machine-utilities apply-plan PLAN.json CURRENT-SNAPSHOT.jsonl PLAN-ID OUTPUT.jsonl
+  machine-utilities apply-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  machine-utilities apply-native-plan PLAN.json PLAN-ID OUTPUT.jsonl
+  machine-utilities apply-ssh-plan PLAN.json PLAN-ID OUTPUT.jsonl
 EOF
   exit 64
 }
@@ -37,6 +43,16 @@ require_jq() {
   fi
 }
 
+ssh_run() {
+  ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
+    -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$@"
+}
+
+scp_run() {
+  scp -q -o BatchMode=yes -o ConnectTimeout=10 \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$@"
+}
+
 validate_config_file() {
   require_jq
   path=$(config_path)
@@ -47,13 +63,21 @@ validate_config_file() {
   jq -e '
     . as $config |
     .version == 1 and
+    ((.worker // null) == null or
+      ((.worker | type == "object") and
+       (.worker.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+       (.worker.controller_configuration_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+       (.machines | keys == [$config.worker.target]))) and
     (.machines | type == "object") and
     (.machines | length > 0) and
     ([.machines | keys[] | test("^[A-Za-z0-9._-]+$")] | all) and
-    ([.machines[] |
+    ([.machines[] | . as $machine |
       (.platform | IN("macos","linux","wsl","windows")) and
       (.transport | IN("local","ssh","codex-remote-control")) and
       ((.codex_host // null) == null or (.codex_host | type == "string" and length > 0)) and
+      ((.codex_control_project // null) == null or
+        (.codex_control_project | type == "string" and test("^[A-Za-z0-9._-]+$") and
+          $config.projects[$machine.codex_control_project] != null)) and
       ((.expected_hostname // null) == null or
         (.expected_hostname | type == "string" and test("^[A-Za-z0-9._-]+$"))) and
       ((.expected_user // null) == null or
@@ -186,13 +210,25 @@ file_owner() {
   stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf unknown
 }
 
-check_private_owned_file() {
+check_safe_owned_path() (
   path=$1
   label=$2
-  [ -f "$path" ] && [ ! -L "$path" ] || {
-    printf 'machine-utilities: %s must be a regular non-symlink file\n' "$label" >&2
-    exit 64
-  }
+  kind=$3
+  case $kind in
+    file)
+      [ -f "$path" ] && [ ! -L "$path" ] || {
+        printf 'machine-utilities: %s must be a regular non-symlink file\n' "$label" >&2
+        exit 64
+      }
+      ;;
+    directory)
+      [ -d "$path" ] && [ ! -L "$path" ] || {
+        printf 'machine-utilities: %s must be a non-symlink directory\n' "$label" >&2
+        exit 64
+      }
+      ;;
+    *) printf 'machine-utilities: invalid safe-path kind\n' >&2; exit 64 ;;
+  esac
   [ "$(file_owner "$path")" = "$(id -un)" ] || {
     printf 'machine-utilities: %s is not owned by the current user\n' "$label" >&2
     exit 64
@@ -207,6 +243,10 @@ check_private_owned_file() {
       exit 64
       ;;
   esac
+)
+
+check_private_owned_file() {
+  check_safe_owned_path "$1" "$2" file
 }
 
 check_mutation_config() {
@@ -233,6 +273,127 @@ sha256_stream() {
     openssl dgst -sha256 | awk '{print tolower($NF)}'
   fi
 }
+
+check_safe_owned_directory() {
+  check_safe_owned_path "$1" "$2" directory
+}
+
+executor_status_command() (
+  output=${1:--}
+  require_jq
+  integrity=$plugin_root/integrity.json
+  check_safe_owned_directory "$plugin_root" "plugin root"
+  check_private_owned_file "$integrity" "executor integrity manifest"
+  jq -e '
+    .schema == "machine-utilities.integrity" and
+    .schema_version == 1 and
+    .plugin == "machine-utilities" and
+    (.marketplace | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.files | type == "array" and length > 0) and
+    ((.files | map(.path) | unique | length) == (.files | length)) and
+    ([.files[] |
+      (.path | type == "string" and
+        test("^[A-Za-z0-9._/-]+$") and
+        startswith("/") | not) and
+      (.path | test("(^|/)\\.\\.(/|$)") | not) and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    ] | all)
+  ' "$integrity" >/dev/null || {
+    printf 'machine-utilities: invalid executor integrity manifest\n' >&2
+    exit 65
+  }
+  codex_version=$(jq -r '.version' "$plugin_root/.codex-plugin/plugin.json")
+  claude_version=$(jq -r '.version' "$plugin_root/.claude-plugin/plugin.json")
+  integrity_version=$(jq -r '.version' "$integrity")
+  integrity_marketplace=$(jq -r '.marketplace' "$integrity")
+  [ "$codex_version" = "$integrity_version" ] && [ "$claude_version" = "$integrity_version" ] || {
+    printf 'machine-utilities: executor manifest versions do not match\n' >&2
+    exit 65
+  }
+
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-executor.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  : >"$tmp/files.jsonl"
+  while IFS="$(printf '\t')" read -r relative expected; do
+    path=$plugin_root/$relative
+    check_private_owned_file "$path" "executor file $relative"
+    actual=$(sha256_file "$path")
+    [ "$actual" = "$expected" ] || {
+      printf 'machine-utilities: executor integrity mismatch: %s\n' "$relative" >&2
+      exit 65
+    }
+    jq -cn --arg path "$relative" --arg sha256 "$actual" \
+      '{path:$path,sha256:$sha256}' >>"$tmp/files.jsonl"
+  done <<EOF
+$(jq -r '.files[] | [.path,.sha256] | @tsv' "$integrity")
+EOF
+
+  source_commit=
+  source_tree=
+  source_dirty=false
+  if command -v git >/dev/null 2>&1 &&
+    git -C "$plugin_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    source_commit=$(git -C "$plugin_root" rev-parse HEAD 2>/dev/null || true)
+    source_tree=$(git -C "$plugin_root" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
+    [ -z "$(git -C "$plugin_root" status --porcelain --untracked-files=no -- "$plugin_root" 2>/dev/null)" ] ||
+      source_dirty=true
+  fi
+  jq -S -n \
+    --arg plugin machine-utilities \
+    --arg marketplace "$integrity_marketplace" \
+    --arg version "$integrity_version" \
+    --arg manifest_sha256 "$(sha256_file "$integrity")" \
+    --slurpfile files "$tmp/files.jsonl" \
+    --arg commit "$source_commit" \
+    --arg tree "$source_tree" \
+    --argjson dirty "$source_dirty" \
+    '{
+      schema:"machine-utilities.executor",
+      schema_version:1,
+      plugin:$plugin,
+      marketplace:$marketplace,
+      version:$version,
+      integrity_manifest_sha256:$manifest_sha256,
+      files:($files | sort_by(.path)),
+      source:{
+        commit:(if $commit == "" then null else $commit end),
+        tree:(if $tree == "" then null else $tree end),
+        dirty:(if $commit == "" then null else $dirty end)
+      },
+      verified:true
+    }' >"$tmp/status.json"
+  safe_output "$tmp/status.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
+verify_executor_requirement() (
+  requirement=$1
+  require_jq
+  [ -f "$requirement" ] && [ ! -L "$requirement" ] || {
+    printf 'machine-utilities: executor requirement must be a regular non-symlink file\n' >&2
+    exit 64
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-executor-verify.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  executor_status_command "$tmp/status.json"
+  jq -e -n --slurpfile required "$requirement" --slurpfile actual "$tmp/status.json" '
+    ($required[0].required_executor // $required[0]) as $r |
+    $actual[0] as $a |
+    $r.plugin == $a.plugin and
+    $r.marketplace == $a.marketplace and
+    $r.version == $a.version and
+    $r.integrity_manifest_sha256 == $a.integrity_manifest_sha256 and
+    ($r.files | sort_by(.path)) == ($a.files | sort_by(.path))
+  ' >/dev/null || {
+    printf 'machine-utilities: installed executor does not match the sealed requirement\n' >&2
+    exit 65
+  }
+  cat "$tmp/status.json"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
 
 sanitize_remote() {
   sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#; s#^[^/@]+@([^:]+:.*)$#\1#; s#[?].*$##'
@@ -268,13 +429,58 @@ make_error_record_without_jq() {
   printf '%s\n' '{"schema":"machine-utilities.inventory","schema_version":1,"snapshot_id":"unavailable","host_id":"unknown","kind":"error","id":"prerequisite:jq","observed_at":null,"status":"unavailable","confidence":"high","data":{},"evidence":[],"errors":[{"code":"jq_missing","severity":"error","retryable":false,"message":"jq is required on the selected POSIX host"}]}'
 }
 
+worker_config_command() (
+  target=$1
+  domain=$2
+  output=$3
+  require_jq
+  validate_config_file
+  config=$(config_path)
+  case $domain in
+    inventory|updates|agents|auth|chezmoi|projects) ;;
+    *) printf 'machine-utilities: unsupported worker domain: %s\n' "$domain" >&2; exit 64 ;;
+  esac
+  jq -e --arg target "$target" '.machines[$target] != null' "$config" >/dev/null || {
+    printf 'machine-utilities: unknown worker target: %s\n' "$target" >&2
+    exit 64
+  }
+  controller_digest=$(sha256_file "$config")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-worker-config.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  jq -S \
+    --arg target "$target" \
+    --arg domain "$domain" \
+    --arg controller_digest "$controller_digest" '
+    {
+      version,
+      worker:{target:$target,controller_configuration_digest:$controller_digest},
+      machines:{($target):.machines[$target]},
+      projects:(if ($domain == "projects" or $domain == "inventory") then (.projects // {}) else {} end),
+      capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
+      skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),
+      agent_artifacts:(if ($domain == "agents" or $domain == "inventory") then (.agent_artifacts // []) else [] end),
+      auth_artifacts:(if ($domain == "auth" or $domain == "agents") then
+        (.auth_artifacts // {})
+      elif $domain == "inventory" then
+        (.auth_artifacts // {})
+      else {} end),
+      policy:(.policy // {})
+    }' "$config" >"$tmp/config.json"
+  MACHINE_UTILITIES_CONFIG="$tmp/config.json" validate_config_file
+  safe_output "$tmp/config.json" "$output"
+  trap - EXIT HUP INT TERM
+  rm -rf "$tmp"
+)
+
 collect_command() {
   target=
   sections=
   output=-
+  native_target=false
   while [ $# -gt 0 ]; do
     case $1 in
       --target) [ $# -ge 2 ] || usage; target=$2; shift 2 ;;
+      --native-target) native_target=true; shift ;;
       --section)
         [ $# -ge 2 ] || usage
         case $2 in
@@ -306,6 +512,19 @@ collect_command() {
   fi
 
   transport=$(jq -r --arg host "$target" '.machines[$host].transport' "$config")
+  if [ "$native_target" = true ]; then
+    [ "$transport" = ssh ] || {
+      printf 'machine-utilities: --native-target requires an SSH-configured host\n' >&2
+      exit 64
+    }
+    expected_hostname=$(jq -r --arg target "$target" '.machines[$target].expected_hostname // empty' "$config")
+    expected_user=$(jq -r --arg target "$target" '.machines[$target].expected_user // empty' "$config")
+    [ -n "$expected_hostname" ] && [ -n "$expected_user" ] &&
+      [ "$(hostname)" = "$expected_hostname" ] && [ "$(id -un)" = "$expected_user" ] || {
+      printf 'machine-utilities: native target identity does not match configured hostname/user\n' >&2
+      exit 65
+    }
+  fi
   observed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   snapshot_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
   config_digest=$(sha256_file "$config")
@@ -332,57 +551,90 @@ collect_command() {
       }
       ;;
     ssh)
-      alias=$(jq -r --arg host "$target" '.machines[$host].ssh_alias // empty' "$config")
-      [ -n "$alias" ] || {
-        printf 'machine-utilities: ssh target %s has no ssh_alias\n' "$target" >&2
-        exit 64
-      }
-      remote_dir=$(ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none "$alias" \
-        'umask 077; mktemp -d "${TMPDIR:-/tmp}/machine-utilities.XXXXXX"') || {
-          rc=2
-          operation_status=partial
-          operation_envelope_status=partial
-        }
-      if [ "$rc" -ne 0 ] || [ -z "${remote_dir:-}" ]; then
-        jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
-          --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
-          '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"transport:ssh",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"ssh"},evidence:[],errors:[{code:"ssh_unreachable",severity:"error",retryable:true,message:"SSH target did not create a remote workspace"}]}' >>"$records"
-      else
-        printf '%s\n' "$remote_dir" |
-          LC_ALL=C grep -Eq '^(/private)?/tmp/machine-utilities\.[A-Za-z0-9]{6,64}$' || {
-            printf 'machine-utilities: unsafe remote temporary path\n' >&2
-            exit 70
-          }
-        jq --arg host "$target" --arg sections "$sections" '
-          ($sections | split(",")) as $requested |
-          def wanted($name): (($requested | index("all")) != null or ($requested | index($name)) != null);
-          {
-            version,
-            machines:{($host):.machines[$host]},
-            projects:(if wanted("projects") then (.projects // {}) else {} end),
-            capabilities:(if wanted("agents") then (.capabilities // {}) else {} end),
-            skill_roots:(if wanted("agents") then (.skill_roots // []) else [] end),
-            agent_artifacts:(if wanted("agents") then (.agent_artifacts // []) else [] end),
-            auth_artifacts:(if wanted("auth") then
-              ((.auth_artifacts // {}) | map_values(del(.secret_ref)))
-            else {} end)
-          }' \
-          "$config" >"$tmp/config.json"
-        chmod 600 "$tmp/config.json"
-        scp -q -o BatchMode=yes "$script_dir/collect-posix" "$tmp/config.json" "$alias:$remote_dir/" || {
+      if [ "$native_target" = true ]; then
+        MACHINE_UTILITIES_OBSERVED_AT="$observed" "$script_dir/collect-posix" \
+          "$config" "$target" "$snapshot_id" "$sections" >>"$records" || {
             rc=2
             operation_status=partial
             operation_envelope_status=partial
           }
-        if [ "$rc" -eq 0 ]; then
-          ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none "$alias" \
-            "'$remote_dir/collect-posix' '$remote_dir/config.json' '$target' '$snapshot_id' '$sections'" >>"$records" || {
+      else
+        alias=$(jq -r --arg host "$target" '.machines[$host].ssh_alias // empty' "$config")
+        [ -n "$alias" ] || {
+          printf 'machine-utilities: ssh target %s has no ssh_alias\n' "$target" >&2
+          exit 64
+        }
+        worker_config_command "$target" inventory "$tmp/config.json"
+        executor_status_command "$tmp/executor.json"
+        remote_dir=$(ssh_run "$alias" \
+          'umask 077; mktemp -d /tmp/machine-utilities.XXXXXX') || {
+            rc=2
+            operation_status=partial
+            operation_envelope_status=partial
+          }
+        if [ "$rc" -ne 0 ] || [ -z "${remote_dir:-}" ]; then
+          jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
+            --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
+            '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"transport:ssh",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"ssh"},evidence:[],errors:[{code:"ssh_unreachable",severity:"error",retryable:true,message:"SSH target did not create a remote workspace"}]}' >>"$records"
+        else
+          printf '%s\n' "$remote_dir" |
+            LC_ALL=C grep -Eq '^(/private)?/tmp/machine-utilities\.[A-Za-z0-9]{6,64}$' || {
+              printf 'machine-utilities: unsafe remote temporary path\n' >&2
+              exit 70
+            }
+          if ! scp_run "$tmp/config.json" "$alias:$remote_dir/config.json" ||
+            ! scp_run "$tmp/executor.json" "$alias:$remote_dir/executor.json"; then
               rc=2
               operation_status=partial
               operation_envelope_status=partial
-            }
+          fi
+          if [ "$rc" -eq 0 ]; then
+            marketplace=$(jq -r '.marketplace' "$tmp/executor.json")
+            version=$(jq -r '.version' "$tmp/executor.json")
+            if ! ssh_run "$alias" \
+              sh -s -- "$remote_dir" "$marketplace" "$version" "$target" "$snapshot_id" "$sections" \
+              >>"$records" <<'REMOTE_COLLECTOR'
+set -eu
+remote_dir=$1
+marketplace=$2
+version=$3
+target=$4
+snapshot_id=$5
+sections=$6
+trap 'rm -rf "$remote_dir"' EXIT HUP INT TERM
+codex_cli=$HOME/.codex/plugins/cache/$marketplace/machine-utilities/$version/scripts/machine-utilities
+claude_cli=$HOME/.claude/plugins/cache/$marketplace/machine-utilities/$version/scripts/machine-utilities
+if [ -x "$codex_cli" ]; then cli=$codex_cli
+elif [ -x "$claude_cli" ]; then cli=$claude_cli
+else
+  printf 'machine-utilities: exact executor is not installed on target\n' >&2
+  exit 69
+fi
+export MACHINE_UTILITIES_CONFIG=$remote_dir/config.json
+"$cli" verify-executor "$remote_dir/executor.json" >/dev/null
+expected_hostname=$(jq -r --arg target "$target" '.machines[$target].expected_hostname // empty' "$remote_dir/config.json")
+expected_user=$(jq -r --arg target "$target" '.machines[$target].expected_user // empty' "$remote_dir/config.json")
+[ -n "$expected_hostname" ] && [ -n "$expected_user" ] &&
+  [ "$(hostname)" = "$expected_hostname" ] && [ "$(id -un)" = "$expected_user" ] || {
+    printf 'machine-utilities: SSH target identity does not match bounded configuration\n' >&2
+    exit 65
+  }
+collector=$(dirname "$cli")/collect-posix
+MACHINE_UTILITIES_OBSERVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  "$collector" "$remote_dir/config.json" "$target" "$snapshot_id" "$sections"
+REMOTE_COLLECTOR
+            then
+              rc=2
+              operation_status=partial
+              operation_envelope_status=partial
+              jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
+                --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed" \
+                '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,kind:"error",id:"executor:ssh",observed_at:$observed_at,status:"unavailable",confidence:"high",data:{transport:"ssh"},evidence:[],errors:[{code:"executor_update_required",severity:"error",retryable:true,message:"Exact Machine Utilities executor is missing, stale, or failed integrity verification"}]}' >>"$records"
+            fi
+          fi
+          ssh_run "$alias" \
+            "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
         fi
-        ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none "$alias" "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
       fi
       ;;
     codex-remote-control)
@@ -456,7 +708,9 @@ validate_file() {
         (.data.operation_status | IN("queued","running","partial","blocked","failed","completed")) and
         (.data.transport | type == "string" and length > 0)
       else true end) and
-      ([.. | strings | length <= 8192] | all)
+      ([.. | strings |
+        length <= 8192 and (test("[[:cntrl:]]") | not)
+      ] | all)
     ) | all)
   ' "$input" >/dev/null
 }
@@ -617,7 +871,7 @@ record_codex_readiness_command() {
         codex_project_id:($m.codex_project_id // null),
         codex_checked_at:$checked_at
       }
-    elif .kind == "operation" and .id == "collect" then
+    elif .kind == "operation" then
       .data.task_id = ($m.task_id // .data.task_id) |
       .data.correlation_id = ($m.correlation_id // .data.correlation_id)
     else . end
@@ -658,9 +912,9 @@ seal_plan_command() {
       type == "object" and
       (.type | IN(
         "package-metadata-refresh","package-upgrade","package-cleanup",
-        "agent-install","agent-update","agent-remove",
+        "agent-update",
         "auth-reauth","auth-install",
-        "chezmoi-pull","chezmoi-add","chezmoi-apply",
+        "chezmoi-pull","chezmoi-apply",
         "project-clone","project-update"
       )) and
       (.kind | IN("package","agent_runtime","plugin","skill","capability","skill_root","agent_artifact","auth_artifact","file","chezmoi_state","project")) and
@@ -680,8 +934,7 @@ seal_plan_command() {
      elif .domain == "chezmoi" then
        [.operations[] |
          (.type == "chezmoi-pull" and .kind == "file" and .id == "chezmoi:source") or
-         (.type == "chezmoi-apply" and .kind == "chezmoi_state" and .id == "live") or
-         (.type == "chezmoi-add" and .kind == "file" and (.id | startswith("chezmoi:")))
+         (.type == "chezmoi-apply" and .kind == "chezmoi_state" and .id == "live")
        ] | all
      elif .domain == "projects" then
        [.operations[] | .kind == "project" and (.type | startswith("project-"))] | all
@@ -709,6 +962,33 @@ seal_plan_command() {
     printf 'machine-utilities: plan target is not configured: %s\n' "$target" >&2
     exit 64
   }
+  platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
+  if [ "$platform" = windows ]; then
+    jq -e --arg target "$target" '
+      .machines[$target] as $machine |
+      ($machine.expected_hostname | type == "string" and length > 0) and
+      ($machine.expected_user | type == "string" and length > 0) and
+      ($machine.codex_control_project | type == "string" and
+        .projects[$machine.codex_control_project] != null)
+    ' "$config" >/dev/null || {
+      printf 'machine-utilities: Windows mutation requires expected identity and a configured Codex control project\n' >&2
+      exit 65
+    }
+    jq -e '
+      if .domain == "updates" then
+        [.operations[] |
+          .type == "package-upgrade" and .kind == "package" and
+          (.id | startswith("winget:"))
+        ] | all
+      elif .domain == "agents" then
+        [.operations[] | .type == "agent-update"] | all
+      elif .domain == "chezmoi" or .domain == "projects" then true
+      else false end
+    ' "$draft" >/dev/null || {
+      printf 'machine-utilities: operation is not supported by the native Windows executor\n' >&2
+      exit 69
+    }
+  fi
   jq -e -s --arg target "$target" 'map(.host_id) | unique == [$target]' "$snapshot" >/dev/null || {
     printf 'machine-utilities: snapshot does not exclusively describe plan target %s\n' "$target" >&2
     exit 64
@@ -750,17 +1030,22 @@ seal_plan_command() {
   created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-plan.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  executor_status_command "$tmp/executor.json"
+  worker_config_command "$target" "$domain" "$tmp/worker-config.json"
+  worker_config_digest=$(sha256_file "$tmp/worker-config.json")
   jq -S -n \
     --slurpfile draft "$draft" \
+    --slurpfile executor "$tmp/executor.json" \
     --arg created_at "$created_at" \
     --arg config_digest "$config_digest" \
+    --arg worker_config_digest "$worker_config_digest" \
     --arg precondition_digest "$precondition_digest" \
     --arg required_section "$required_section" \
     --arg planning_snapshot_id "$planning_snapshot_id" \
     --arg planning_observed_at "$planning_observed_at" '
       {
         schema:"machine-utilities.plan",
-        schema_version:1,
+        schema_version:2,
         created_at:$created_at,
         domain:$draft[0].domain,
         target:$draft[0].target,
@@ -769,7 +1054,12 @@ seal_plan_command() {
         planning_snapshot_id:$planning_snapshot_id,
         planning_observed_at:$planning_observed_at,
         configuration_digest:{algorithm:"sha256",value:$config_digest},
-        precondition_digest:{algorithm:"sha256",value:$precondition_digest}
+        worker_configuration_digest:{algorithm:"sha256",value:$worker_config_digest},
+        precondition_digest:{algorithm:"sha256",value:$precondition_digest},
+        required_executor:(
+          $executor[0] |
+          {plugin,marketplace,version,integrity_manifest_sha256,files}
+        )
       }' >"$tmp/base.json"
   plan_digest=$(jq -cS . "$tmp/base.json" | sha256_stream)
   plan_id="plan-$(printf '%s' "$plan_digest" | cut -c 1-16)"
@@ -789,7 +1079,7 @@ verify_preconditions_command() {
   check_private_owned_file "$plan" "apply plan"
   jq -e '
     .schema == "machine-utilities.plan" and
-    .schema_version == 1 and
+    .schema_version == 2 and
     (.plan_id | type == "string" and test("^plan-[0-9a-f]{16}$")) and
     (.domain | IN("updates","agents","auth","chezmoi","projects")) and
     (.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
@@ -797,9 +1087,9 @@ verify_preconditions_command() {
     ([.operations[] |
       (.type | IN(
         "package-metadata-refresh","package-upgrade","package-cleanup",
-        "agent-install","agent-update","agent-remove",
+        "agent-update",
         "auth-reauth","auth-install",
-        "chezmoi-pull","chezmoi-add","chezmoi-apply",
+        "chezmoi-pull","chezmoi-apply",
         "project-clone","project-update"
       )) and
       (.kind | IN("package","agent_runtime","plugin","skill","capability","skill_root","agent_artifact","auth_artifact","file","chezmoi_state","project")) and
@@ -819,8 +1109,7 @@ verify_preconditions_command() {
      elif .domain == "chezmoi" then
        [.operations[] |
          (.type == "chezmoi-pull" and .kind == "file" and .id == "chezmoi:source") or
-         (.type == "chezmoi-apply" and .kind == "chezmoi_state" and .id == "live") or
-         (.type == "chezmoi-add" and .kind == "file" and (.id | startswith("chezmoi:")))
+         (.type == "chezmoi-apply" and .kind == "chezmoi_state" and .id == "live")
        ] | all
      elif .domain == "projects" then
        [.operations[] | .kind == "project" and (.type | startswith("project-"))] | all
@@ -830,8 +1119,21 @@ verify_preconditions_command() {
     (.planning_observed_at | type == "string" and fromdateiso8601 > 0) and
     (.configuration_digest.algorithm == "sha256") and
     (.configuration_digest.value | test("^[0-9a-f]{64}$")) and
+    (.worker_configuration_digest.algorithm == "sha256") and
+    (.worker_configuration_digest.value | test("^[0-9a-f]{64}$")) and
     (.precondition_digest.algorithm == "sha256") and
     (.precondition_digest.value | test("^[0-9a-f]{64}$")) and
+    (.required_executor.plugin == "machine-utilities") and
+    (.required_executor.marketplace | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.required_executor.version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.required_executor.integrity_manifest_sha256 | test("^[0-9a-f]{64}$")) and
+    (.required_executor.files | type == "array" and length > 0) and
+    ((.required_executor.files | map(.path) | unique | length) == (.required_executor.files | length)) and
+    ([.required_executor.files[] |
+      (.path | type == "string" and test("^[A-Za-z0-9._/-]+$") and
+        (startswith("/") | not) and (test("(^|/)\\.\\.(/|$)") | not)) and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    ] | all) and
     (.plan_digest.algorithm == "sha256") and
     (.plan_digest.value | test("^[0-9a-f]{64}$")) and
     ([.. | strings | length <= 8192] | all)
@@ -851,29 +1153,41 @@ verify_preconditions_command() {
     exit 65
   }
   config=$(config_path)
-  [ "$(jq -r '.configuration_digest.value' "$plan")" = "$(sha256_file "$config")" ] || {
-    printf 'machine-utilities: configuration changed after planning; create a new plan\n' >&2
-    exit 65
-  }
+  verify_executor_requirement "$plan" >/dev/null
   target=$(jq -r '.target' "$plan")
+  if jq -e '.worker != null' "$config" >/dev/null; then
+    jq -e --arg target "$target" --arg controller_digest "$(jq -r '.configuration_digest.value' "$plan")" '
+      .worker.target == $target and
+      .worker.controller_configuration_digest == $controller_digest
+    ' "$config" >/dev/null &&
+      [ "$(jq -r '.worker_configuration_digest.value' "$plan")" = "$(sha256_file "$config")" ] || {
+        printf 'machine-utilities: bounded worker configuration does not match the sealed plan\n' >&2
+        exit 65
+      }
+  else
+    [ "$(jq -r '.configuration_digest.value' "$plan")" = "$(sha256_file "$config")" ] || {
+      printf 'machine-utilities: configuration changed after planning; create a new plan\n' >&2
+      exit 65
+    }
+  fi
   validate_file "$snapshot"
   jq -e -s --arg target "$target" 'map(.host_id) | unique == [$target]' "$snapshot" >/dev/null || {
     printf 'machine-utilities: current snapshot does not exclusively describe plan target %s\n' "$target" >&2
     exit 64
   }
   transport=$(jq -r --arg target "$target" '.machines[$target].transport' "$config")
-  if [ "$transport" = ssh ]; then
+  if [ "$transport" = local ] || [ "$transport" = ssh ]; then
     expected_hostname=$(jq -r --arg target "$target" '.machines[$target].expected_hostname // empty' "$config")
     expected_user=$(jq -r --arg target "$target" '.machines[$target].expected_user // empty' "$config")
     [ -n "$expected_hostname" ] && [ -n "$expected_user" ] || {
-      printf 'machine-utilities: SSH mutation requires expected_hostname and expected_user for %s\n' "$target" >&2
+      printf 'machine-utilities: mutation requires expected_hostname and expected_user for %s\n' "$target" >&2
       exit 65
     }
     jq -e -s --arg hostname "$expected_hostname" --arg user "$expected_user" '
       any(.[]; .kind == "host" and .status == "present" and
         .data.hostname == $hostname and .data.user == $user)
     ' "$snapshot" >/dev/null || {
-      printf 'machine-utilities: SSH target identity does not match configured hostname/user\n' >&2
+      printf 'machine-utilities: target identity does not match configured hostname/user\n' >&2
       exit 65
     }
   fi
@@ -1105,6 +1419,12 @@ EOF
       case $id in
         skills-cli:*)
           agent_name=${id#skills-cli:}
+          case $agent_name in
+            ''|-*|*[!A-Za-z0-9@._/-]*)
+              printf 'machine-utilities: unsafe skills-cli entity name\n' >&2
+              return 64
+              ;;
+          esac
           { [ $# -eq 6 ] && [ "$1" = npx ] && [ "$2" = skills ] &&
             [ "$3" = update ] && [ "$4" = "$agent_name" ] &&
             [ "$5" = -g ] && [ "$6" = -y ]; } || {
@@ -1114,6 +1434,12 @@ EOF
           ;;
         jsm:*)
           agent_name=${id#jsm:}
+          case $agent_name in
+            ''|-*|*[!A-Za-z0-9._/-]*)
+              printf 'machine-utilities: unsafe JSM entity name\n' >&2
+              return 64
+              ;;
+          esac
           { [ $# -eq 3 ] && [ "$1" = jsm ] && [ "$2" = upgrade ] &&
             [ "$3" = "$agent_name" ]; } || {
             printf 'machine-utilities: unsafe JSM update argv\n' >&2
@@ -1138,10 +1464,6 @@ EOF
           return 69
           ;;
       esac
-      ;;
-    agent-install|agent-remove)
-      printf 'machine-utilities: local agent install/remove is not yet supported safely\n' >&2
-      return 69
       ;;
     auth-reauth)
       jq -e --arg id "$id" --slurpfile operation "$operation" '
@@ -1171,10 +1493,6 @@ EOF
         return 64
       }
       ;;
-    chezmoi-add)
-      printf 'machine-utilities: chezmoi add requires explicit path policy and is not yet supported\n' >&2
-      return 69
-      ;;
     project-clone|project-update)
       project_source=$(jq -r --arg id "$id" '.projects[$id].source // empty' "$config")
       clone_source=$(printf '%s\n' "$project_source" | jq -Rr '
@@ -1192,6 +1510,7 @@ EOF
           printf 'machine-utilities: project clone argv does not match configured source/path\n' >&2
           return 64
         }
+        mkdir -p "$(dirname "$project_path")"
       else
         { [ $# -eq 5 ] && [ "$1" = git ] && [ "$2" = -C ] &&
           [ "$3" = "$project_path" ] && [ "$4" = pull ] &&
@@ -1212,9 +1531,9 @@ EOF
 
 apply_plan_command() {
   plan=$1
-  # $2 remains in the CLI contract for compatibility; apply recaptures trusted state.
-  confirmation=$3
-  output=$4
+  confirmation=$2
+  output=$3
+  native_mode=${4:-false}
   require_jq
   plan_id=$(jq -r '.plan_id // empty' "$plan" 2>/dev/null || true)
   [ -n "$plan_id" ] && [ "$confirmation" = "$plan_id" ] || {
@@ -1224,16 +1543,24 @@ apply_plan_command() {
   config=$(config_path)
   target=$(jq -r '.target' "$plan")
   transport=$(jq -r --arg target "$target" '.machines[$target].transport' "$config")
-  [ "$transport" = local ] || {
-    printf 'machine-utilities: %s apply must execute through its target-native task transport\n' "$transport" >&2
-    exit 69
-  }
+  if [ "$native_mode" = true ]; then
+    [ "$transport" = ssh ] || {
+      printf 'machine-utilities: native POSIX apply requires an SSH-configured target\n' >&2
+      exit 69
+    }
+  else
+    [ "$transport" = local ] || {
+      printf 'machine-utilities: %s apply must execute through its target-native task transport\n' "$transport" >&2
+      exit 69
+    }
+  fi
 
   work=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-apply.XXXXXX")
   trap 'rm -rf "$work"' EXIT HUP INT TERM
   section=$(jq -r '.required_section' "$plan")
-  set -- --target "$target" --section "$section"
+  set -- --target "$target" --section host --section "$section"
   [ "$section" != agents ] || set -- "$@" --section auth
+  [ "$native_mode" != true ] || set -- "$@" --native-target
   if ! "$script_dir/machine-utilities" collect "$@" --output "$work/pre.jsonl"; then
     printf 'machine-utilities: apply preflight inventory was partial\n' >&2
     exit 70
@@ -1241,22 +1568,39 @@ apply_plan_command() {
   verify_preconditions_command "$plan" "$work/pre.jsonl" >/dev/null
   operation_count=$(jq '.operations | length' "$plan")
   index=0
+  apply_status=completed
+  failed_index=null
   while [ "$index" -lt "$operation_count" ]; do
     jq ".operations[$index]" "$plan" >"$work/operation.json"
-    execute_plan_operation "$work/operation.json" "$config" "$target" || {
+    if ! execute_plan_operation "$work/operation.json" "$config" "$target"; then
       printf 'machine-utilities: apply operation %s failed\n' "$index" >&2
-      exit 70
-    }
+      apply_status=partial
+      failed_index=$index
+      break
+    fi
     index=$((index + 1))
   done
 
+  post_status=completed
   if ! "$script_dir/machine-utilities" collect "$@" --output "$work/post.jsonl"; then
     printf 'machine-utilities: apply completed but post-change inventory was partial\n' >&2
-    exit 70
+    post_status=partial
+    apply_status=partial
   fi
   validate_file "$work/post.jsonl"
-  jq -e -n --slurpfile plan "$plan" --slurpfile before "$work/pre.jsonl" \
+  if [ "$apply_status" = completed ] && ! jq -e -n --slurpfile plan "$plan" --slurpfile before "$work/pre.jsonl" \
     --slurpfile records "$work/post.jsonl" '
+    def same_agent($record; $operation):
+      if $operation.kind == "plugin" and
+        ($operation.id | test("^(claude|codex):[^:]+:[^:]+:[^:]+$")) then
+        ($operation.id | split(":")) as $parts |
+        $record.kind == "plugin" and
+        $record.data.agent == $parts[0] and
+        $record.data.marketplace == $parts[1] and
+        $record.data.name == $parts[2]
+      else
+        $record.kind == $operation.kind and $record.id == $operation.id
+      end;
     all($plan[0].operations[];
       if .type == "package-upgrade" then
         . as $operation |
@@ -1276,30 +1620,40 @@ apply_plan_command() {
       elif .type == "agent-update" then
         . as $operation |
         any($records[]; . as $after |
-          .kind == $operation.kind and .id == $operation.id and
+          same_agent(.; $operation) and
           .status == "present" and
-          any($before[]; .kind == $operation.kind and .id == $operation.id and
+          any($before[]; same_agent(.; $operation) and
             (.data | del(.installed_at,.updated_at,.inferred_installed_at,
               .inferred_installed_at_evidence,.inferred_installed_at_confidence)) !=
             ($after.data | del(.installed_at,.updated_at,.inferred_installed_at,
               .inferred_installed_at_evidence,.inferred_installed_at_confidence))))
       else true end)
-  ' >/dev/null || {
+  ' >/dev/null; then
     printf 'machine-utilities: post-change state did not satisfy the sealed plan\n' >&2
-    exit 70
-  }
+    apply_status=partial
+  fi
   snapshot_id=$(jq -r 'select(.kind == "snapshot") | .snapshot_id' "$work/post.jsonl")
   observed_at=$(jq -r 'select(.kind == "snapshot") | .observed_at' "$work/post.jsonl")
   domain=$(jq -r '.domain' "$plan")
   jq -cn --arg schema "$schema" --argjson schema_version "$schema_version" \
     --arg snapshot_id "$snapshot_id" --arg host_id "$target" --arg observed_at "$observed_at" \
     --arg plan_id "$plan_id" --arg domain "$domain" --argjson operation_count "$operation_count" \
+    --argjson completed_operation_count "$index" --argjson failed_operation_index "$failed_index" \
+    --arg operation_status "$apply_status" --arg post_inventory_status "$post_status" \
+    --arg transport "$transport" --slurpfile plan "$plan" \
     '{schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,
-      kind:"operation",id:("apply:"+$plan_id),observed_at:$observed_at,status:"present",confidence:"high",
+      kind:"operation",id:("apply:"+$plan_id),observed_at:$observed_at,
+      status:(if $operation_status == "completed" then "present" else "partial" end),confidence:"high",
       data:{run_id:$snapshot_id,host_id:$host_id,scope:[$domain],phase:"verify",
-        operation_status:"completed",plan_id:$plan_id,domain:$domain,
-        operation_count:$operation_count,transport:"local"},
-      evidence:[{source:"sealed-plan",method:"verified-execution+post-inventory"}],errors:[]}' \
+        operation_status:$operation_status,plan_id:$plan_id,domain:$domain,
+        operation_count:$operation_count,completed_operation_count:$completed_operation_count,
+        failed_operation_index:$failed_operation_index,post_inventory_status:$post_inventory_status,
+        transport:$transport,
+        executor:$plan[0].required_executor},
+      evidence:[{source:"sealed-plan",method:"verified-execution+post-inventory"}],
+      errors:(if $operation_status == "completed" then [] else
+        [{code:"apply_partial",severity:"error",retryable:false,
+          message:"One or more operations or postconditions failed"}] end)}' \
     >"$work/apply.jsonl"
   cat "$work/post.jsonl" "$work/apply.jsonl" |
     jq -sc 'sort_by(.host_id,.kind,.id)[]' >"$work/result.jsonl"
@@ -1307,7 +1661,109 @@ apply_plan_command() {
   safe_output "$work/result.jsonl" "$output"
   trap - EXIT HUP INT TERM
   rm -rf "$work"
+  [ "$apply_status" = completed ] || return 70
 }
+
+apply_ssh_plan_command() (
+  plan=$1
+  confirmation=$2
+  output=$3
+  require_jq
+  check_mutation_config
+  check_private_owned_file "$plan" "apply plan"
+  [ "$(jq -r '.plan_id // empty' "$plan")" = "$confirmation" ] || {
+    printf 'machine-utilities: apply confirmation must equal the sealed plan ID\n' >&2
+    exit 64
+  }
+  target=$(jq -r '.target' "$plan")
+  domain=$(jq -r '.domain' "$plan")
+  config=$(config_path)
+  transport=$(jq -r --arg target "$target" '.machines[$target].transport // empty' "$config")
+  alias=$(jq -r --arg target "$target" '.machines[$target].ssh_alias // empty' "$config")
+  [ "$transport" = ssh ] && [ -n "$alias" ] || {
+    printf 'machine-utilities: apply-ssh-plan requires a configured SSH target\n' >&2
+    exit 64
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-ssh-apply.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  worker_config_command "$target" "$domain" "$tmp/config.json"
+  [ "$(sha256_file "$tmp/config.json")" = "$(jq -r '.worker_configuration_digest.value' "$plan")" ] || {
+    printf 'machine-utilities: generated worker configuration does not match the sealed plan\n' >&2
+    exit 65
+  }
+  remote_dir=$(ssh_run "$alias" \
+    'umask 077; mktemp -d /tmp/machine-utilities-apply.XXXXXX') || {
+      printf 'machine-utilities: SSH target did not create a private workspace\n' >&2
+      exit 70
+    }
+  printf '%s\n' "$remote_dir" |
+    LC_ALL=C grep -Eq '^(/private)?/tmp/machine-utilities-apply\.[A-Za-z0-9]{6,64}$' || {
+      printf 'machine-utilities: unsafe remote temporary path\n' >&2
+      exit 70
+    }
+  if ! scp_run "$tmp/config.json" "$alias:$remote_dir/config.json" ||
+    ! scp_run "$plan" "$alias:$remote_dir/plan.json"; then
+    ssh_run "$alias" \
+      "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+    printf 'machine-utilities: failed to transfer bounded worker inputs\n' >&2
+    exit 70
+  fi
+  marketplace=$(jq -r '.required_executor.marketplace' "$plan")
+  version=$(jq -r '.required_executor.version' "$plan")
+  remote_rc=0
+  ssh_run "$alias" \
+    sh -s -- "$remote_dir" "$marketplace" "$version" "$confirmation" >"$tmp/result.jsonl" <<'REMOTE_WORKER' || remote_rc=$?
+set -eu
+remote_dir=$1
+marketplace=$2
+version=$3
+confirmation=$4
+trap 'rm -rf "$remote_dir"' EXIT HUP INT TERM
+codex_cli=$HOME/.codex/plugins/cache/$marketplace/machine-utilities/$version/scripts/machine-utilities
+claude_cli=$HOME/.claude/plugins/cache/$marketplace/machine-utilities/$version/scripts/machine-utilities
+if [ -x "$codex_cli" ]; then
+  cli=$codex_cli
+elif [ -x "$claude_cli" ]; then
+  cli=$claude_cli
+else
+  printf 'machine-utilities: exact executor is not installed on target\n' >&2
+  exit 69
+fi
+export MACHINE_UTILITIES_CONFIG=$remote_dir/config.json
+"$cli" verify-executor "$remote_dir/plan.json" >/dev/null
+worker_rc=0
+"$cli" apply-native-plan "$remote_dir/plan.json" \
+  "$confirmation" "$remote_dir/result.jsonl" >/dev/null || worker_rc=$?
+cat "$remote_dir/result.jsonl"
+exit "$worker_rc"
+REMOTE_WORKER
+  if [ ! -s "$tmp/result.jsonl" ]; then
+    ssh_run "$alias" \
+      "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+    printf 'machine-utilities: target-native SSH worker returned no result\n' >&2
+    exit 70
+  fi
+  validate_file "$tmp/result.jsonl"
+  jq -e -s --arg target "$target" --arg plan_id "$confirmation" --argjson remote_rc "$remote_rc" '
+    . as $records |
+    ($records | map(.host_id) | unique) == [$target] and
+    any($records[]; .kind == "operation" and .id == ("apply:" + $plan_id) and
+      (if $remote_rc == 0 then
+        .status == "present" and .data.operation_status == "completed"
+      else
+        .status == "partial" and .data.operation_status == "partial"
+      end) and
+      .data.plan_id == $plan_id)
+  ' "$tmp/result.jsonl" >/dev/null || {
+    printf 'machine-utilities: SSH worker returned no authoritative completion record\n' >&2
+    exit 70
+  }
+  safe_output "$tmp/result.jsonl" "$output"
+  if [ "$remote_rc" -ne 0 ]; then
+    printf 'machine-utilities: target-native SSH worker reported a partial apply\n' >&2
+    exit 70
+  fi
+)
 
 command=${1:-}
 [ -n "$command" ] || usage
@@ -1315,13 +1771,21 @@ shift
 case $command in
   validate-config) [ $# -eq 0 ] || usage; validate_config_file ;;
   check-mutation-config) [ $# -eq 0 ] || usage; check_mutation_config ;;
+  worker-config) [ $# -eq 3 ] || usage; worker_config_command "$1" "$2" "$3" ;;
   collect) collect_command "$@" ;;
   validate) [ $# -eq 1 ] || usage; validate_stream "$1" ;;
   render) render_command "$@" ;;
   compare) [ $# -eq 2 ] || usage; compare_command "$1" "$2" ;;
+  executor-status) [ $# -le 1 ] || usage; executor_status_command "${1:--}" ;;
+  verify-executor)
+    [ $# -le 1 ] || usage
+    if [ $# -eq 0 ]; then executor_status_command -; else verify_executor_requirement "$1"; fi
+    ;;
   record-codex-readiness) [ $# -eq 3 ] || usage; record_codex_readiness_command "$1" "$2" "$3" ;;
   seal-plan) [ $# -eq 3 ] || usage; seal_plan_command "$1" "$2" "$3" ;;
   verify-preconditions) [ $# -eq 2 ] || usage; verify_preconditions_command "$1" "$2" ;;
-  apply-plan) [ $# -eq 4 ] || usage; apply_plan_command "$1" "$2" "$3" "$4" ;;
+  apply-plan) [ $# -eq 3 ] || usage; apply_plan_command "$1" "$2" "$3" ;;
+  apply-native-plan) [ $# -eq 3 ] || usage; apply_plan_command "$1" "$2" "$3" true ;;
+  apply-ssh-plan) [ $# -eq 3 ] || usage; apply_ssh_plan_command "$1" "$2" "$3" ;;
   *) usage ;;
 esac

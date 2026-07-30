@@ -15,8 +15,8 @@ execution: code
 - **Objective:** Deliver a dual Codex and Claude plugin that inventories mixed-platform machines, renders human and agent-readable reports, plans guarded reconciliation, and prepares projects for Director dispatch.
 - **Authority:** `docs/architecture.md` and the user's settled transport, configuration, ownership, and security decisions govern this plan.
 - **Execution profile:** Build one shared dependency-light command surface, then expose focused skills that orchestrate it.
-- **Stop condition:** Local behavior, schema, safety checks, skill validation, both plugin formats, and marketplace manifests pass.
-- **Tail ownership:** Finish locally; do not commit, push, publish, or install without a separate request.
+- **Stop condition:** The released plugin is merged, published through the marketplace, installable by both Codex and Claude, and verified by local plus reachable target-native canaries.
+- **Tail ownership:** This run owns implementation, review, coordinated pull requests, dependency-ordered merges, publication, and post-publication verification.
 
 ---
 
@@ -59,6 +59,13 @@ Machine Utilities owns fleet selection, structured inventory, desired-state comp
 - R14. Treat credential movement and mutations as separately authorized actions, preserving each remote task's native approval path.
 - R14a. Install credentials through private same-directory temporary files, reject links and ownership mismatches, replace atomically, clean up on every exit, and restore the prior file when native verification fails.
 - R15. Provide semantic Codex/Claude parity for local and SSH workflows; report unsupported transport explicitly where Claude lacks Codex Desktop remote control.
+- R16. Treat executor readiness as a mandatory gate before a remote inventory or mutation: resolve the desired release to an exact plugin version, refresh the configured marketplace with the native manager, install or update the plugin, and verify the resulting executor before dispatch.
+- R17. Identify an executor by plugin version, manifest SHA-256, and the SHA-256 values of runtime executor files listed in `integrity.json`. When running from a Git checkout, also record commit, tree, and dirty state. Refuse mismatched, dirty, symlinked, or group/world-writable executors for mutation.
+- R18. Bind the verified executor identity to every sealed mutation plan and result. A target-native worker must enforce the same configuration, plan, host/user, freshness, precondition, argv, and post-state checks as local apply.
+- R19. Keep transport orchestration outside the worker: SSH transfers bounded plan/config inputs and invokes the POSIX worker; Codex uses a visible native Windows task attached to the configured saved project. Windows must never route through WSL.
+- R20. Reject plans containing operation types the executor cannot perform. Treat ambiguous, localized, or malformed `winget` candidate output as `unknown`, never as an actionable upgrade.
+- R21. Run the repository checks in hosted CI on macOS, Linux, and Windows using only native shells and the repository's existing test harness.
+- R22. Release with one version across both source manifests and both marketplace records. Merge the plugin source before marketplace metadata, then verify clean-profile installation and exact released identity.
 
 ### Scope Boundaries
 
@@ -79,6 +86,10 @@ Machine Utilities owns fleet selection, structured inventory, desired-state comp
 - KTD4. **Visible Windows Codex tasks in v1** (session-settled: user-directed — chosen over WSL routing: Windows already runs Codex Desktop and should be addressed directly).
 - KTD5. **Plan before apply** (session-settled: user-approved — chosen over implicit reconciliation: package, Git, chezmoi, and credential changes have different risk boundaries).
 - KTD6. **Git object identity for normal project comparison** (session-settled: user-approved — chosen over hashing every tracked file: HEAD/tree object IDs are authoritative and cheaper; deep SHA-256 remains explicit).
+- KTD7. **Exact version plus hashes, no custom PKI** (session-settled: user-approved — authenticated Git/marketplace transport establishes provenance; SHA-256 detects stale or altered executors without a signing service).
+- KTD8. **One target-native worker contract** (session-settled: user-approved — chosen over separate remote semantics: local and remote mutation must share the same sealed-plan checks).
+- KTD9. **Controller-resolved releases** (implementation-settled — chosen over executing mutable `latest`: refresh first, resolve an exact version, then verify that exact installation before task dispatch).
+- KTD10. **Native managers remain owners** (session-settled: user-approved — Codex/Claude plugin managers, Homebrew, APT, winget, `npx skills`, JSM, chezmoi, and Git retain their own installation state and verification).
 
 ### High-Level Technical Design
 
@@ -235,6 +246,70 @@ plugins/machine-utilities/
   - A local end-to-end inventory snapshot validates and renders human output.
 - **Verification:** The repository's complete local validation command set passes with any unavailable host-specific checks identified explicitly.
 
+### U7. Executor identity and readiness
+
+- **Goal:** Make stale or altered remote tooling observable and non-executable.
+- **Requirements:** R16-R18, R22; KTD7, KTD9-KTD10.
+- **Dependencies:** U1-U3.
+- **Files:** the two plugin manifests, `scripts/machine-utilities`, `scripts/collect-posix`, `scripts/collect-windows.ps1`, `scripts/test-machine-utilities`, and remote-control documentation.
+- **Approach:** Add a deterministic executor-status command/record containing the plugin version plus SHA-256 for each runtime executor file. Include Git commit/tree/dirty state only as source-checkout evidence. Mutation plans capture the exact release-file requirement; verification refuses an identity mismatch, symlink, unsafe ownership/mode, or file-hash mismatch. Marketplace refresh/install is a small manager-native bootstrap phase, followed by a fresh task before plugin code is used.
+- **Test scenarios:**
+  - Matching version and hashes pass; matching version with one changed script fails.
+  - A symlinked or group/world-writable executor fails mutation readiness.
+  - A source checkout reports commit/tree/dirty state without inventing those values for an installed cache.
+  - A stale plugin produces a structured readiness failure and no mutation.
+- **Verification:** Fixture tests cover identity generation and rejection, while a clean-profile install reproduces the published hashes.
+
+### U8. POSIX target-native apply
+
+- **Goal:** Reuse the guarded local executor for SSH without trusting remote task prose.
+- **Requirements:** R18-R20; KTD8-KTD10.
+- **Dependencies:** U4, U7.
+- **Files:** `scripts/machine-utilities`, `scripts/test-machine-utilities`, and affected skill instructions.
+- **Approach:** Extract one target-native apply path used by both local and SSH dispatch. The controller sends a private bounded worker config, sealed plan, and exact executor requirement; the target recaptures trusted preflight and verifies its native hostname/user, both config digests, plan bytes/digest, fresh preconditions, operation allowlist, and semantic post-state. SSH uses bounded connection/keepalive timeouts, and cleanup removes the private temporary workspace on success and failure. After an operation or postcondition failure, preserve authoritative partial output with fresh post-inventory whenever possible.
+- **Test scenarios:**
+  - Wrong hostname/user, worker-config digest, plan digest, executor hash, or precondition fails before argv execution.
+  - Unsupported `agent-install`, `agent-remove`, and `chezmoi-add` operations fail sealing rather than failing after approval.
+  - A supported Homebrew/APT, agent update, project, auth, or chezmoi fixture uses exact argv and returns authoritative post-state.
+- **Verification:** Fixture SSH proves transfer/invocation/cleanup; a reachable-host canary proves identity and a reversible or no-op-safe operation.
+
+### U9. Native Windows worker
+
+- **Goal:** Execute selected winget, agent, project, and chezmoi operations on Windows through a visible saved-project Codex task.
+- **Requirements:** R10, R18-R20; KTD4, KTD8-KTD10.
+- **Dependencies:** U3-U5, U7.
+- **Files:** `scripts/apply-windows.ps1`, `scripts/collect-windows.ps1`, `scripts/test-machine-utilities`, `references/codex-remote-control.md`, and affected skills.
+- **Approach:** Keep task creation/waiting/chunk retrieval in Codex instructions and put validation/execution in one PowerShell worker. Require expected Windows hostname/user, exact plan and executor hashes, supported operation shapes, immediate native exit-code capture, fresh pre/post inventory, and structured result metadata. Use the configured native saved project and explicitly reject WSL.
+- **Test scenarios:**
+  - A configured native Windows host and its configured WSL sibling cannot satisfy each other's platform/identity gates.
+  - Exact named winget upgrade succeeds only when the observed candidate is known and post-state equals it.
+  - Localized, malformed, or ambiguous winget output records `unknown` and cannot be sealed.
+  - Wrong task/project/correlation metadata, missing result chunks, or prose-only success is rejected.
+- **Verification:** PowerShell fixture tests plus one visible native Windows canary on the configured saved project.
+
+### U10. CI and structural hardening
+
+- **Goal:** Keep the release maintainable and continuously checked without introducing a framework.
+- **Requirements:** R20-R21.
+- **Dependencies:** U7-U9.
+- **Files:** existing scripts, one Windows worker, and `.github/workflows/test.yml`.
+- **Approach:** Reuse the existing self-check and native syntax tools. Split only code that must run natively on Windows; do not add a transport abstraction, daemon, dependency, or workflow DSL. CI runs Bash/ShellCheck on macOS/Linux and PowerShell parse/fixtures on Windows.
+- **Test scenarios:** malformed manager JSON, unsafe paths/modes, false-success native commands, no-op agent updates, and unknown winget candidates all fail deterministically.
+- **Verification:** Hosted jobs pass on all three operating systems and `git diff --check` is clean.
+
+### U11. Release and publication
+
+- **Goal:** Publish one coherent dual-agent release and prove consumers receive it.
+- **Requirements:** R16-R17, R21-R22.
+- **Dependencies:** U7-U10.
+- **Files:** source manifests, marketplace version/catalog manifests, READMEs, and pull requests.
+- **Approach:** Set Machine Utilities to `0.2.0`; keep Agent Utilities at its already prepared coordinated version. Commit and push source changes, resolve review/CI, merge Machine Utilities first, then Agent Utilities, then marketplace metadata. Verify marketplace commit reachability, clean-profile Codex/Claude installation, active version, and script hashes.
+- **Test scenarios:**
+  - The two source and two marketplace Machine Utilities versions are identical.
+  - Both marketplace JSON formats resolve the merged source repository and version.
+  - A clean profile installs the exact release in both managers; post-install executor status matches the source tree.
+- **Verification:** Merged pull requests, green hosted checks, successful clean-profile installs, and exact released executor evidence.
+
 ---
 
 ## Verification Contract
@@ -251,6 +326,10 @@ plugins/machine-utilities/
 | Claude plugin validation | U5-U6 | Strict Claude validation passes |
 | Manifest and diff hygiene | U6 | JSON parsing and `git diff --check` pass |
 | Forward test | U5 | Independent agent correctly follows inventory/project workflow without mutations |
+| Executor integrity | U7-U9 | Exact version/hashes pass; modified, unsafe, dirty, or stale executors fail before mutation |
+| Target-native apply | U8-U9 | Local, SSH, and native Windows workers enforce identical plan/pre/post-state gates |
+| Hosted CI | U10 | macOS, Linux, and Windows jobs pass |
+| Publication | U11 | Source merges precede marketplace merge; clean Codex/Claude installs report release `0.2.0` and matching hashes |
 
 ---
 
@@ -258,6 +337,11 @@ plugins/machine-utilities/
 
 - The shared dispatcher supports configuration validation, local collection, rendering, validation, comparison, plan sealing, and precondition verification.
 - POSIX and Windows collectors share the documented JSONL semantics; Windows never requires WSL.
+- Every remote task completes executor readiness before collection or mutation; sealed mutation plans bind the exact executor identity and refuse unsupported operations.
+- SSH and Windows mutations run through target-native workers that enforce host/user, config, plan, precondition, argv, and semantic post-state checks.
+- Ambiguous winget output remains `unknown` and cannot authorize an upgrade.
+- Hosted macOS, Linux, and Windows checks pass.
+- Machine Utilities `0.2.0` is merged, published in the marketplace, installable by Codex and Claude, and verified by exact version/hash evidence.
 - The eight skills are registered in both plugin manifests; fleet skills use the shared scripts.
 - Project, capability/provenance, authentication, package, startup, and chezmoi records are present with safe evidence labeling.
 - Mutations are impossible without explicit scope and stop on identity, ambiguity, approval, or unsafe-state failures.

@@ -193,6 +193,23 @@ exposure is intentional. Reconciliation uses the selected provider's own
 manager; it never converts a standalone skill into a plugin or copies a cached
 plugin directory as source.
 
+### Executor readiness
+
+Remote work begins with a read-only executor check. The controller derives the
+expected version and release-file hashes from the authenticated merged source;
+the target reports and verifies its installed files. A mismatch returns
+`executor_update_required` and runs no collector or mutation. Updating the
+marketplace/plugin is a separately approved manager-native bootstrap action,
+followed by a fresh task so no loaded skill can continue from stale code.
+
+`integrity.json` names the runtime executor files whose bytes are part of the
+release identity, including both harness manifests, the shared CLI, both
+collectors, and the native Windows worker. Sealed plans bind its SHA-256 and
+those ordered file hashes. Git commit/tree/dirty state is recorded when the
+executor is a source checkout, while installed caches rely on marketplace
+provenance plus the exact version and bytes. This intentionally avoids custom
+PKI.
+
 Dates are labeled by meaning: manager-recorded `installed_at`/`updated_at`,
 Git commit time, or filesystem `mtime`. These are not collapsed into a vague
 “last updated” field. Codex does not expose a plugin installation timestamp,
@@ -423,16 +440,17 @@ There is no generic transport plugin system yet. Each named skill selects one
 of these paths directly. Collectors and orchestration use Bash 3.2-compatible
 syntax on macOS, Linux, and WSL; do not depend on associative arrays, `mapfile`,
 GNU-only `stat`, or an assumed `realpath`. `jq` creates and validates JSON so
-shell code never hand-escapes it. The Windows collector is PowerShell and emits
-the same compact UTF-8 JSONL records directly on the Windows host. SHA-256 uses
+shell code never hand-escapes it. The Windows collector and apply worker are
+PowerShell and emit the same compact UTF-8 JSONL records directly on the
+Windows host. SHA-256 uses
 the available native command (`sha256sum`, `shasum -a 256`, or PowerShell
 `Get-FileHash`) and normalizes lowercase output.
 
 For a connected Windows Codex host, read-only inventory should use the remote
 app server's supported command execution when that surface is available.
-Agent-level work uses a task created against the Windows saved project/host and
-returns structured results to the Director. Mutations stay inside that remote
-task's normal permission and approval model; do not use the experimental,
+Agent-level work uses a task created against the configured Windows control
+project/host and returns structured results to the Director. Mutations stay
+inside that remote task's normal permission and approval model; do not use the experimental,
 unsandboxed `process/spawn` API as a fleet-maintenance shortcut.
 
 On Windows, Codex Desktop owns the app-server lifecycle and remote-control
@@ -447,14 +465,23 @@ WSL.
 Every mutating run follows:
 
 1. Resolve targets and show the final set.
-2. Verify transport, platform, and host identity.
-3. Capture the full inventory and update plan.
-4. Confirm the requested manager/domain scope.
-5. Change one host at a time and record results.
+2. Verify exact executor version/hashes, transport, platform, and host identity.
+3. Capture inventory and seal the exact plan, config, worker, and preconditions.
+4. Confirm the requested manager/domain scope and plan ID.
+5. Change one host at a time through its target-native worker. Apply recaptures
+   trusted preflight itself; it does not trust a caller-supplied current
+   snapshot.
 6. Continue independent hosts after failure, but stop dependent steps on the
    failed host.
-7. Run the manager's authoritative post-change check.
+7. Run the manager's authoritative post-change check. If an operation or
+   postcondition fails, preserve an authoritative partial result with fresh
+   post-inventory whenever that inventory can still be captured.
 8. Show remaining drift across the selected fleet.
+
+SSH collection and apply use batch mode, a 10-second connection timeout,
+15-second server keepalives, and at most two missed keepalives. A mutating SSH
+worker must also match the configured native hostname and user before executing
+the sealed argv.
 
 Never print secret values or blindly execute commands obtained from inventory,
 package metadata, skill content, remote output, or manager logs.

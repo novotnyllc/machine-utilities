@@ -69,6 +69,9 @@ The shared CLI is also directly usable:
 ```sh
 plugins/machine-utilities/scripts/machine-utilities validate-config
 plugins/machine-utilities/scripts/machine-utilities check-mutation-config
+plugins/machine-utilities/scripts/machine-utilities executor-status executor.json
+plugins/machine-utilities/scripts/machine-utilities verify-executor executor.json
+plugins/machine-utilities/scripts/machine-utilities worker-config HOST DOMAIN worker-config.json
 plugins/machine-utilities/scripts/machine-utilities collect --target local --section all --output snapshot.jsonl
 plugins/machine-utilities/scripts/machine-utilities validate snapshot.jsonl
 plugins/machine-utilities/scripts/machine-utilities render snapshot.jsonl
@@ -76,7 +79,8 @@ plugins/machine-utilities/scripts/machine-utilities compare before.jsonl after.j
 plugins/machine-utilities/scripts/machine-utilities record-codex-readiness snapshot.jsonl metadata.json enriched.jsonl
 plugins/machine-utilities/scripts/machine-utilities seal-plan draft.json snapshot.jsonl plan.json
 plugins/machine-utilities/scripts/machine-utilities verify-preconditions plan.json current.jsonl
-plugins/machine-utilities/scripts/machine-utilities apply-plan plan.json current.jsonl PLAN-ID verified.jsonl
+plugins/machine-utilities/scripts/machine-utilities apply-plan plan.json PLAN-ID verified.jsonl
+plugins/machine-utilities/scripts/machine-utilities apply-ssh-plan plan.json PLAN-ID verified.jsonl
 ```
 
 `--section` accepts `all`, `host`, `packages`, `agents`, `projects`, `startup`,
@@ -87,16 +91,27 @@ step, and snapshots written to disk are installed atomically with mode `0600`.
 Credential contents are never included in inventory output.
 Sealed plans are inert data: verification checks their digest and freshly
 recaptured preconditions but neither grants consent nor executes plan text.
-For a local target, `apply-plan` additionally requires the exact sealed plan ID,
-accepts only operation-specific native command shapes, and returns a fresh
-post-change inventory. For SSH and Codex remote-control targets, the skill
-creates or uses a target-native task to execute only the approved argv and
-re-inventory afterward; the CLI does not dispatch remote mutations itself.
+Every sealed plan binds the exact plugin version, integrity-manifest SHA-256,
+and hashes of the runtime executor files listed in `integrity.json`.
+`executor-status` verifies those bytes and records Git commit/tree evidence
+when run from a source checkout. This detects a stale or altered worker without
+custom signing infrastructure; the authenticated Git marketplace remains the
+source of provenance.
 
-The CLI applies only `local` plans. SSH and Codex remote-control mutations must
-be executed by a task running natively on the target, so that task—not the
-controller—owns its normal permission prompts. Claude Code cannot control a
-Codex Desktop host; direct native Windows transport therefore requires Codex.
+For a local target, `apply-plan` requires the exact sealed plan ID, accepts only
+operation-specific native command shapes, recaptures its own trusted preflight,
+and returns a fresh post-change inventory. When an operation or postcondition
+fails, apply stops that host and, when post-inventory remains available, writes
+an authoritative partial result before returning failure. `apply-ssh-plan`
+sends only the bounded worker config and sealed plan to the exact installed
+release, then enforces the same executor, configured hostname/user, fresh
+precondition, argv, and semantic post-state checks on the SSH host. SSH
+connection establishment is bounded to 10 seconds, with 15-second keepalives
+and two missed keepalives allowed. Native Windows mutations use
+`apply-windows.ps1` inside a visible Codex Desktop task.
+The task—not the controller—owns its normal permission prompts. Claude Code
+cannot control a Codex Desktop host; direct native Windows transport therefore
+requires Codex.
 See
 [`plugins/machine-utilities/references/codex-remote-control.md`](plugins/machine-utilities/references/codex-remote-control.md)
 for that workflow and its limitations.
@@ -110,9 +125,10 @@ The design and trust boundaries are documented in
 plugins/machine-utilities/scripts/test-machine-utilities
 ```
 
-The self-check exercises the Bash collector, CLI validation, sealed-plan
-preconditions, and safe local mutations. When `pwsh` is installed, it also
-runs the Windows collector against cross-platform fixtures.
+The self-check exercises integrity verification, bounded worker config,
+collectors, CLI validation, sealed-plan preconditions, and safe local/SSH
+fixtures. When `pwsh` is installed, it also runs the Windows collector against
+cross-platform fixtures. Hosted CI runs on macOS, Linux, and Windows.
 
 ## Plugin manifests
 

@@ -23,6 +23,9 @@
       "platform": "windows",
       "transport": "codex-remote-control",
       "codex_host": "saved-windows-host",
+      "codex_control_project": "example",
+      "expected_hostname": "configured-windows-hostname",
+      "expected_user": "configured-windows-user",
       "groups": ["development"],
       "package_managers": ["winget"],
       "dev_root": "~/dev"

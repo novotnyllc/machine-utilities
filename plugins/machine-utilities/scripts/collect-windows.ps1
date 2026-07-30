@@ -107,8 +107,18 @@ function Test-JsmVersion([object]$Value) {
         $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]
 }
 
+function Test-ManagerEntityName([object]$Value, [string]$Manager) {
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $false }
+    $Pattern = if ($Manager -eq "skills-cli") {
+        "^[A-Za-z0-9@._/][A-Za-z0-9@._/-]*$"
+    } else {
+        "^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"
+    }
+    return [string]$Value -match $Pattern
+}
+
 function Test-JsmSkill([object]$Skill) {
-    if ($null -eq $Skill -or [string]::IsNullOrWhiteSpace([string]$Skill.name)) { return $false }
+    if ($null -eq $Skill -or -not (Test-ManagerEntityName $Skill.name "jsm")) { return $false }
     if (-not (Test-JsmVersion $Skill.version) -or -not (Test-JsmVersion $Skill.latest_version)) { return $false }
     foreach ($Field in @("installed_at")) {
         if ($null -ne $Skill.$Field -and $Skill.$Field -isnot [string]) { return $false }
@@ -176,7 +186,9 @@ function Get-AuthHealth([object]$Definition) {
 
 function Test-BoundedStrings([object]$Value) {
     if ($null -eq $Value) { return $true }
-    if ($Value -is [string]) { return $Value.Length -le 8192 }
+    if ($Value -is [string]) {
+        return $Value.Length -le 8192 -and $Value -notmatch "[\x00-\x1f\x7f-\x9f]"
+    }
     if ($Value -is [Collections.IDictionary]) {
         foreach ($Key in $Value.Keys) {
             if (-not (Test-BoundedStrings $Key) -or -not (Test-BoundedStrings $Value[$Key])) { return $false }
@@ -201,12 +213,25 @@ function Assert-WorkerConfig([object]$Value) {
     if ($HostId -notmatch '^[A-Za-z0-9._-]+$' -or $Value.version -ne 1 -or $null -eq $Value.machines.$HostId) {
         throw "Invalid version 1 configuration or unknown host"
     }
-    if (-not (Test-BoundedStrings $Value)) { throw "Configuration contains an oversized string" }
+    if (-not (Test-BoundedStrings $Value)) { throw "Configuration contains an oversized or control string" }
+    if ($null -eq $Value.worker -or
+        [string]$Value.worker.target -ne $HostId -or
+        [string]$Value.worker.controller_configuration_digest -ne $ControllerConfigDigest.ToLowerInvariant()) {
+        throw "Worker configuration is not bound to this controller and target"
+    }
     $ConfiguredMachine = $Value.machines.$HostId
     if ($ConfiguredMachine.platform -ne "windows" -or
         $ConfiguredMachine.transport -ne "codex-remote-control" -or
         [string]::IsNullOrWhiteSpace([string]$ConfiguredMachine.codex_host)) {
         throw "Windows worker requires direct codex-remote-control transport"
+    }
+    if ([string]$ConfiguredMachine.expected_hostname -notmatch "^[A-Za-z0-9._-]+$" -or
+        [string]$ConfiguredMachine.expected_user -notmatch "^[A-Za-z0-9._@-]+$") {
+        throw "Windows worker requires expected_hostname and expected_user"
+    }
+    if ([string]$env:COMPUTERNAME -ine [string]$ConfiguredMachine.expected_hostname -or
+        [string][Environment]::UserName -ine [string]$ConfiguredMachine.expected_user) {
+        throw "Windows target hostname or user does not match configuration"
     }
     if (@($ConfiguredMachine.groups | Where-Object { $_ -notmatch '^[A-Za-z0-9._-]+$' }).Count -gt 0) {
         throw "Invalid machine group"
@@ -231,7 +256,7 @@ function Assert-WorkerConfig([object]$Value) {
     }
     if ($null -ne $Value.capabilities) {
         foreach ($Property in $Value.capabilities.PSObject.Properties) {
-            if ($Property.Name -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid capability configuration" }
+            if ($Property.Name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') { throw "Invalid capability configuration" }
             $ProviderCount = 0
             foreach ($Agent in @("codex", "claude")) {
                 $Definition = $Property.Value.$Agent
@@ -241,8 +266,8 @@ function Assert-WorkerConfig([object]$Value) {
                     [string]::IsNullOrWhiteSpace([string]$Definition.source) -or
                     [string]$Definition.source -match '\?' -or
                     [string]$Definition.source -match '^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@' -or
-                    ($null -ne $Definition.skill -and [string]$Definition.skill -notmatch '^[A-Za-z0-9._-]+$') -or
-                    ($null -ne $Definition.name -and [string]$Definition.name -notmatch '^[A-Za-z0-9._-]+$')) {
+                    ($null -ne $Definition.skill -and [string]$Definition.skill -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') -or
+                    ($null -ne $Definition.name -and [string]$Definition.name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$')) {
                     throw "Invalid capability provider configuration"
                 }
                 if ([string]$Definition.provider -eq "plugin" -and
@@ -346,17 +371,41 @@ if (Test-Section "packages") {
         } else {
             $Temp = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-winget-" + [Guid]::NewGuid().ToString("N") + ".json")
             $Candidates = @{}
+            $CandidateQueryAuthoritative = $false
             try {
                 $UpgradeLines = @(& winget upgrade --accept-source-agreements --disable-interactivity 2>$null)
                 $UpgradeSucceeded = $?
                 $UpgradeExitCode = $LASTEXITCODE
                 if ($UpgradeSucceeded -and ($null -eq $UpgradeExitCode -or $UpgradeExitCode -eq 0)) {
-                    foreach ($Line in $UpgradeLines) {
-                        if ([string]$Line -match '^(?<name>.*?)\s{2,}(?<id>\S+)\s+(?<installed>\S+)\s+(?<available>\S+)\s+(?<source>\S+)\s*$' -and
-                            [string]$Matches.id -notin @("Id", "ID") -and
-                            [string]$Matches.available -notmatch '^-+$') {
+                    $HeaderIndex = -1
+                    for ($Index = 0; $Index -lt $UpgradeLines.Count; $Index++) {
+                        if ([string]$UpgradeLines[$Index] -match '^Name\s{2,}Id\s{2,}Version\s{2,}Available\s{2,}Source\s*$') {
+                            $HeaderIndex = $Index
+                            break
+                        }
+                    }
+                    if ($HeaderIndex -ge 0 -and $HeaderIndex + 1 -lt $UpgradeLines.Count -and
+                        [string]$UpgradeLines[$HeaderIndex + 1] -match '^-{3,}(\s+-{2,}){4}\s*$') {
+                        $CandidateQueryAuthoritative = $true
+                        foreach ($Line in @($UpgradeLines | Select-Object -Skip ($HeaderIndex + 2))) {
+                            if ([string]::IsNullOrWhiteSpace([string]$Line)) { continue }
+                            if ([string]$Line -notmatch '^(?<name>.*?)\s{2,}(?<id>\S+)\s+(?<installed>\S+)\s+(?<available>\S+)\s+(?<source>\S+)\s*$' -or
+                                [string]$Matches.available -match '^-+$' -or
+                                $Candidates.ContainsKey([string]$Matches.id)) {
+                                $CandidateQueryAuthoritative = $false
+                                $Candidates.Clear()
+                                break
+                            }
                             $Candidates[[string]$Matches.id] = [string]$Matches.available
                         }
+                    } elseif (($UpgradeLines -join "`n") -match
+                        '(?m)^(No installed package found matching input criteria|No applicable upgrade found)\.?$') {
+                        $CandidateQueryAuthoritative = $true
+                    }
+                    if (-not $CandidateQueryAuthoritative) {
+                        Add-Record -Kind "error" -Id "packages:winget-updates" -Status "partial" -Confidence "high" -Errors @(
+                            @{ code = "candidate_query_unverified"; severity = "warning"; retryable = $true; message = "winget upgrade output was not an authoritative package table" }
+                        )
                     }
                 } else {
                     Add-Record -Kind "error" -Id "packages:winget-updates" -Status "unavailable" -Confidence "medium" -Errors @(
@@ -379,12 +428,15 @@ if (Test-Section "packages") {
                             } else {
                                 $null
                             }
-                            Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" -Confidence "high" -Data @{
+                            Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" `
+                                -Confidence $(if ($CandidateQueryAuthoritative) { "high" } else { "medium" }) -Data @{
                                 manager = "winget"
                                 name = $Name
                                 installed_version = Limit-Text $Package.Version
                                 candidate_version = $Candidate
-                                update_available = $null -ne $Candidate -and $Candidate -ne [string]$Package.Version
+                                update_available = if ($CandidateQueryAuthoritative) {
+                                    $null -ne $Candidate -and $Candidate -ne [string]$Package.Version
+                                } else { $null }
                                 source = Limit-Text $Source.SourceDetails.Name
                             } -Evidence @(@{ source = "package-manager"; method = "winget-export+upgrade-list" })
                         }
@@ -540,6 +592,9 @@ if (Test-Section "agents") {
             $Skills = if ($null -ne $Lock.skills) { $Lock.skills } else { $Lock }
             $SkillLockEntries = @($Skills.PSObject.Properties)
             foreach ($Property in $Skills.PSObject.Properties) {
+                if (-not (Test-ManagerEntityName $Property.Name "skills-cli")) {
+                    throw "skills-cli lock contains an option-shaped or invalid skill name"
+                }
                 $Value = $Property.Value
                 Add-Record -Kind "skill" -Id ("skills-cli:" + (Limit-Text $Property.Name)) -Status "present" -Confidence "high" -Data @{
                     manager = "skills-cli"
