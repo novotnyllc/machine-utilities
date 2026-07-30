@@ -22,6 +22,13 @@ assert_contains() {
   esac
 }
 
+test_file_mode() {
+  value=$(stat -f %Lp "$1" 2>/dev/null) ||
+    value=$(stat -c %a "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
+}
+
 cat >"$tmp/config.json" <<'JSON'
 {
   "version": 1,
@@ -579,7 +586,7 @@ if MACHINE_UTILITIES_CONFIG="$tmp/invalid-auth-mode.json" \
   fail "encrypted auth artifact accepted a non-private mode"
 fi
 "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
-[ "$(stat -f %Lp "$tmp/snapshot.jsonl" 2>/dev/null || stat -c %a "$tmp/snapshot.jsonl")" = 600 ] ||
+[ "$(test_file_mode "$tmp/snapshot.jsonl")" = 600 ] ||
   fail "snapshot mode is not 600"
 "$cli" validate "$tmp/snapshot.jsonl"
 if [ "$(uname -s)" = Linux ]; then
@@ -1154,7 +1161,7 @@ fi
 [ "$(jq -r '.worker_configuration_digest.value' "$tmp/plan.json")" = \
   "$(shasum -a 256 "$tmp/local-worker-config.json" | awk '{print $1}')" ] ||
   fail "sealed plan did not bind the deterministic worker config"
-[ "$(stat -f %Lp "$tmp/plan.json" 2>/dev/null || stat -c %a "$tmp/plan.json")" = 600 ] ||
+[ "$(test_file_mode "$tmp/plan.json")" = 600 ] ||
   fail "sealed plan mode is not 600"
 verification=$("$cli" verify-preconditions "$tmp/plan.json" "$tmp/snapshot-2.jsonl")
 assert_contains "$verification" '"verified":true'
@@ -1489,8 +1496,7 @@ if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; t
 fi
 
 cp "$tmp/home/.test-auth" "$tmp/auth-before-signal"
-auth_mode_before_signal=$(stat -f %Lp "$tmp/home/.test-auth" 2>/dev/null ||
-  stat -c %a "$tmp/home/.test-auth")
+auth_mode_before_signal=$(test_file_mode "$tmp/home/.test-auth")
 printf '%s\n' '{"portable":"signal-interrupted"}' >"$OP_SECRET_FILE"
 rm -f "$tmp/auth-signal-marker"
 if AUTH_CHECK_SIGNAL_PARENT=1 AUTH_CHECK_SIGNAL_MARKER="$tmp/auth-signal-marker" \
@@ -1502,8 +1508,7 @@ fi
   fail "auth signal fixture did not interrupt verification after installation"
 cmp -s "$tmp/auth-before-signal" "$tmp/home/.test-auth" ||
   fail "signal interruption did not restore original credential bytes"
-[ "$(stat -f %Lp "$tmp/home/.test-auth" 2>/dev/null ||
-  stat -c %a "$tmp/home/.test-auth")" = "$auth_mode_before_signal" ] ||
+[ "$(test_file_mode "$tmp/home/.test-auth")" = "$auth_mode_before_signal" ] ||
   fail "signal interruption did not restore original credential mode"
 if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; then
   fail "signal-interrupted auth install left a temporary or backup file"
