@@ -4,6 +4,7 @@ set -eu
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cli="$script_dir/machine-utilities"
 pwsh_command=$(command -v pwsh 2>/dev/null || true)
+real_git=$(command -v git)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/home/dev/example" "$tmp/bin"
@@ -55,6 +56,12 @@ cat >"$tmp/config.json" <<'JSON'
       "path": "example",
       "groups": ["development"],
       "codex": true
+    },
+    "clone-example": {
+      "source": "owner/clone-example",
+      "path": "clone-example",
+      "groups": ["development"],
+      "codex": false
     }
   },
   "capabilities": {
@@ -235,6 +242,15 @@ cat >"$tmp/bin/npx" <<'SH'
 #!/usr/bin/env bash
 [ "$#" -eq 5 ] && [ "$1" = skills ] && [ "$2" = update ] &&
   [ "$3" = capability-example ] && [ "$4" = -g ] && [ "$5" = -y ] || exit 64
+if [ "${SKILLS_UPDATE_TIMESTAMP_ONLY:-0}" = 1 ]; then
+  jq '.skills."capability-example".updatedAt = "2026-02-03"' \
+    "$HOME/.agents/.skill-lock.json" >"$HOME/.agents/.skill-lock.json.new"
+  mv "$HOME/.agents/.skill-lock.json.new" "$HOME/.agents/.skill-lock.json"
+elif [ "${SKILLS_UPDATE_NOOP:-0}" != 1 ]; then
+  jq '.skills."capability-example".skillFolderHash = "updated-hash"' \
+    "$HOME/.agents/.skill-lock.json" >"$HOME/.agents/.skill-lock.json.new"
+  mv "$HOME/.agents/.skill-lock.json.new" "$HOME/.agents/.skill-lock.json"
+fi
 : >"$SKILLS_UPDATE_MARKER"
 SH
 chmod +x "$tmp/bin/npx"
@@ -274,6 +290,19 @@ printf 'ok\n' >"$tmp/home/dev/example/file.txt"
 git -C "$tmp/home/dev/example" add file.txt
 git -C "$tmp/home/dev/example" -c commit.gpgsign=false commit -qm initial
 git -C "$tmp/home/dev/example" remote add origin ssh://user:secret@github.com/owner/example.git
+git clone -q --bare "$tmp/home/dev/example" "$tmp/clone-example.git"
+
+cat >"$tmp/bin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 4 ] && [ "$1" = clone ] && [ "$2" = -- ] &&
+  [ "$3" = https://github.com/owner/clone-example.git ]; then
+  "$REAL_GIT" clone -q -- "$GIT_CLONE_FIXTURE" "$4" &&
+    "$REAL_GIT" -C "$4" remote set-url origin "$3"
+  exit
+fi
+exec "$REAL_GIT" "$@"
+SH
+chmod +x "$tmp/bin/git"
 
 export HOME="$tmp/home"
 export PATH="$tmp/bin:/usr/bin:/bin"
@@ -282,6 +311,8 @@ export BREW_STATE_FILE="$tmp/brew-state"
 export OP_SECRET_FILE="$tmp/op-secret"
 export CHEZMOI_APPLY_MARKER="$tmp/chezmoi-applied"
 export SKILLS_UPDATE_MARKER="$tmp/skills-updated"
+export REAL_GIT="$real_git"
+export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
 printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 
@@ -841,9 +872,41 @@ cat >"$tmp/agent-plan-draft.json" <<'JSON'
 JSON
 "$cli" seal-plan "$tmp/agent-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/agent-plan.json"
 agent_plan_id=$(jq -r '.plan_id' "$tmp/agent-plan.json")
+if SKILLS_UPDATE_NOOP=1 "$cli" apply-plan "$tmp/agent-plan.json" \
+  "$tmp/snapshot-2.jsonl" "$agent_plan_id" "$tmp/agent-noop.jsonl" >/dev/null 2>&1; then
+  fail "agent update reported success without changing manager state"
+fi
+if SKILLS_UPDATE_TIMESTAMP_ONLY=1 "$cli" apply-plan "$tmp/agent-plan.json" \
+  "$tmp/snapshot-2.jsonl" "$agent_plan_id" "$tmp/agent-timestamp-only.jsonl" >/dev/null 2>&1; then
+  fail "agent update treated a timestamp-only change as updated manager state"
+fi
+cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
+rm -f "$SKILLS_UPDATE_MARKER"
 "$cli" apply-plan "$tmp/agent-plan.json" "$tmp/snapshot-2.jsonl" \
   "$agent_plan_id" "$tmp/agent-applied.jsonl"
 [ -e "$SKILLS_UPDATE_MARKER" ] || fail "safe skills-cli update was not executed"
+
+cat >"$tmp/project-plan-draft.json" <<JSON
+{
+  "domain": "projects",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "project-clone",
+      "kind": "project",
+      "id": "clone-example",
+      "argv": ["git", "clone", "--", "https://github.com/owner/clone-example.git", "$tmp/home/dev/clone-example"]
+    }
+  ]
+}
+JSON
+"$cli" seal-plan "$tmp/project-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/project-plan.json"
+project_plan_id=$(jq -r '.plan_id' "$tmp/project-plan.json")
+"$cli" apply-plan "$tmp/project-plan.json" "$tmp/snapshot-2.jsonl" \
+  "$project_plan_id" "$tmp/project-applied.jsonl"
+[ "$(jq -r 'select(.kind == "project" and .id == "clone-example") | .data.repository_readiness' \
+  "$tmp/project-applied.jsonl")" = ready ] ||
+  fail "GitHub shorthand project source was not expanded and cloned"
 
 cat >"$tmp/chezmoi-plan-draft.json" <<'JSON'
 {

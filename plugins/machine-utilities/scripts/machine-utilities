@@ -1177,12 +1177,17 @@ EOF
       ;;
     project-clone|project-update)
       project_source=$(jq -r --arg id "$id" '.projects[$id].source // empty' "$config")
+      clone_source=$(printf '%s\n' "$project_source" | jq -Rr '
+        if test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$") then
+          "https://github.com/" + . + ".git"
+        else .
+        end')
       project_relative=$(jq -r --arg id "$id" '.projects[$id].path // empty' "$config")
       dev_root=$(expand_user_path "$(jq -r --arg target "$target" '.machines[$target].dev_root // empty' "$config")")
       project_path=$dev_root/$project_relative
       if [ "$type" = project-clone ]; then
         { [ $# -eq 5 ] && [ "$1" = git ] && [ "$2" = clone ] &&
-          [ "$3" = -- ] && [ "$4" = "$project_source" ] &&
+          [ "$3" = -- ] && [ "$4" = "$clone_source" ] &&
           [ "$5" = "$project_path" ]; } || {
           printf 'machine-utilities: project clone argv does not match configured source/path\n' >&2
           return 64
@@ -1250,7 +1255,8 @@ apply_plan_command() {
     exit 70
   fi
   validate_file "$work/post.jsonl"
-  jq -e -n --slurpfile plan "$plan" --slurpfile records "$work/post.jsonl" '
+  jq -e -n --slurpfile plan "$plan" --slurpfile before "$work/pre.jsonl" \
+    --slurpfile records "$work/post.jsonl" '
     all($plan[0].operations[];
       if .type == "package-upgrade" then
         . as $operation |
@@ -1269,11 +1275,17 @@ apply_plan_command() {
           .status == "present" and .data.drift_count == 0)
       elif .type == "agent-update" then
         . as $operation |
-        any($records[]; .kind == $operation.kind and .id == $operation.id and
-          .status == "present")
+        any($records[]; . as $after |
+          .kind == $operation.kind and .id == $operation.id and
+          .status == "present" and
+          any($before[]; .kind == $operation.kind and .id == $operation.id and
+            (.data | del(.installed_at,.updated_at,.inferred_installed_at,
+              .inferred_installed_at_evidence,.inferred_installed_at_confidence)) !=
+            ($after.data | del(.installed_at,.updated_at,.inferred_installed_at,
+              .inferred_installed_at_evidence,.inferred_installed_at_confidence))))
       else true end)
   ' >/dev/null || {
-    printf 'machine-utilities: post-change package version does not match sealed candidate\n' >&2
+    printf 'machine-utilities: post-change state did not satisfy the sealed plan\n' >&2
     exit 70
   }
   snapshot_id=$(jq -r 'select(.kind == "snapshot") | .snapshot_id' "$work/post.jsonl")
