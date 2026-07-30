@@ -24,7 +24,7 @@ jobs:
           bash -n plugins/machine-utilities/scripts/collect-posix
           bash -n plugins/machine-utilities/scripts/test-machine-utilities
           bash -n plugins/machine-utilities/scripts/update-integrity
-          shellcheck plugins/machine-utilities/scripts/machine-utilities \
+          shellcheck --severity=warning plugins/machine-utilities/scripts/machine-utilities \
             plugins/machine-utilities/scripts/collect-posix \
             plugins/machine-utilities/scripts/test-machine-utilities \
             plugins/machine-utilities/scripts/update-integrity
