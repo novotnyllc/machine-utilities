@@ -1028,7 +1028,7 @@ if has_section startup; then
         printf '%s\n' "$units" | awk 'NF {print $1}' | LC_ALL=C sort -u |
           while IFS= read -r unit; do
             if [ "$scope" = user ]; then
-              active=$(systemctl --user is-active "$unit" 2>/dev/null || printf inactive)
+              active=$(systemctl --user is-active "$unit" 2>/dev/null) || active=inactive
               path=$(systemctl --user show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
               action_line=$(systemctl --user show "$unit" -p ExecStart --value 2>/dev/null | head -1)
               working_directory=$(systemctl --user show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
@@ -1036,7 +1036,7 @@ if has_section startup; then
               next_run=$(systemctl --user show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | head -1)
               last_run=$(systemctl --user show "$unit" -p LastTriggerUSec --value 2>/dev/null | head -1)
             else
-              active=$(systemctl is-active "$unit" 2>/dev/null || printf inactive)
+              active=$(systemctl is-active "$unit" 2>/dev/null) || active=inactive
               path=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
               action_line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null | head -1)
               working_directory=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)

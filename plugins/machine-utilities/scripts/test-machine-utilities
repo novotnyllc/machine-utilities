@@ -357,6 +357,19 @@ fi
 SH
 chmod +x "$tmp/bin/npx"
 
+cat >"$tmp/bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" list-unit-files "*) printf 'fixture.service enabled\n' ;;
+  *" is-active "*) printf 'inactive\n'; exit 3 ;;
+  *" -p ExecStart "*) printf '{ path=/usr/bin/true ; argv[]=/usr/bin/true ; }\n' ;;
+  *" -p Restart "*) printf 'no\n' ;;
+  *" show "*) printf '\n' ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$tmp/bin/systemctl"
+
 cat >"$tmp/bin/ssh" <<'SH'
 #!/usr/bin/env bash
 original=$*
@@ -569,6 +582,11 @@ fi
 [ "$(stat -f %Lp "$tmp/snapshot.jsonl" 2>/dev/null || stat -c %a "$tmp/snapshot.jsonl")" = 600 ] ||
   fail "snapshot mode is not 600"
 "$cli" validate "$tmp/snapshot.jsonl"
+if [ "$(uname -s)" = Linux ]; then
+  [ "$(jq -r 'select(.kind == "startup_task" and .data.scheduler == "systemd-system") |
+    .data.active' "$tmp/snapshot.jsonl" | sort -u)" = inactive ] ||
+    fail "inactive systemd status was duplicated after a nonzero query exit"
+fi
 
 json=$("$cli" render --format json "$tmp/snapshot.jsonl")
 human=$("$cli" render --format human "$tmp/snapshot.jsonl")
