@@ -1136,13 +1136,11 @@ if has_section chezmoi; then
         for (code in counts) print code "\t" counts[code]
       }' "$chezmoi_status" | LC_ALL=C sort | jq -Rsc '
         split("\n") | map(select(length > 0) | split("\t") | {code:.[0],count:(.[1]|tonumber)})')
-      drift_status=present
-      [ "$drift_count" -eq 0 ] || drift_status=partial
       data=$(jq -cn --arg source_path "$source_path" --arg digest "$status_digest" \
         --argjson drift_count "$drift_count" --argjson codes "$status_codes" \
         '{source_path:$source_path,drift_count:$drift_count,status_codes:$codes,
           status_digest:{algorithm:"sha256",value:$digest,scope:"chezmoi-status-output"}}')
-      emit chezmoi_state live "$drift_status" high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
+      emit chezmoi_state live present high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
     else
       emit chezmoi_state live unavailable high "$(jq -cn --arg source_path "$source_path" '{source_path:$source_path}')" \
         '[]' '[{"code":"chezmoi_status_failed","severity":"warning","retryable":true,"message":"chezmoi status failed"}]'

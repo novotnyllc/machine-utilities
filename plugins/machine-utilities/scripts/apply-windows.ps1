@@ -485,10 +485,11 @@ function Get-ProjectCommand([object]$Operation, [object]$Config, [object]$Machin
     return @("git", "-C", $ProjectPath, "pull", "--ff-only")
 }
 
-function Initialize-ProjectCloneParent([object]$Operation, [object]$Config, [object]$Machine) {
+function Prepare-ProjectMutationPath([object]$Operation, [object]$Config, [object]$Machine) {
     $Argv = @(Get-ProjectCommand $Operation $Config $Machine)
+    $IsClone = [string]$Operation.type -eq "project-clone"
     $DevRoot = [IO.Path]::GetFullPath((Resolve-UserPath ([string]$Machine.dev_root)))
-    $ProjectPath = [IO.Path]::GetFullPath([string]$Argv[-1])
+    $ProjectPath = [IO.Path]::GetFullPath([string]$(if ($IsClone) { $Argv[-1] } else { $Argv[2] }))
     $RootPrefix = $DevRoot.TrimEnd(
         [IO.Path]::DirectorySeparatorChar,
         [IO.Path]::AltDirectorySeparatorChar
@@ -496,35 +497,37 @@ function Initialize-ProjectCloneParent([object]$Operation, [object]$Config, [obj
     if (-not $ProjectPath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Project path escapes dev_root"
     }
-    if (Test-Path -LiteralPath $ProjectPath) {
+    if ($IsClone -and $null -ne (Get-Item -LiteralPath $ProjectPath -Force -ErrorAction SilentlyContinue)) {
         throw "Project clone destination is no longer absent"
     }
 
-    if (-not (Test-Path -LiteralPath $DevRoot)) {
+    $RootItem = Get-Item -LiteralPath $DevRoot -Force -ErrorAction SilentlyContinue
+    if ($null -eq $RootItem -and $IsClone) {
         [void][IO.Directory]::CreateDirectory($DevRoot)
+        $RootItem = Get-Item -LiteralPath $DevRoot -Force
     }
-    $RootItem = Get-Item -LiteralPath $DevRoot -Force
-    if (-not $RootItem.PSIsContainer -or
+    if ($null -eq $RootItem -or -not $RootItem.PSIsContainer -or
         ($RootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "Configured dev_root must be a regular directory"
     }
 
-    $Parent = [IO.Path]::GetDirectoryName($ProjectPath)
-    $RelativeParent = [IO.Path]::GetRelativePath($DevRoot, $Parent)
-    if ($RelativeParent -eq ".." -or $RelativeParent.StartsWith("..\", [StringComparison]::Ordinal)) {
-        throw "Project parent escapes dev_root"
+    $CheckedPath = $(if ($IsClone) { [IO.Path]::GetDirectoryName($ProjectPath) } else { $ProjectPath })
+    $RelativePath = [IO.Path]::GetRelativePath($DevRoot, $CheckedPath)
+    if ($RelativePath -eq ".." -or $RelativePath.StartsWith("..\", [StringComparison]::Ordinal)) {
+        throw "Project path escapes dev_root"
     }
     $Current = $DevRoot
-    foreach ($Segment in @($RelativeParent -split "[\\/]")) {
+    foreach ($Segment in @($RelativePath -split "[\\/]")) {
         if ([string]::IsNullOrWhiteSpace($Segment) -or $Segment -eq ".") { continue }
         $Current = Join-Path $Current $Segment
-        if (-not (Test-Path -LiteralPath $Current)) {
+        $Item = Get-Item -LiteralPath $Current -Force -ErrorAction SilentlyContinue
+        if ($null -eq $Item -and $IsClone) {
             [void][IO.Directory]::CreateDirectory($Current)
+            $Item = Get-Item -LiteralPath $Current -Force
         }
-        $Item = Get-Item -LiteralPath $Current -Force
-        if (-not $Item.PSIsContainer -or
+        if ($null -eq $Item -or -not $Item.PSIsContainer -or
             ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Project parent must not traverse a link"
+            throw "Project path must contain only existing regular directories"
         }
     }
 }
@@ -869,10 +872,35 @@ if ($SelfTest) {
         }
         $CloneMachine = [pscustomobject]@{ dev_root = $CloneRoot }
         $CloneOperation = [pscustomobject]@{ type = "project-clone"; id = "example" }
-        Initialize-ProjectCloneParent $CloneOperation $CloneConfig $CloneMachine
+        Prepare-ProjectMutationPath $CloneOperation $CloneConfig $CloneMachine
         if (-not (Test-Path -LiteralPath (Join-Path $CloneRoot "nested/team") -PathType Container)) {
             throw "Nested project parent self-test failed"
         }
+
+        $UpdateRoot = Join-Path $SelfTestRoot "update-dev"
+        $UpdateTarget = Join-Path $SelfTestRoot "update-target"
+        [void][IO.Directory]::CreateDirectory($UpdateRoot)
+        [void][IO.Directory]::CreateDirectory($UpdateTarget)
+        $UpdatePath = Join-Path $UpdateRoot "example"
+        [void](New-Item -ItemType $(if ($IsWindows) { "Junction" } else { "SymbolicLink" }) `
+            -Path $UpdatePath -Target $UpdateTarget)
+        $UpdateConfig = [pscustomobject]@{
+            projects = [pscustomobject]@{
+                example = [pscustomobject]@{
+                    path = "example"
+                    source = "owner/example"
+                }
+            }
+        }
+        $UpdateOperation = [pscustomobject]@{ type = "project-update"; id = "example" }
+        $Rejected = $false
+        try {
+            Prepare-ProjectMutationPath $UpdateOperation $UpdateConfig `
+                ([pscustomobject]@{ dev_root = $UpdateRoot })
+        } catch {
+            $Rejected = $true
+        }
+        if (-not $Rejected) { throw "Project update reparse-point self-test failed" }
 
         $ExecutorRoot = Join-Path $SelfTestRoot "executor"
         [void][IO.Directory]::CreateDirectory((Join-Path $ExecutorRoot "scripts"))
@@ -1265,8 +1293,8 @@ for ($Index = 0; $Index -lt @($Plan.operations).Count; $Index++) {
     $Operation = @($Plan.operations)[$Index]
     $ExpectedArgv = [string[]]@($ExactArgvByIndex[$Index])
     try {
-        if ($Operation.type -eq "project-clone") {
-            Initialize-ProjectCloneParent $Operation $Config $Machine
+        if ($Operation.type -in @("project-clone", "project-update")) {
+            Prepare-ProjectMutationPath $Operation $Config $Machine
         }
         $ExitCode = Invoke-Exact $ExpectedArgv
         [void]$OperationResults.Add([ordered]@{

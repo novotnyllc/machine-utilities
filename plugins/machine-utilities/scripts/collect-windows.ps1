@@ -1314,7 +1314,7 @@ if (Test-Section "chezmoi") {
             $StatusLines = @(Get-Content -LiteralPath $StatusFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             $Codes = @($StatusLines | Group-Object { if ($_.Length -ge 2) { $_.Substring(0, 2) } else { $_ } } |
                 Sort-Object Name | ForEach-Object { @{ code = Limit-Text $_.Name; count = $_.Count } })
-            Add-Record -Kind "chezmoi_state" -Id "live" -Status $(if ($StatusLines.Count -eq 0) { "present" } else { "partial" }) -Confidence "high" -Data @{
+            Add-Record -Kind "chezmoi_state" -Id "live" -Status "present" -Confidence "high" -Data @{
                 source_path = Limit-Text $SourcePath
                 drift_count = $StatusLines.Count
                 status_codes = $Codes

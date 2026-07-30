@@ -1493,6 +1493,24 @@ EOF
             return 64
           }
           ;;
+        codex:*)
+          printf '%s\n' "$id" |
+            jq -eR 'test("^codex:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+:[^:]+$")' >/dev/null || {
+              printf 'machine-utilities: unsafe Codex plugin ID\n' >&2
+              return 64
+            }
+          plugin_tail=${id#codex:}
+          marketplace=${plugin_tail%%:*}
+          plugin_tail=${plugin_tail#*:}
+          plugin_name=${plugin_tail%%:*}
+          plugin_id=$plugin_name@$marketplace
+          { [ $# -eq 5 ] && [ "$1" = codex ] && [ "$2" = plugin ] &&
+            [ "$3" = add ] && [ "$4" = "$plugin_id" ] &&
+            [ "$5" = --json ]; } || {
+            printf 'machine-utilities: unsafe Codex plugin update argv\n' >&2
+            return 64
+          }
+          ;;
         claude:*)
           plugin_tail=${id#claude:}
           marketplace=${plugin_tail%%:*}
