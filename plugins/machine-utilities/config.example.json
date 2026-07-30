@@ -9,6 +9,16 @@
       "package_managers": ["homebrew"],
       "dev_root": "~/dev"
     },
+    "remote-mac": {
+      "platform": "macos",
+      "transport": "ssh",
+      "ssh_alias": "configured-ssh-alias",
+      "expected_hostname": "configured-hostname",
+      "expected_user": "configured-user",
+      "groups": ["development"],
+      "package_managers": ["homebrew"],
+      "dev_root": "~/dev"
+    },
     "windows": {
       "platform": "windows",
       "transport": "codex-remote-control",
@@ -29,6 +39,7 @@
   "capabilities": {
     "last30days": {
       "groups": ["development"],
+      "requires_auth": ["xurl"],
       "codex": {
         "provider": "skills-cli",
         "source": "mvanhorn/last30days-skill"
@@ -118,7 +129,7 @@
       "path": "~/.xurl/auth.yml",
       "strategy": "encrypted-install",
       "portability": "secret-reference",
-      "secret_ref": "configure-in-your-secret-manager",
+      "secret_ref": "op://your-vault/xurl-auth/credential-file",
       "mode": "0600",
       "verify": ["xurl", "auth", "status"]
     }

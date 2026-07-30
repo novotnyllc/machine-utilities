@@ -31,6 +31,11 @@ then atomically rename it into the user-owned parent directory. Never copy
 through a world-readable location.
 Run the configured native verification command; on failure restore the prior
 file or remove the new file.
+For a local `encrypted-install`, use
+`"$CLI" apply-plan PLAN CURRENT-SNAPSHOT PLAN-ID OUTPUT`; it resolves the
+configured `op://` reference directly into a private same-directory temporary
+file, replaces atomically, verifies, and rolls back on failure. Remote targets
+perform the same procedure inside their target-native task.
 
 Matching SHA-256 proves identical bytes, not valid authentication. Prefer
 per-machine least-privilege credentials for unattended work. For Windows,

@@ -46,6 +46,7 @@ plugins/machine-utilities/scripts/machine-utilities compare before.jsonl after.j
 plugins/machine-utilities/scripts/machine-utilities record-codex-readiness snapshot.jsonl metadata.json enriched.jsonl
 plugins/machine-utilities/scripts/machine-utilities seal-plan draft.json snapshot.jsonl plan.json
 plugins/machine-utilities/scripts/machine-utilities verify-preconditions plan.json current.jsonl
+plugins/machine-utilities/scripts/machine-utilities apply-plan plan.json current.jsonl PLAN-ID verified.jsonl
 plugins/machine-utilities/scripts/test-machine-utilities
 ```
 
@@ -54,6 +55,10 @@ step, and snapshots written to disk are installed atomically with mode `0600`.
 Credential contents are never included in inventory output.
 Sealed plans are inert data: verification checks their digest and freshly
 recaptured preconditions but neither grants consent nor executes plan text.
+For a local target, `apply-plan` additionally requires the exact sealed plan ID,
+accepts only operation-specific native command shapes, and returns a fresh
+post-change inventory. Remote targets execute the same sealed scope through
+their configured target-native task transport.
 
 The design and trust boundaries are documented in
 [`docs/architecture.md`](docs/architecture.md).
@@ -62,7 +67,7 @@ The design and trust boundaries are documented in
 
 - Codex: `plugins/machine-utilities/.codex-plugin/plugin.json`
 - Claude Code: `plugins/machine-utilities/.claude-plugin/plugin.json`
-- Claude marketplace: `.claude-plugin/marketplace.json`
+- Marketplace catalogs: the separate `novotnyllc/marketplace` repository
 
 No machine names, addresses, users, secrets, or private inventory belong in
 this repository.

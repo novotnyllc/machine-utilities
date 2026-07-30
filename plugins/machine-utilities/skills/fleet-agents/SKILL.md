@@ -29,7 +29,12 @@ or hash, and desired action. Seal it with
 recapture inventory, and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. Obtain
 separate user approval and execute only the exact sealed argv. Do not silently
-convert a standalone skill into a plugin or vice versa.
+convert a standalone skill into a plugin or vice versa. For a local target use
+`"$CLI" apply-plan PLAN CURRENT-SNAPSHOT PLAN-ID OUTPUT`; remote targets run
+the sealed scope through their configured task transport.
+The local executor supports exact updates for skills-cli, JSM, and Claude
+plugins. Codex currently has no plugin-update subcommand; installs, removals,
+and Codex plugin replacement remain explicit target-task operations.
 
 Use local/SSH execution where configured. For Windows Codex tasks read and
 follow `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports

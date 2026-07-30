@@ -42,5 +42,7 @@ The controller does not need a local copy of the remote path. Task creation
 uses the saved remote project. Cross-host handoff is separate and requires the
 same repository to be saved on both source and destination hosts.
 
-This chunk protocol remains unverified until exercised against an enrolled
-Windows saved project; report that limitation explicitly.
+The native Windows saved-project workflow was exercised on 2026-07-30 with
+small byte-for-byte payloads and a 323-record inventory split and exactly
+reassembled at record boundaries. Revalidate the protocol if the Desktop task
+result limits or task-control surface change.

@@ -226,7 +226,7 @@ plugins/machine-utilities/
 - **Goal:** Leave a self-contained, validated plugin and accurate marketplace metadata.
 - **Requirements:** R1-R15.
 - **Dependencies:** U1-U5.
-- **Files:** `README.md`, `docs/architecture.md`, `plugins/machine-utilities/.codex-plugin/plugin.json`, `plugins/machine-utilities/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, shared marketplace manifests and README.
+- **Files:** `README.md`, `docs/architecture.md`, `plugins/machine-utilities/.codex-plugin/plugin.json`, `plugins/machine-utilities/.claude-plugin/plugin.json`, and the separate marketplace repository manifests and README.
 - **Approach:** Document configuration and invocation, keep architecture aligned with implemented behavior, list unsupported/deferred surfaces, and validate both harness formats without installing or publishing.
 - **Test scenarios:**
   - All JSON manifests parse and version coupling stays aligned.

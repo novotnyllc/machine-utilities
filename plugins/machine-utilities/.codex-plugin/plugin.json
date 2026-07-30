@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "description": "Inventory and reconcile packages, agent tooling, projects, dotfiles, remote Macs, SSH, startup tasks, and portable authentication across mixed-machine fleets.",
   "author": {
-    "name": "Machine Utilities Contributors"
+    "name": "Claire Novotny LLC",
+    "url": "https://github.com/novotnyllc"
   },
+  "homepage": "https://github.com/novotnyllc/machine-utilities",
+  "repository": "https://github.com/novotnyllc/machine-utilities",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -24,7 +27,7 @@
     "displayName": "Machine Utilities",
     "shortDescription": "Inventory and reconcile machines, agent capabilities, projects, and updates",
     "longDescription": "Machine Utilities provides configuration-driven fleet inventory and maintenance for Homebrew, APT, winget, chezmoi, Codex, Claude, plugins and standalone skills, project placement and Codex readiness, remote Mac and SSH diagnostics, startup automation, and deliberate credential portability without embedding private machine inventory.",
-    "developerName": "Machine Utilities Contributors",
+    "developerName": "Claire Novotny LLC",
     "category": "Productivity",
     "capabilities": [
       "Read",

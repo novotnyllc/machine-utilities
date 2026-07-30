@@ -26,6 +26,11 @@ chezmoi inventory and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed immediately
 before mutation. Obtain separate approval and execute only the sealed argv.
 Never force-reset, auto-commit, or reveal template secret values.
+For a local target use `"$CLI" apply-plan PLAN CURRENT-SNAPSHOT PLAN-ID
+OUTPUT`; remote targets run the sealed scope in their configured task.
+The local executor supports a clean fast-forward source pull and a non-TTY
+full apply. `chezmoi add` remains an explicit target-task operation because
+the allowed target paths are user-specific.
 
 Use local/SSH execution. If a Windows host is configured for Codex remote
 control, read and follow

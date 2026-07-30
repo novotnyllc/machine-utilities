@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cli="$script_dir/machine-utilities"
+pwsh_command=$(command -v pwsh 2>/dev/null || true)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/home/dev/example" "$tmp/bin"
@@ -59,6 +60,8 @@ cat >"$tmp/config.json" <<'JSON'
   "capabilities": {
     "example-research": {
       "groups": ["development"],
+      "requires_auth": ["test-auth"],
+      "requires_artifacts": ["shared-agent-definition"],
       "codex": {"provider": "plugin", "source": "example"},
       "claude": {"provider": "skills-cli", "source": "example-source", "skill": "capability-example"}
     },
@@ -95,7 +98,7 @@ cat >"$tmp/config.json" <<'JSON'
     "test-auth": {
       "path": "~/.test-auth",
       "strategy": "encrypted-install",
-      "secret_ref": "not-a-secret-value",
+      "secret_ref": "op://test/item/value",
       "verify": ["auth-check", "login", "status"]
     }
   }
@@ -107,24 +110,52 @@ printf 'super-secret-value\n' >"$tmp/home/.test-auth"
 chmod 600 "$tmp/home/.test-auth"
 mkdir -p "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin" \
   "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.claude-plugin" \
+  "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/nested-fixture/.codex-plugin" \
+  "$tmp/home/.codex/plugins/cache/test-market/example/0.9.0/.codex-plugin" \
+  "$tmp/home/.codex/plugins/cache/plugin-eval/2f1a8948/fixtures/.codex-plugin" \
+  "$tmp/home/.claude/plugins/cache/test-market/claude-example/2.0.0/.claude-plugin" \
+  "$tmp/home/.claude/plugins/cache/test-market/claude-example/1.0.0/.claude-plugin" \
+  "$tmp/home/.claude/plugins/cache/plugin-eval/fixture/ignored/1.0.0/.claude-plugin" \
   "$tmp/home/.agents/skills/manual-example" "$tmp/home/.agents/agents" "$tmp/home/.agents/empty-agents"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin/plugin.json"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.claude-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/nested-fixture/.codex-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/0.9.0/.codex-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.codex/plugins/cache/plugin-eval/2f1a8948/fixtures/.codex-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.claude/plugins/cache/test-market/claude-example/2.0.0/.claude-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.claude/plugins/cache/test-market/claude-example/1.0.0/.claude-plugin/plugin.json"
+printf '{}\n' >"$tmp/home/.claude/plugins/cache/plugin-eval/fixture/ignored/1.0.0/.claude-plugin/plugin.json"
 printf '%s\n' '---' 'name: manual-example' 'description: Manual skill fixture.' '---' >"$tmp/home/.agents/skills/manual-example/SKILL.md"
 printf '%s\n' '# Example agent' >"$tmp/home/.agents/agents/example.md"
 printf '%s\n' '{"skills":{"locked-example":{"source":"https://user:lock-secret@example.invalid/repo","sourceUrl":"https://user:lock-secret@example.invalid/repo","skillPath":"skills/example","skillFolderHash":"abc","installedAt":"2026-01-01","updatedAt":"2026-01-02"},"capability-example":{"source":"example-source","sourceUrl":"example-source","skillPath":"skills/example","skillFolderHash":"def","installedAt":"2026-01-01","updatedAt":"2026-01-02"}}}' \
   >"$tmp/home/.agents/.skill-lock.json"
+cp "$tmp/home/.agents/.skill-lock.json" "$tmp/skill-lock-fixture.json"
 
 cat >"$tmp/bin/brew" <<'SH'
 #!/usr/bin/env bash
 [ "${BREW_FAIL:-0}" != 1 ] || exit 1
+installed_version=2.50.0
+[ -z "${BREW_STATE_FILE:-}" ] || [ ! -f "$BREW_STATE_FILE" ] ||
+  installed_version=$(cat "$BREW_STATE_FILE")
+if [ "${1:-}" = outdated ] && [ "${2:-}" = --json=v2 ]; then
+  if [ "$installed_version" = 2.51.0 ]; then
+    printf '%s\n' '{"formulae":[],"casks":[{"name":"visual-tool","current_version":"1.1.0"}]}'
+  else
+    printf '%s\n' '{"formulae":[{"name":"git","current_version":"2.51.0"}],"casks":[{"name":"visual-tool","current_version":"1.1.0"}]}'
+  fi
+  exit 0
+fi
+if [ "${1:-}" = upgrade ] && [ "${2:-}" = git ]; then
+  printf '%s\n' "${BREW_UPGRADE_VERSION:-2.51.0}" >"$BREW_STATE_FILE"
+  exit 0
+fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --cask ] && [ "${3:-}" = --versions ]; then
   [ "${BREW_CASK_FAIL:-0}" != 1 ] || exit 1
   printf 'visual-tool 1.0.0\n'
   exit 0
 fi
 if [ "${1:-}" = list ] && [ "${2:-}" = --versions ]; then
-  printf 'git 2.50.0\njq 1.7.1\n'
+  printf 'git %s\njq 1.7.1\n' "$installed_version"
   exit 0
 fi
 exit 1
@@ -139,11 +170,74 @@ printf '%s\n' '{"workspace":"default","skills":[{"name":"example-jsm","version":
 SH
 chmod +x "$tmp/bin/jsm"
 
+cat >"$tmp/bin/codex" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'codex fixture'
+  exit 0
+fi
+if [ "${1:-}" = plugin ] && [ "${2:-}" = list ] && [ "${3:-}" = --json ]; then
+  [ "${CODEX_PLUGIN_LIST_INVALID:-0}" != 1 ] || { printf '{invalid\n'; exit 0; }
+  [ "${CODEX_PLUGIN_LIST_INVALID_SHAPE:-0}" != 1 ] || {
+    printf '%s\n' '{"installed":[{"pluginId":"broken@test-market","name":"broken","marketplaceName":"test-market","version":7,"installed":true,"enabled":"yes"}]}'
+    exit 0
+  }
+  printf '%s\n' '{"installed":[{"pluginId":"example@test-market","name":"example","marketplaceName":"test-market","version":"1.2.3","installed":true,"enabled":true,"source":{"source":"local","path":"fixture-codex-active"}},{"pluginId":"disabled-example@test-market","name":"disabled-example","marketplaceName":"test-market","version":"3.0.0","installed":true,"enabled":false,"source":{"source":"local","path":"fixture-codex-disabled"}}]}'
+  exit 0
+fi
+exit 64
+SH
+chmod +x "$tmp/bin/codex"
+
+cat >"$tmp/bin/claude" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = --version ]; then
+  printf '%s\n' 'claude fixture'
+  exit 0
+fi
+if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] && [ "\${3:-}" = --json ]; then
+  printf '%s\n' '[{"id":"claude-example@test-market","version":"2.0.0","scope":"user","enabled":true,"installPath":"$tmp/home/.claude/plugins/cache/test-market/claude-example/2.0.0","installedAt":"2026-01-03T04:05:06.000Z","lastUpdated":"2026-01-04T05:06:07.000Z"}]'
+  exit 0
+fi
+exit 64
+SH
+chmod +x "$tmp/bin/claude"
+
 cat >"$tmp/bin/auth-check" <<'SH'
 #!/usr/bin/env bash
+[ "${AUTH_CHECK_FAIL:-0}" != 1 ] || exit 1
 [ "${1:-}" = login ] && [ "${2:-}" = status ]
 SH
 chmod +x "$tmp/bin/auth-check"
+
+cat >"$tmp/bin/op" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = read ] && [ "${2:-}" = "op://test/item/value" ] || exit 64
+cat "$OP_SECRET_FILE"
+SH
+chmod +x "$tmp/bin/op"
+
+cat >"$tmp/bin/chezmoi" <<'SH'
+#!/usr/bin/env bash
+case ${1:-} in
+  source-path) printf '%s\n' "$HOME/.local/share/chezmoi" ;;
+  status) exit 0 ;;
+  --no-tty)
+    [ "${2:-}" = apply ] || exit 64
+    : >"$CHEZMOI_APPLY_MARKER"
+    ;;
+  *) exit 64 ;;
+esac
+SH
+chmod +x "$tmp/bin/chezmoi"
+
+cat >"$tmp/bin/npx" <<'SH'
+#!/usr/bin/env bash
+[ "$#" -eq 5 ] && [ "$1" = skills ] && [ "$2" = update ] &&
+  [ "$3" = capability-example ] && [ "$4" = -g ] && [ "$5" = -y ] || exit 64
+: >"$SKILLS_UPDATE_MARKER"
+SH
+chmod +x "$tmp/bin/npx"
 
 cat >"$tmp/bin/ssh" <<'SH'
 #!/usr/bin/env bash
@@ -184,8 +278,26 @@ git -C "$tmp/home/dev/example" remote add origin ssh://user:secret@github.com/ow
 export HOME="$tmp/home"
 export PATH="$tmp/bin:/usr/bin:/bin"
 export MACHINE_UTILITIES_CONFIG="$tmp/config.json"
+export BREW_STATE_FILE="$tmp/brew-state"
+export OP_SECRET_FILE="$tmp/op-secret"
+export CHEZMOI_APPLY_MARKER="$tmp/chezmoi-applied"
+export SKILLS_UPDATE_MARKER="$tmp/skills-updated"
+printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
+printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 
 "$cli" validate-config
+jq '.capabilities."example-research".requires_auth = ["missing-auth"]' \
+  "$tmp/config.json" >"$tmp/invalid-capability-reference.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-capability-reference.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "capability accepted an unknown auth dependency"
+fi
+jq '.auth_artifacts."test-auth".mode = "0644"' \
+  "$tmp/config.json" >"$tmp/invalid-auth-mode.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-auth-mode.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "encrypted auth artifact accepted a non-private mode"
+fi
 "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
 [ "$(stat -f %Lp "$tmp/snapshot.jsonl" 2>/dev/null || stat -c %a "$tmp/snapshot.jsonl")" = 600 ] ||
   fail "snapshot mode is not 600"
@@ -196,6 +308,8 @@ human=$("$cli" render --format human "$tmp/snapshot.jsonl")
 assert_contains "$json" '"kind":"package"'
 assert_contains "$json" '"id":"homebrew:git"'
 assert_contains "$json" '"id":"homebrew-cask:visual-tool"'
+assert_contains "$json" '"candidate_version":"2.51.0"'
+assert_contains "$json" '"update_available":true'
 assert_contains "$json" '"kind":"project"'
 assert_contains "$json" '"origin_matches":true'
 assert_contains "$json" '"codex_saved_project_status":"requires-controller-check"'
@@ -206,6 +320,12 @@ assert_contains "$json" '"id":"jsm:example-jsm"'
   fail "POSIX JSM version was not normalized to a string"
 assert_contains "$json" '"id":"example-research"'
 assert_contains "$json" '"consistent":true'
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research" and .data.ready == true and .data.dependencies.ready == true)] | length')" -eq 1 ] ||
+  fail "satisfied POSIX capability dependencies were not ready"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "healthy" and .ready == true)] | length')" -eq 1 ] ||
+  fail "POSIX capability did not report healthy auth dependency state"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "shared-agent-definition" and .status == "present" and .ready == true)] | length')" -eq 1 ] ||
+  fail "POSIX capability did not report present artifact dependency state"
 if printf '%s' "$json" | grep -q 'other-group'; then fail "capability group filter leaked another group"; fi
 assert_contains "$json" '"id":"standalone:manual:manual-example"'
 assert_contains "$json" '"id":"shared-agent-definition"'
@@ -215,6 +335,7 @@ assert_contains "$json" '"manager":"manual"'
 assert_contains "$json" '"health":"healthy"'
 assert_contains "$json" '"portability":"per-machine"'
 assert_contains "$json" '"id":"codex:test-market:example:1.2.3"'
+assert_contains "$json" '"id":"claude:test-market:claude-example:2.0.0"'
 assert_contains "$json" '"inferred_installed_at_evidence":"filesystem_birthtime"'
 assert_contains "$json" '"inferred_installed_at_confidence":"low"'
 assert_contains "$json" '"algorithm":"sha256"'
@@ -222,6 +343,31 @@ assert_contains "$human" 'test-host'
 assert_contains "$human" "$(printf 'HOST\tKIND')"
 [ "$(printf '%s' "$json" | jq '[.records[] | select(.id == "codex:test-market:example:1.2.3")] | length')" -eq 1 ] ||
   fail "dual manifests produced duplicate plugin records"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "plugin" and .id == "codex:test-market:example:1.2.3" and .confidence == "high" and .data.install_state == "installed")] | length')" -eq 1 ] ||
+  fail "Codex manager-listed plugin was not authoritative POSIX inventory"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "plugin" and .id == "claude:test-market:claude-example:2.0.0" and .data.installed_at == "2026-01-03T04:05:06.000Z" and .data.last_updated == "2026-01-04T05:06:07.000Z")] | length')" -eq 1 ] ||
+  fail "Claude manager timestamps were not preserved in POSIX inventory"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "plugin_cache" and (.id == "codex:test-market:example:0.9.0" or .id == "claude:test-market:claude-example:1.0.0") and .data.install_state == "cache-only")] | length')" -eq 2 ] ||
+  fail "stale POSIX plugin cache versions were not preserved as cache-only evidence"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "plugin" and (.id == "codex:test-market:example:0.9.0" or .id == "claude:test-market:claude-example:1.0.0"))] | length')" -eq 0 ] ||
+  fail "stale POSIX plugin cache version was classified as installed"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.providers[] | select(.agent == "codex") | .matches[]] | length')" -eq 1 ] ||
+  fail "POSIX capability reconciliation did not use exactly one active Codex plugin"
+if printf '%s' "$json" | grep -q 'plugin-eval'; then
+  fail "transient plugin-eval fixture was classified as an installed POSIX plugin"
+fi
+if printf '%s' "$json" | grep -q 'nested-fixture'; then
+  fail "nested POSIX plugin fixture was classified as cache evidence"
+fi
+
+set +e
+"$cli" collect --target test-host --section agents --output "$tmp/agents-without-auth-verify-posix.jsonl"
+agents_without_auth_verify_rc=$?
+set -e
+[ "$agents_without_auth_verify_rc" -eq 2 ] ||
+  fail "ordinary POSIX agents inventory did not report unverified auth dependency"
+[ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "not-authorized" and .ready == false)] | length' "$tmp/agents-without-auth-verify-posix.jsonl")" -eq 1 ] ||
+  fail "ordinary POSIX agents inventory executed or trusted auth verification"
 
 stdin_human=$("$cli" render --format human - <"$tmp/snapshot.jsonl")
 assert_contains "$stdin_human" 'test-host'
@@ -280,6 +426,28 @@ sleep 1
 "$cli" collect --target test-host --section all --output "$tmp/snapshot-2.jsonl"
 "$cli" compare "$tmp/snapshot.jsonl" "$tmp/snapshot-2.jsonl" >"$tmp/compare-2.json"
 [ "$(jq 'length' "$tmp/compare-2.json")" -eq 0 ] || fail "timestamps and run IDs reported as inventory drift"
+
+set +e
+AUTH_CHECK_FAIL=1 "$cli" collect --target test-host --section agents --section auth --output "$tmp/unhealthy-capability-auth-posix.jsonl"
+unhealthy_capability_auth_rc=$?
+set -e
+[ "$unhealthy_capability_auth_rc" -eq 2 ] ||
+  fail "unhealthy required auth did not produce partial POSIX capability inventory"
+[ "$(jq -s 'map(select(.kind == "capability" and .id == "example-research" and .status == "partial" and .data.available == false and .data.ready == false and .data.dependencies.ready == false)) | length' "$tmp/unhealthy-capability-auth-posix.jsonl")" -eq 1 ] ||
+  fail "unhealthy required auth did not make the POSIX capability unavailable"
+[ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "unhealthy" and .ready == false)] | length' "$tmp/unhealthy-capability-auth-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX capability did not report unhealthy auth dependency state"
+
+mv "$tmp/home/.agents/agents/example.md" "$tmp/missing-agent-definition"
+set +e
+"$cli" collect --target test-host --section agents --output "$tmp/missing-capability-artifact-posix.jsonl"
+missing_capability_artifact_rc=$?
+set -e
+mv "$tmp/missing-agent-definition" "$tmp/home/.agents/agents/example.md"
+[ "$missing_capability_artifact_rc" -eq 2 ] ||
+  fail "missing required artifact did not produce partial POSIX capability inventory"
+[ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "shared-agent-definition" and .status == "absent" and .ready == false)] | length' "$tmp/missing-capability-artifact-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX capability did not report absent artifact dependency state"
 
 "$cli" collect --target test-ssh --section host --output "$tmp/ssh.jsonl"
 "$cli" validate "$tmp/ssh.jsonl"
@@ -401,15 +569,68 @@ set -e
 [ "$invalid_jsm_rc" -eq 2 ] || fail "invalid JSM JSON did not produce partial inventory"
 assert_contains "$(cat "$tmp/invalid-jsm.jsonl")" '"id":"agents:jsm"'
 
-if command -v pwsh >/dev/null 2>&1; then
-  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+set +e
+CODEX_PLUGIN_LIST_INVALID=1 "$cli" collect --target test-host --section agents --output "$tmp/invalid-codex-plugins-posix.jsonl"
+invalid_codex_plugins_rc=$?
+set -e
+[ "$invalid_codex_plugins_rc" -eq 2 ] ||
+  fail "invalid Codex plugin manager JSON did not produce partial POSIX inventory"
+"$cli" validate "$tmp/invalid-codex-plugins-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "plugin_manager" and .id == "codex" and .status == "unavailable")) | length' "$tmp/invalid-codex-plugins-posix.jsonl")" -eq 1 ] ||
+  fail "invalid Codex plugin manager JSON was not reported on POSIX"
+[ "$(jq -s 'map(select(.kind == "plugin" and .data.agent == "codex")) | length' "$tmp/invalid-codex-plugins-posix.jsonl")" -eq 0 ] ||
+  fail "POSIX cache evidence was promoted when the Codex manager query failed"
+[ "$(jq -s 'map(select(.kind == "plugin_cache" and .id == "codex:test-market:example:1.2.3")) | length' "$tmp/invalid-codex-plugins-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX manager failure discarded distinct Codex cache evidence"
+[ "$(jq -s 'map(select(.kind == "plugin_cache" and .id == "codex:test-market:example:1.2.3" and .data.install_state == "manager-unverified" and .data.active == null)) | length' "$tmp/invalid-codex-plugins-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX manager failure mislabeled unknown active cache state"
+
+set +e
+CODEX_PLUGIN_LIST_INVALID_SHAPE=1 "$cli" collect --target test-host --section agents --output "$tmp/invalid-codex-plugin-shape-posix.jsonl"
+invalid_codex_plugin_shape_rc=$?
+set -e
+[ "$invalid_codex_plugin_shape_rc" -eq 2 ] ||
+  fail "invalid Codex plugin manager shape did not produce partial POSIX inventory"
+"$cli" validate "$tmp/invalid-codex-plugin-shape-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "plugin_manager" and .id == "codex" and .status == "unavailable")) | length' "$tmp/invalid-codex-plugin-shape-posix.jsonl")" -eq 1 ] ||
+  fail "invalid Codex plugin manager shape was not reported on POSIX"
+[ "$(jq -s 'map(select(.kind == "plugin" and .data.agent == "codex")) | length' "$tmp/invalid-codex-plugin-shape-posix.jsonl")" -eq 0 ] ||
+  fail "POSIX invalid manager shape produced active Codex plugins"
+[ "$(jq -s 'map(select(.kind == "plugin_cache" and .id == "codex:test-market:example:1.2.3" and .data.install_state == "manager-unverified" and .data.active == null)) | length' "$tmp/invalid-codex-plugin-shape-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX invalid manager shape did not preserve unverified cache evidence"
+
+cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
+if [ -n "$pwsh_command" ]; then
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
-    -Sections agents >"$tmp/windows.jsonl"
+    -Sections agents -AllowAuthVerify >"$tmp/windows.jsonl"
   "$cli" validate "$tmp/windows.jsonl"
   [ "$(jq -s 'map(select(.kind == "operation")) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
     fail "Windows collector did not emit one operation record"
-  [ "$(jq -s 'map(select(.kind == "plugin" and .data.inferred_installed_at_confidence == "low")) | length' "$tmp/windows.jsonl")" -ge 1 ] ||
-    fail "Windows collector did not emit inferred plugin creation time"
+  [ "$(jq -s 'map(select(.kind == "plugin" and .id == "codex:test-market:example:1.2.3" and .confidence == "high" and .data.install_state == "installed" and .data.inferred_installed_at_confidence == "low")) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector did not use authoritative Codex inventory with inferred creation time"
+  windows_claude_plugin=$(jq -c 'select(.kind == "plugin" and .id == "claude:test-market:claude-example:2.0.0")' "$tmp/windows.jsonl")
+  [ "$(printf '%s' "$windows_claude_plugin" | jq -s 'map(select(.data.installed_at == "2026-01-03T04:05:06Z" and .data.last_updated == "2026-01-04T05:06:07Z")) | length')" -eq 1 ] ||
+    fail "Windows collector did not preserve Claude manager timestamps: $windows_claude_plugin"
+  [ "$(jq -s 'map(select(.kind == "plugin_cache" and (.id == "codex:test-market:example:0.9.0" or .id == "claude:test-market:claude-example:1.0.0") and .data.install_state == "cache-only")) | length' "$tmp/windows.jsonl")" -eq 2 ] ||
+    fail "Windows collector did not preserve stale versions as cache-only evidence"
+  [ "$(jq -s 'map(select(.kind == "plugin" and (.id == "codex:test-market:example:0.9.0" or .id == "claude:test-market:claude-example:1.0.0"))) | length' "$tmp/windows.jsonl")" -eq 0 ] ||
+    fail "Windows collector classified stale cache versions as installed"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.providers[] | select(.agent == "codex") | .matches[]] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability reconciliation did not use exactly one active Codex plugin"
+  [ "$(jq -s 'map(select(.kind == "capability" and .id == "example-research" and .data.ready == true and .data.dependencies.ready == true)) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "satisfied Windows capability dependencies were not ready"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "healthy" and .ready == true)] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability did not report healthy auth dependency state"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "shared-agent-definition" and .status == "present" and .ready == true)] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability did not report present artifact dependency state"
+  windows_plugin_eval=$(grep 'plugin-eval' "$tmp/windows.jsonl" || true)
+  if [ -n "$windows_plugin_eval" ]; then
+    fail "transient plugin-eval fixture was classified as Windows plugin evidence: $windows_plugin_eval"
+  fi
+  if grep -q 'nested-fixture' "$tmp/windows.jsonl"; then
+    fail "nested Windows plugin fixture was classified as cache evidence"
+  fi
   [ "$(jq -r 'select(.kind == "operation") | .data.transport' "$tmp/windows.jsonl")" = codex-remote-control ] ||
     fail "Windows operation did not preserve configured transport"
   [ "$(jq -r 'select(.id == "jsm:example-jsm") | .data.version | type' "$tmp/windows.jsonl")" = string ] ||
@@ -421,35 +642,86 @@ if command -v pwsh >/dev/null 2>&1; then
   [ "$posix_skill_hash" = "$windows_skill_hash" ] ||
     fail "standalone skill digest is not cross-platform canonical"
 
-  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents >"$tmp/agents-without-auth-verify-windows.jsonl"
+  "$cli" validate "$tmp/agents-without-auth-verify-windows.jsonl"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "not-authorized" and .ready == false)] | length' "$tmp/agents-without-auth-verify-windows.jsonl")" -eq 1 ] ||
+    fail "ordinary Windows agents inventory trusted auth without authorization"
+
+  AUTH_CHECK_FAIL=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/unhealthy-capability-auth-windows.jsonl"
+  "$cli" validate "$tmp/unhealthy-capability-auth-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "capability" and .id == "example-research" and .status == "partial" and .data.available == false and .data.ready == false and .data.dependencies.ready == false)) | length' "$tmp/unhealthy-capability-auth-windows.jsonl")" -eq 1 ] ||
+    fail "unhealthy required auth did not make the Windows capability unavailable"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "unhealthy" and .ready == false)] | length' "$tmp/unhealthy-capability-auth-windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability did not report unhealthy auth dependency state"
+
+  mv "$tmp/home/.agents/agents/example.md" "$tmp/missing-agent-definition-windows"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/missing-capability-artifact-windows.jsonl"
+  mv "$tmp/missing-agent-definition-windows" "$tmp/home/.agents/agents/example.md"
+  "$cli" validate "$tmp/missing-capability-artifact-windows.jsonl"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "shared-agent-definition" and .status == "absent" and .ready == false)] | length' "$tmp/missing-capability-artifact-windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability did not report absent artifact dependency state"
+
+  CODEX_PLUGIN_LIST_INVALID=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents >"$tmp/invalid-codex-plugins-windows.jsonl"
+  "$cli" validate "$tmp/invalid-codex-plugins-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "plugin_manager" and .id == "codex" and .status == "unavailable")) | length' "$tmp/invalid-codex-plugins-windows.jsonl")" -eq 1 ] ||
+    fail "invalid Codex plugin manager JSON was not reported on Windows"
+  [ "$(jq -s 'map(select(.kind == "plugin" and .data.agent == "codex")) | length' "$tmp/invalid-codex-plugins-windows.jsonl")" -eq 0 ] ||
+    fail "Windows cache evidence was promoted when the Codex manager query failed"
+  [ "$(jq -s 'map(select(.kind == "plugin_cache" and .id == "codex:test-market:example:1.2.3")) | length' "$tmp/invalid-codex-plugins-windows.jsonl")" -eq 1 ] ||
+    fail "Windows manager failure discarded distinct Codex cache evidence"
+  [ "$(jq -s 'map(select(.kind == "plugin_cache" and .id == "codex:test-market:example:1.2.3" and .data.install_state == "manager-unverified" and .data.active == null)) | length' "$tmp/invalid-codex-plugins-windows.jsonl")" -eq 1 ] ||
+    fail "Windows manager failure mislabeled unknown active cache state"
+
+  CODEX_PLUGIN_LIST_INVALID_SHAPE=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents >"$tmp/invalid-codex-plugin-shape-windows.jsonl"
+  "$cli" validate "$tmp/invalid-codex-plugin-shape-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "plugin_manager" and .id == "codex" and .status == "unavailable")) | length' "$tmp/invalid-codex-plugin-shape-windows.jsonl")" -eq 1 ] ||
+    fail "invalid Codex plugin manager shape was not reported on Windows"
+  [ "$(jq -s 'map(select(.kind == "plugin" and .data.agent == "codex")) | length' "$tmp/invalid-codex-plugin-shape-windows.jsonl")" -eq 0 ] ||
+    fail "Windows invalid manager shape produced active Codex plugins"
+  [ "$(jq -s 'map(select(.kind == "plugin_cache" and .id == "codex:test-market:example:1.2.3" and .data.install_state == "manager-unverified" and .data.active == null)) | length' "$tmp/invalid-codex-plugin-shape-windows.jsonl")" -eq 1 ] ||
+    fail "Windows invalid manager shape did not preserve unverified cache evidence"
+
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections projects >"$tmp/windows-projects.jsonl"
   "$cli" validate "$tmp/windows-projects.jsonl"
   [ "$(jq -r 'select(.kind == "project" and .id == "example") | .data.repository_readiness' "$tmp/windows-projects.jsonl")" = ready ] ||
     fail "Windows collector did not recognize a readable Git checkout"
 
-  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections auth -AllowAuthVerify >"$tmp/windows-auth.jsonl"
   "$cli" validate "$tmp/windows-auth.jsonl"
   [ "$(jq -r 'select(.id == "test-auth") | .data.health' "$tmp/windows-auth.jsonl")" = healthy ] ||
     fail "Windows native auth health check was not healthy"
 
-  JSM_INVALID_SHAPE=1 HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+  JSM_INVALID_SHAPE=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections agents >"$tmp/windows-invalid-jsm.jsonl"
   "$cli" validate "$tmp/windows-invalid-jsm.jsonl"
   assert_contains "$(cat "$tmp/windows-invalid-jsm.jsonl")" '"id":"agents:jsm"'
 
-  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections chezmoi >"$tmp/windows-chezmoi.jsonl"
   "$cli" validate "$tmp/windows-chezmoi.jsonl"
-  [ "$(jq -s 'map(select(.id == "chezmoi:source")) | length' "$tmp/windows-chezmoi.jsonl")" -eq 1 ] ||
-    fail "Windows chezmoi section emitted no state"
+  [ "$(jq -r 'select(.kind == "chezmoi_state" and .id == "live") | .status' "$tmp/windows-chezmoi.jsonl")" = present ] ||
+    fail "Windows collector did not recognize an empty clean chezmoi status"
+  [ "$(jq -r 'select(.kind == "chezmoi_state" and .id == "live") | .data.drift_count' "$tmp/windows-chezmoi.jsonl")" -eq 0 ] ||
+    fail "Windows clean chezmoi status reported drift"
 
   printf '{invalid\n' >"$tmp/home/.agents/.skill-lock.json"
-  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections agents >"$tmp/invalid-lock-windows.jsonl"
   "$cli" validate "$tmp/invalid-lock-windows.jsonl"
@@ -458,7 +730,7 @@ if command -v pwsh >/dev/null 2>&1; then
 
   jq '.projects.example.path = "../escape"' "$tmp/config.json" >"$tmp/invalid-worker-config.json"
   invalid_worker_hash=$(shasum -a 256 "$tmp/invalid-worker-config.json" | awk '{print $1}')
-  if HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/invalid-worker-config.json" -HostId test-windows \
     -ControllerConfigDigest "$invalid_worker_hash" -Sections projects >/dev/null 2>&1; then
     fail "Windows worker accepted a traversal project path"
@@ -474,6 +746,7 @@ cat >"$tmp/plan-draft.json" <<JSON
       "type": "package-upgrade",
       "kind": "package",
       "id": "homebrew:git",
+      "candidate_version": "2.51.0",
       "argv": ["touch", "$tmp/plan-must-stay-inert"]
     }
   ]
@@ -489,6 +762,11 @@ fi
 verification=$("$cli" verify-preconditions "$tmp/plan.json" "$tmp/snapshot-2.jsonl")
 assert_contains "$verification" '"verified":true'
 [ ! -e "$tmp/plan-must-stay-inert" ] || fail "plan text was executed"
+plan_id=$(jq -r '.plan_id' "$tmp/plan.json")
+if "$cli" apply-plan "$tmp/plan.json" "$tmp/snapshot-2.jsonl" "$plan_id" "$tmp/unsafe-apply.jsonl" >/dev/null 2>&1; then
+  fail "apply executor ran a non-manager command from a package plan"
+fi
+[ ! -e "$tmp/plan-must-stay-inert" ] || fail "unsafe apply command was executed"
 
 if "$cli" verify-preconditions "$tmp/plan.json" "$tmp/snapshot.jsonl" >/dev/null 2>&1; then
   fail "planning snapshot was accepted as a fresh recapture"
@@ -509,6 +787,126 @@ jq -c 'if .kind == "package" and .id == "homebrew:git" then .data.installed_vers
   "$tmp/snapshot-2.jsonl" >"$tmp/drifted-snapshot.jsonl"
 if "$cli" verify-preconditions "$tmp/plan.json" "$tmp/drifted-snapshot.jsonl" >/dev/null 2>&1; then
   fail "changed preconditions passed apply authorization"
+fi
+
+cat >"$tmp/safe-plan-draft.json" <<'JSON'
+{
+  "domain": "updates",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "package-upgrade",
+      "kind": "package",
+      "id": "homebrew:git",
+      "candidate_version": "2.51.0",
+      "argv": ["env", "HOMEBREW_NO_AUTO_UPDATE=1", "brew", "upgrade", "git"]
+    }
+  ]
+}
+JSON
+"$cli" seal-plan "$tmp/safe-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/safe-plan.json"
+safe_plan_id=$(jq -r '.plan_id' "$tmp/safe-plan.json")
+printf '%s\n' 9.9.9 >"$BREW_STATE_FILE"
+if "$cli" apply-plan "$tmp/safe-plan.json" "$tmp/snapshot-2.jsonl" \
+  "$safe_plan_id" "$tmp/replayed-apply.jsonl" >/dev/null 2>&1; then
+  fail "apply trusted the supplied snapshot instead of recapturing live state"
+fi
+printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
+if BREW_UPGRADE_VERSION=2.52.0 "$cli" apply-plan "$tmp/safe-plan.json" \
+  "$tmp/snapshot-2.jsonl" "$safe_plan_id" "$tmp/wrong-candidate-apply.jsonl" >/dev/null 2>&1; then
+  fail "apply accepted a package version other than the sealed candidate"
+fi
+printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
+"$cli" apply-plan "$tmp/safe-plan.json" "$tmp/snapshot-2.jsonl" "$safe_plan_id" "$tmp/applied.jsonl"
+"$cli" validate "$tmp/applied.jsonl"
+[ "$(jq -r 'select(.kind == "package" and .id == "homebrew:git") | .data.installed_version' "$tmp/applied.jsonl")" = 2.51.0 ] ||
+  fail "package apply did not verify the upgraded native-manager version"
+[ "$(jq -r 'select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status' "$tmp/applied.jsonl")" = completed ] ||
+  fail "package apply emitted no completed verification operation"
+
+cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
+cat >"$tmp/agent-plan-draft.json" <<'JSON'
+{
+  "domain": "agents",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "agent-update",
+      "kind": "skill",
+      "id": "skills-cli:capability-example",
+      "argv": ["npx", "skills", "update", "capability-example", "-g", "-y"]
+    }
+  ]
+}
+JSON
+"$cli" seal-plan "$tmp/agent-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/agent-plan.json"
+agent_plan_id=$(jq -r '.plan_id' "$tmp/agent-plan.json")
+"$cli" apply-plan "$tmp/agent-plan.json" "$tmp/snapshot-2.jsonl" \
+  "$agent_plan_id" "$tmp/agent-applied.jsonl"
+[ -e "$SKILLS_UPDATE_MARKER" ] || fail "safe skills-cli update was not executed"
+
+cat >"$tmp/chezmoi-plan-draft.json" <<'JSON'
+{
+  "domain": "chezmoi",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "chezmoi-apply",
+      "kind": "chezmoi_state",
+      "id": "live",
+      "argv": ["chezmoi", "--no-tty", "apply"]
+    }
+  ]
+}
+JSON
+"$cli" seal-plan "$tmp/chezmoi-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/chezmoi-plan.json"
+chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/chezmoi-plan.json")
+"$cli" apply-plan "$tmp/chezmoi-plan.json" "$tmp/snapshot-2.jsonl" \
+  "$chezmoi_plan_id" "$tmp/chezmoi-applied.jsonl"
+[ -e "$CHEZMOI_APPLY_MARKER" ] || fail "safe chezmoi apply was not executed"
+
+"$cli" collect --target test-host --section auth --output "$tmp/auth-plan-snapshot.jsonl"
+sleep 1
+"$cli" collect --target test-host --section auth --output "$tmp/auth-current-snapshot.jsonl"
+cat >"$tmp/auth-plan-draft.json" <<'JSON'
+{
+  "domain": "auth",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "auth-install",
+      "kind": "auth_artifact",
+      "id": "test-auth",
+      "argv": ["op", "read", "op://test/item/value"]
+    }
+  ]
+}
+JSON
+"$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-plan-snapshot.jsonl" "$tmp/auth-plan.json"
+auth_plan_id=$(jq -r '.plan_id' "$tmp/auth-plan.json")
+"$cli" apply-plan "$tmp/auth-plan.json" "$tmp/auth-current-snapshot.jsonl" "$auth_plan_id" "$tmp/auth-applied.jsonl"
+"$cli" validate "$tmp/auth-applied.jsonl"
+cmp -s "$OP_SECRET_FILE" "$tmp/home/.test-auth" ||
+  fail "encrypted auth install did not atomically install the retrieved bytes"
+if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; then
+  fail "encrypted auth install left a temporary or backup file"
+fi
+
+"$cli" collect --target test-host --section auth --output "$tmp/auth-rollback-plan-snapshot.jsonl"
+sleep 1
+"$cli" collect --target test-host --section auth --output "$tmp/auth-rollback-current-snapshot.jsonl"
+"$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-rollback-plan-snapshot.jsonl" "$tmp/auth-rollback-plan.json"
+auth_rollback_plan_id=$(jq -r '.plan_id' "$tmp/auth-rollback-plan.json")
+cp "$tmp/home/.test-auth" "$tmp/auth-before-failed-verify"
+printf '%s\n' '{"portable":"invalid"}' >"$OP_SECRET_FILE"
+if AUTH_CHECK_FAIL=1 "$cli" apply-plan "$tmp/auth-rollback-plan.json" \
+  "$tmp/auth-rollback-current-snapshot.jsonl" "$auth_rollback_plan_id" "$tmp/auth-rollback-result.jsonl" >/dev/null 2>&1; then
+  fail "encrypted auth install succeeded despite failed native verification"
+fi
+cmp -s "$tmp/auth-before-failed-verify" "$tmp/home/.test-auth" ||
+  fail "failed auth verification did not restore the prior credential file"
+if find "$tmp/home" -name '.machine-utilities-auth*' -print -quit | grep -q .; then
+  fail "failed auth verification left a temporary or backup file"
 fi
 
 chmod 666 "$tmp/config.json"

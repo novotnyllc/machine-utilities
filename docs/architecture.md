@@ -394,7 +394,7 @@ values.
     "xurl": {
       "path": "~/.xurl/auth.yml",
       "strategy": "encrypted-install",
-      "secret_ref": "configured-secret-reference",
+      "secret_ref": "op://your-vault/xurl-auth/credential-file",
       "mode": "0600",
       "verify": ["xurl", "auth", "status"]
     }

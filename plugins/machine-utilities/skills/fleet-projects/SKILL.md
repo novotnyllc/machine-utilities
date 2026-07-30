@@ -11,7 +11,9 @@ is not the skill directory. Collect the `projects` section with `"$CLI"`.
 Evaluate configured path, expected source, sanitized origin, HEAD/tree IDs,
 branch, dirty count, host groups, and whether Codex exposes the
 environment-native checkout as a saved project. Git readiness and Codex
-readiness are separate.
+readiness are separate. Ahead/behind values describe only the current local
+remote-tracking ref; treat network freshness as unknown until an explicitly
+authorized `git fetch` succeeds.
 
 Default to a plan:
 
@@ -27,6 +29,8 @@ the exact source/path operations with
 `"$CLI" seal-plan DRAFT SNAPSHOT PLAN`. Recapture project inventory and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. Obtain
 separate approval, execute only the sealed argv, and inventory again afterward.
+For a local target use `"$CLI" apply-plan PLAN CURRENT-SNAPSHOT PLAN-ID
+OUTPUT`; remote targets run the sealed scope inside the matching saved project.
 
 For Codex readiness, discover saved projects and match both host and native
 path. The controller does not need that path locally. If missing, tell the user
