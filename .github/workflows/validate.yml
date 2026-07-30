@@ -34,7 +34,9 @@ jobs:
           git diff --exit-code -- plugins/machine-utilities/integrity.json
       - name: Run fixture suite
         shell: bash
-        run: plugins/machine-utilities/scripts/test-machine-utilities
+        run: |
+          chmod -R go-w plugins/machine-utilities
+          plugins/machine-utilities/scripts/test-machine-utilities
 
   windows:
     runs-on: windows-latest
