@@ -1,0 +1,6 @@
+/plugins/machine-utilities/.claude-plugin/plugin.json text eol=lf
+/plugins/machine-utilities/.codex-plugin/plugin.json text eol=lf
+/plugins/machine-utilities/scripts/apply-windows.ps1 text eol=lf
+/plugins/machine-utilities/scripts/collect-posix text eol=lf
+/plugins/machine-utilities/scripts/collect-windows.ps1 text eol=lf
+/plugins/machine-utilities/scripts/machine-utilities text eol=lf

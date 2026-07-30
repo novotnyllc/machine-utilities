@@ -21,13 +21,23 @@ and inventory the package section first. Default to a read-only plan:
   when the user approves that exact scope.
 
 Present exact host, manager, package, current version, candidate version, and
-command. Put those inert operations in a plan draft and run
+command. Every `package-upgrade` operation must carry the exact observed
+`candidate_version`; sealing refuses a candidate not present in the snapshot,
+and the fresh precondition snapshot must still report it. Put those inert
+operations in a plan draft and run
 `"$CLI" seal-plan DRAFT SNAPSHOT PLAN`. Before apply, verify live host and
 platform identity, recapture package inventory, and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. This binds
 config, plan integrity, and preconditions without executing plan text. Then
 obtain separate user approval and execute only the exact argv sealed in the
-plan. Never infer apply permission from a request to inspect or plan.
+plan. For a local target use `"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH
+use `"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`. Both recapture trusted
+preflight and enforce the same executor, identity, manager-command,
+fresh-precondition, and semantic post-state checks. If an operation or
+postcondition fails, preserve the authoritative partial result emitted when
+post-inventory remains available. SSH uses bounded connection/keepalive
+timeouts and verifies the configured native hostname/user. Never infer apply
+permission from a request to inspect or plan.
 
 Run each native manager directly on local/SSH hosts. For Windows, Codex reads
 and follows `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude

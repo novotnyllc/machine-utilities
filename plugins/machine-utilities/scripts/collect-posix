@@ -54,13 +54,36 @@ emit_package_lines() {
       select(($fields | length) >= 2 and $fields[0] != "") |
       ($fields[0][0:8192]) as $name |
       ($fields[1][0:8192]) as $version |
+      (($fields[2] // "")[0:8192]) as $candidate |
       {
         schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,
         host_id:$host_id,kind:"package",id:(($manager+":"+$name)[0:8192]),
         observed_at:$observed_at,status:"present",confidence:"high",
-        data:{manager:$manager,name:$name,installed_version:$version},
+        data:{
+          manager:$manager,name:$name,installed_version:$version,
+          candidate_version:(if $candidate == "" then null else $candidate end),
+          update_available:($candidate != "" and $candidate != $version)
+        },
         evidence:[{source:"package-manager",method:$method}],errors:[]
       }'
+}
+
+join_package_candidates() {
+  installed=$1
+  candidates=$2
+  native_arch=${3:-}
+  awk -F '\t' -v native_arch="$native_arch" '
+    FILENAME == ARGV[1] { candidate[$1] = $2; next }
+    NF >= 2 {
+      name = $1
+      version = candidate[name]
+      if (version == "" && native_arch != "" && name ~ (":" native_arch "$")) {
+        sub(":" native_arch "$", "", name)
+        version = candidate[name]
+      }
+      print $1 "\t" $2 "\t" version
+    }
+  ' "$candidates" "$installed"
 }
 
 expand_home() {
@@ -92,29 +115,45 @@ sha256_stream() {
 }
 
 file_mode() {
-  stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1" 2>/dev/null || printf unknown
+  value=$(stat -f %Lp "$1" 2>/dev/null) ||
+    value=$(stat -c %a "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
 }
 
 file_owner() {
-  stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf unknown
+  value=$(stat -f %Su "$1" 2>/dev/null) ||
+    value=$(stat -c %U "$1" 2>/dev/null) ||
+    value=unknown
+  printf '%s\n' "$value"
 }
 
 file_size() {
-  stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || printf 0
+  value=$(stat -f %z "$1" 2>/dev/null) ||
+    value=$(stat -c %s "$1" 2>/dev/null) ||
+    value=0
+  printf '%s\n' "$value"
 }
 
 file_mtime() {
-  stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null ||
-    stat -c %y "$1" 2>/dev/null | awk '{print $1"T"$2"Z"}' || printf unknown
+  value=$(stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null) || {
+    raw=$(stat -c %y "$1" 2>/dev/null) || raw=
+    if [ -n "$raw" ]; then
+      value=$(printf '%s\n' "$raw" | awk '{print $1"T"$2"Z"}')
+    else
+      value=unknown
+    fi
+  }
+  printf '%s\n' "$value"
 }
 
 directory_birth_time() {
-  value=$(stat -f %SB -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null || true)
+  value=$(stat -f %SB -t %Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null) || value=
   if [ -n "$value" ]; then
     printf '%s\n' "$value"
     return
   fi
-  epoch=$(stat -c %W "$1" 2>/dev/null || printf 0)
+  epoch=$(stat -c %W "$1" 2>/dev/null) || epoch=0
   case $epoch in
     ''|0|-1|*[!0-9]*) return ;;
   esac
@@ -154,6 +193,10 @@ run_auth_health() {
     auth_health_status=not-configured
     return
   }
+  if [ "${auth_verify_allowed:-false}" != true ]; then
+    auth_health_status=not-authorized
+    return
+  fi
   verify_command=$(printf '%s' "$entry" | jq -r '.value.verify[0]')
   if ! command -v "$verify_command" >/dev/null 2>&1; then
     auth_health_status=unavailable
@@ -195,20 +238,17 @@ capability_matches() {
   case $match_provider in
     plugin)
       case $match_agent in
-        codex) match_cache="$HOME/.codex/plugins/cache" ;;
-        claude) match_cache="$HOME/.claude/plugins/cache" ;;
+        codex) match_plugins=$codex_plugins ;;
+        claude) match_plugins=$claude_plugins ;;
         *) return ;;
       esac
-      [ -d "$match_cache" ] || return
       match_plugin=$(basename "$match_source")
-      find "$match_cache" -mindepth 2 -maxdepth 2 -type d -name "$match_plugin" 2>/dev/null |
-        LC_ALL=C sort | while IFS= read -r plugin_dir; do
-          find "$plugin_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort |
-            while IFS= read -r version_dir; do
-              printf 'plugin:%s:%s:%s:%s\n' "$match_agent" \
-                "$(basename "$(dirname "$plugin_dir")")" "$match_plugin" "$(basename "$version_dir")"
-            done
-        done
+      printf '%s\n' "$match_plugins" | jq -r \
+        --arg source "$match_source" --arg name "$match_plugin" '
+          .[] |
+          select(.enabled == true) |
+          select(.name == $name or .manager_id == $source) |
+          "plugin:"+.agent+":"+.marketplace+":"+.name+":"+.installed_version'
       ;;
     skills-cli)
       match_lock="$HOME/.agents/.skill-lock.json"
@@ -241,6 +281,9 @@ capability_matches() {
   esac
 }
 
+auth_verify_allowed=false
+has_section auth && auth_verify_allowed=true
+
 if has_section host; then
   hostname_value=$(hostname 2>/dev/null | clip || printf unknown)
   user_value=$(id -un 2>/dev/null | clip || printf unknown)
@@ -265,9 +308,26 @@ if has_section packages; then
     case $manager in
       homebrew|linuxbrew)
         if command -v brew >/dev/null 2>&1; then
+          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-packages.XXXXXX")
+          installed_formulae="$package_tmp/formulae.tsv"
+          installed_casks="$package_tmp/casks.tsv"
+          candidate_formulae="$package_tmp/formulae-candidates.tsv"
+          candidate_casks="$package_tmp/cask-candidates.tsv"
+          : >"$candidate_formulae"
+          : >"$candidate_casks"
+          if outdated_json=$(brew outdated --json=v2 2>/dev/null); then
+            printf '%s\n' "$outdated_json" |
+              jq -r '.formulae[]? | [.name, .current_version] | @tsv' >"$candidate_formulae"
+            printf '%s\n' "$outdated_json" |
+              jq -r '.casks[]? | [.name, .current_version] | @tsv' >"$candidate_casks"
+          else
+            emit error "packages:$manager-updates" unavailable high '{}' '[]' \
+              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"brew outdated inventory failed"}]'
+          fi
           if brew_packages=$(brew list --versions 2>/dev/null); then
             printf '%s\n' "$brew_packages" |
-              awk 'NF >= 2 { print $1 "\t" $2 }' |
+              awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_formulae"
+            join_package_candidates "$installed_formulae" "$candidate_formulae" |
               emit_package_lines "$manager" list-installed
           else
             emit error "packages:$manager" unavailable high '{}' '[]' \
@@ -275,12 +335,14 @@ if has_section packages; then
           fi
           if casks=$(brew list --cask --versions 2>/dev/null); then
             printf '%s\n' "$casks" |
-              awk 'NF >= 2 { print $1 "\t" $2 }' |
+              awk 'NF >= 2 { print $1 "\t" $2 }' >"$installed_casks"
+            join_package_candidates "$installed_casks" "$candidate_casks" |
               emit_package_lines "$manager-cask" list-installed-casks
           else
             emit error "packages:$manager-cask" unavailable high '{}' '[]' \
               '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"brew cask inventory failed"}]'
           fi
+          rm -rf "$package_tmp"
         else
           emit error "packages:$manager" unavailable high '{}' '[]' \
             "$(jq -cn --arg manager "$manager" '[{code:"manager_missing",severity:"warning",retryable:false,message:($manager+" is not installed")} ]')"
@@ -288,12 +350,31 @@ if has_section packages; then
         ;;
       apt)
         if command -v dpkg-query >/dev/null 2>&1; then
+          package_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-packages.XXXXXX")
+          installed_apt="$package_tmp/installed.tsv"
+          candidate_apt="$package_tmp/candidates.tsv"
+          : >"$candidate_apt"
+          if command -v apt >/dev/null 2>&1 &&
+            apt_candidates=$(apt list --upgradable 2>/dev/null); then
+            printf '%s\n' "$apt_candidates" |
+              awk -F '[/ ]' 'NR > 1 && NF >= 3 { print $1 "\t" $3 }' >"$candidate_apt"
+          else
+            emit error packages:apt-updates unavailable high '{}' '[]' \
+              '[{"code":"candidate_query_failed","severity":"warning","retryable":true,"message":"APT candidate inventory failed"}]'
+          fi
           if apt_packages=$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null); then
-            printf '%s\n' "$apt_packages" | emit_package_lines apt dpkg-query
+            printf '%s\n' "$apt_packages" >"$installed_apt"
+            native_apt_arch=
+            if command -v dpkg >/dev/null 2>&1; then
+              native_apt_arch=$(dpkg --print-architecture 2>/dev/null) || native_apt_arch=
+            fi
+            join_package_candidates "$installed_apt" "$candidate_apt" "$native_apt_arch" |
+              emit_package_lines apt dpkg-query+apt-upgradable
           else
             emit error packages:apt unavailable high '{}' '[]' \
               '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"dpkg-query package inventory failed"}]'
           fi
+          rm -rf "$package_tmp"
         else
           emit error packages:apt unavailable high '{}' '[]' \
             '[{"code":"manager_missing","severity":"warning","retryable":false,"message":"dpkg-query is not installed"}]'
@@ -313,6 +394,116 @@ if has_section agents; then
       emit agent_runtime "$runtime" present high "$data" '[{"source":"runtime","method":"--version"}]'
     else
       emit agent_runtime "$runtime" absent high "$(jq -cn --arg runtime "$runtime" '{runtime:$runtime}')"
+    fi
+  done
+
+  codex_plugins='[]'
+  claude_plugins='[]'
+  codex_plugin_manager_state=absent
+  claude_plugin_manager_state=absent
+  for plugin_agent in codex claude; do
+    if ! command -v "$plugin_agent" >/dev/null 2>&1; then
+      emit plugin_manager "$plugin_agent" absent high \
+        "$(jq -cn --arg agent "$plugin_agent" '{agent:$agent,authoritative:false}')"
+      continue
+    fi
+    plugin_output=
+    normalized_plugins=
+    if plugin_output=$("$plugin_agent" plugin list --json 2>/dev/null); then
+      case $plugin_agent in
+        codex)
+          normalized_plugins=$(printf '%s\n' "$plugin_output" | jq -ce '
+            if type != "object" or
+              (.installed | type) != "array" or
+              (all(.installed[];
+                type == "object" and
+                (.pluginId | type == "string" and length > 0) and
+                (.name | type == "string" and length > 0) and
+                (.marketplaceName | type == "string" and length > 0) and
+                (.version | type == "string" and length > 0) and
+                (.installed | type == "boolean") and
+                (.enabled | type == "boolean") and
+                (
+                  (.source == null) or
+                  (
+                    (.source | type) == "object" and
+                    ((.source.path == null) or (.source.path | type) == "string")
+                  )
+                )
+              ) | not)
+            then error("invalid codex plugin list") else
+              [.installed[] |
+                select(.installed == true) |
+                {
+                  agent:"codex",
+                  manager_id:(.pluginId[0:8192]),
+                  marketplace:(.marketplaceName[0:8192]),
+                  name:(.name[0:8192]),
+                  installed_version:(.version[0:8192]),
+                  enabled:.enabled,
+                  path:((.source.path // null) | if type == "string" then .[0:8192] else null end),
+                  installed_at:null,
+                  last_updated:null
+                }]
+            end' 2>/dev/null) || normalized_plugins=
+          ;;
+        claude)
+          normalized_plugins=$(printf '%s\n' "$plugin_output" | jq -ce '
+            if type != "array" or
+              (all(.[];
+                type == "object" and
+                (.id | type == "string" and length > 0) and
+                ((.id | split("@")) as $parts |
+                  ($parts | length) == 2 and
+                  ($parts[0] | length) > 0 and
+                  ($parts[1] | length) > 0) and
+                (.version | type == "string" and length > 0) and
+                (.enabled | type == "boolean") and
+                ((.installPath == null) or (.installPath | type) == "string") and
+                ((.installedAt == null) or (.installedAt | type) == "string") and
+                ((.lastUpdated == null) or (.lastUpdated | type) == "string")
+              ) | not)
+            then error("invalid claude plugin list") else
+              [.[] |
+                .id as $manager_id |
+                {
+                  agent:"claude",
+                  manager_id:($manager_id[0:8192]),
+                  marketplace:(($manager_id | split("@")[1])[0:8192]),
+                  name:(($manager_id | split("@")[0])[0:8192]),
+                  installed_version:(.version[0:8192]),
+                  enabled:.enabled,
+                  path:((.installPath // null) | if type == "string" then .[0:8192] else null end),
+                  installed_at:((.installedAt // null) | if type == "string" then .[0:8192] else null end),
+                  last_updated:((.lastUpdated // null) | if type == "string" then .[0:8192] else null end)
+                }]
+            end' 2>/dev/null) || normalized_plugins=
+          ;;
+      esac
+    fi
+    if [ -n "$normalized_plugins" ]; then
+      case $plugin_agent in
+        codex)
+          codex_plugins=$normalized_plugins
+          codex_plugin_manager_state=present
+          ;;
+        claude)
+          claude_plugins=$normalized_plugins
+          claude_plugin_manager_state=present
+          ;;
+      esac
+      emit plugin_manager "$plugin_agent" present high \
+        "$(jq -cn --arg agent "$plugin_agent" --argjson count "$(printf '%s' "$normalized_plugins" | jq 'length')" \
+          '{agent:$agent,authoritative:true,installed_count:$count}')" \
+        '[{"source":"manager-cli","method":"plugin-list-json"}]'
+    else
+      case $plugin_agent in
+        codex) codex_plugin_manager_state=unavailable ;;
+        claude) claude_plugin_manager_state=unavailable ;;
+      esac
+      emit plugin_manager "$plugin_agent" unavailable high \
+        "$(jq -cn --arg agent "$plugin_agent" '{agent:$agent,authoritative:false}')" '[]' \
+        '[{"code":"manager_query_failed","severity":"warning","retryable":true,"message":"plugin manager inventory failed"}]'
     fi
   done
 
@@ -437,19 +628,93 @@ if has_section agents; then
         '. + [{agent:$agent,provider:$provider,source:$source,expected_name:$expected_name,
           observed:(($matches|length)>0),matches:$matches,duplicate:(($matches|length)>1)}]')
     done
+    auth_dependencies='[]'
+    artifact_dependencies='[]'
+    dependencies_ready=true
+    while IFS= read -r required_auth; do
+      [ -n "$required_auth" ] || continue
+      dependency_status=unconfigured
+      dependency_ready=false
+      auth_definition=$(jq -c --arg id "$required_auth" '.auth_artifacts[$id] // empty' "$config")
+      if [ -n "$auth_definition" ]; then
+        configured_path=$(printf '%s' "$auth_definition" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')
+        dependency_path=$(expand_home "$configured_path")
+        if [ -L "$dependency_path" ]; then
+          dependency_status=partial
+        elif [ -f "$dependency_path" ]; then
+          auth_entry=$(jq -cn --arg key "$required_auth" --argjson value "$auth_definition" '{key:$key,value:$value}')
+          run_auth_health "$auth_entry"
+          dependency_status=$auth_health_status
+          case $auth_health_status in
+            healthy|not-configured) dependency_ready=true ;;
+          esac
+        else
+          dependency_status=absent
+        fi
+      fi
+      [ "$dependency_ready" = true ] || dependencies_ready=false
+      auth_dependencies=$(printf '%s' "$auth_dependencies" | jq -c \
+        --arg id "$required_auth" --arg status "$dependency_status" --argjson ready "$dependency_ready" \
+        '. + [{id:$id,status:$status,ready:$ready}]')
+    done <<EOF
+$(printf '%s' "$capability" | jq -r '.value.requires_auth[]?')
+EOF
+    while IFS= read -r required_artifact; do
+      [ -n "$required_artifact" ] || continue
+      dependency_status=unconfigured
+      dependency_ready=false
+      artifact_definition=$(jq -c --arg id "$required_artifact" --argjson host_groups "$capability_host_groups" '
+        first((.agent_artifacts // [])[] |
+          select(.id == $id) |
+          select(
+            (.groups // []) as $groups |
+            ($groups | length) == 0 or
+            any($groups[]; . as $group | $host_groups | index($group) != null)
+          )
+        ) // empty' "$config")
+      if [ -n "$artifact_definition" ]; then
+        artifact_path=$(expand_home "$(printf '%s' "$artifact_definition" | jq -r '.path')")
+        if [ -L "$artifact_path" ]; then
+          dependency_status=partial
+        elif [ -f "$artifact_path" ] || [ -d "$artifact_path" ]; then
+          dependency_status=present
+          dependency_ready=true
+        else
+          dependency_status=absent
+        fi
+      fi
+      [ "$dependency_ready" = true ] || dependencies_ready=false
+      artifact_dependencies=$(printf '%s' "$artifact_dependencies" | jq -c \
+        --arg id "$required_artifact" --arg status "$dependency_status" --argjson ready "$dependency_ready" \
+        '. + [{id:$id,status:$status,ready:$ready}]')
+    done <<EOF
+$(printf '%s' "$capability" | jq -r '.value.requires_artifacts[]?')
+EOF
+    provider_available=false
+    provider_consistent=false
+    if [ "$desired_count" -gt 0 ] && [ "$observed_count" -eq "$desired_count" ]; then
+      provider_available=true
+      [ "$duplicate_count" -ne 0 ] || provider_consistent=true
+    fi
     capability_status=absent
-    capability_consistent=false
-    if [ "$desired_count" -gt 0 ] && [ "$observed_count" -eq "$desired_count" ] && [ "$duplicate_count" -eq 0 ]; then
+    capability_ready=false
+    if [ "$provider_consistent" = true ] && [ "$dependencies_ready" = true ]; then
       capability_status=present
-      capability_consistent=true
-    elif [ "$observed_count" -gt 0 ]; then
+      capability_ready=true
+    elif [ "$observed_count" -gt 0 ] ||
+      [ "$(printf '%s' "$auth_dependencies" | jq 'length')" -gt 0 ] ||
+      [ "$(printf '%s' "$artifact_dependencies" | jq 'length')" -gt 0 ]; then
       capability_status=partial
     fi
     data=$(jq -cn --arg name "$capability_name" --argjson providers "$providers" \
-      --argjson consistent "$capability_consistent" \
-      '{name:$name,available:([$providers[].observed]|all),consistent:$consistent,providers:$providers}')
+      --argjson provider_available "$provider_available" --argjson consistent "$provider_consistent" \
+      --argjson ready "$capability_ready" --argjson dependencies_ready "$dependencies_ready" \
+      --argjson auth "$auth_dependencies" --argjson artifacts "$artifact_dependencies" \
+      '{name:$name,available:($provider_available and $dependencies_ready),ready:$ready,
+        consistent:$consistent,providers:$providers,
+        dependencies:{ready:$dependencies_ready,auth:$auth,artifacts:$artifacts}}')
     emit capability "$capability_name" "$capability_status" high "$data" \
-      '[{"source":"configuration+filesystem","method":"logical-provider-reconciliation"}]'
+      '[{"source":"configuration+manager-state+dependency-state","method":"logical-provider-reconciliation"}]'
   done
 
   jq -c --argjson host_groups "$capability_host_groups" '
@@ -526,23 +791,71 @@ if has_section agents; then
 
   for agent in codex claude; do
     case $agent in
-      codex) cache="$HOME/.codex/plugins/cache" ;;
-      claude) cache="$HOME/.claude/plugins/cache" ;;
+      codex)
+        cache="$HOME/.codex/plugins/cache"
+        active_plugins=$codex_plugins
+        plugin_manager_state=$codex_plugin_manager_state
+        ;;
+      claude)
+        cache="$HOME/.claude/plugins/cache"
+        active_plugins=$claude_plugins
+        plugin_manager_state=$claude_plugin_manager_state
+        ;;
     esac
+    printf '%s\n' "$active_plugins" | jq -c '.[]' | while IFS= read -r active_plugin; do
+      marketplace=$(printf '%s' "$active_plugin" | jq -r '.marketplace' | clip)
+      plugin=$(printf '%s' "$active_plugin" | jq -r '.name' | clip)
+      version=$(printf '%s' "$active_plugin" | jq -r '.installed_version' | clip)
+      cache_path="$cache/$marketplace/$plugin/$version"
+      inferred=
+      cache_exists=false
+      if [ -d "$cache_path" ]; then
+        cache_exists=true
+        inferred=$(directory_birth_time "$cache_path")
+      fi
+      data=$(printf '%s' "$active_plugin" | jq -c \
+        --arg inferred "$inferred" --arg cache_path "$cache_path" --argjson cache_exists "$cache_exists" '
+          . + {
+            active:true,
+            install_state:"installed",
+            inventory_source:"manager",
+            cache_path:(if $cache_exists then $cache_path else null end),
+            inferred_installed_at:(if .installed_at != null or $inferred == "" then null else $inferred end),
+            inferred_installed_at_evidence:(if .installed_at != null or $inferred == "" then null else "filesystem_birthtime" end),
+            inferred_installed_at_confidence:(if .installed_at != null or $inferred == "" then "unknown" else "low" end)
+          }')
+      emit plugin "$agent:$marketplace:$plugin:$version" present high "$data" \
+        '[{"source":"manager-cli","method":"plugin-list-json"}]'
+    done
+
     [ -d "$cache" ] || continue
     find "$cache" -mindepth 3 -maxdepth 5 -type f \
       \( -path '*/.codex-plugin/plugin.json' -o -path '*/.claude-plugin/plugin.json' \) \
+      ! -path "$cache/plugin-eval/*" \
       2>/dev/null | while IFS= read -r manifest; do
         dirname "$(dirname "$manifest")"
       done | sort -u | while IFS= read -r path; do
       version=$(basename "$path" | clip)
       plugin=$(basename "$(dirname "$path")" | clip)
       marketplace=$(basename "$(dirname "$(dirname "$path")")" | clip)
+      if printf '%s\n' "$active_plugins" | jq -e \
+        --arg marketplace "$marketplace" --arg plugin "$plugin" --arg version "$version" \
+        'any(.[]; .marketplace == $marketplace and .name == $plugin and .installed_version == $version)' \
+        >/dev/null; then
+        continue
+      fi
       inferred=$(directory_birth_time "$path")
+      cache_install_state='cache-only'
+      cache_active=false
+      if [ "$plugin_manager_state" = unavailable ]; then
+        cache_install_state='manager-unverified'
+        cache_active=null
+      fi
       data=$(jq -cn --arg agent "$agent" --arg marketplace "$marketplace" --arg plugin "$plugin" --arg version "$version" --arg path "$path" \
-        --arg inferred "$inferred" \
-        '{agent:$agent,marketplace:$marketplace,name:$plugin,installed_version:$version,path:$path,installed_at:null,inferred_installed_at:(if $inferred=="" then null else $inferred end),inferred_installed_at_evidence:(if $inferred=="" then null else "filesystem_birthtime" end),inferred_installed_at_confidence:(if $inferred=="" then "unknown" else "low" end)}')
-      emit plugin "$agent:$marketplace:$plugin:$version" present medium "$data" '[{"source":"filesystem","method":"directory-observation+birthtime-inference"}]'
+        --arg inferred "$inferred" --arg install_state "$cache_install_state" --argjson active "$cache_active" \
+        '{agent:$agent,marketplace:$marketplace,name:$plugin,cached_version:$version,path:$path,active:$active,install_state:$install_state,inventory_source:"cache",inferred_cached_at:(if $inferred=="" then null else $inferred end),inferred_cached_at_evidence:(if $inferred=="" then null else "filesystem_birthtime" end),inferred_cached_at_confidence:(if $inferred=="" then "unknown" else "low" end)}')
+      emit plugin_cache "$agent:$marketplace:$plugin:$version" present low "$data" \
+        '[{"source":"filesystem","method":"cache-directory-observation+birthtime-inference"}]'
     done
   done
 fi
@@ -614,26 +927,26 @@ if has_section projects; then
       upstream=$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null | clip || true)
       ahead=0
       behind=0
-      sync_state=no-upstream
+      sync_state=local-no-upstream
       if [ -n "$upstream" ]; then
         counts=$(git -C "$path" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || printf '0 0')
         ahead=$(printf '%s\n' "$counts" | awk '{print $1+0}')
         behind=$(printf '%s\n' "$counts" | awk '{print $2+0}')
         if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
-          sync_state=diverged
+          sync_state=local-tracking-diverged
         elif [ "$ahead" -gt 0 ]; then
-          sync_state=ahead
+          sync_state=local-tracking-ahead
         elif [ "$behind" -gt 0 ]; then
-          sync_state=behind
+          sync_state=local-tracking-behind
         else
-          sync_state=up-to-date
+          sync_state=local-tracking-up-to-date
         fi
       fi
       repository_readiness=ready
       [ "$dirty" -eq 0 ] || repository_readiness=dirty
       [ "$origin_matches" = true ] || repository_readiness=wrong-origin
       [ "$branch" != detached ] || repository_readiness=detached
-      [ "$sync_state" != diverged ] || repository_readiness=diverged
+      [ "$sync_state" != local-tracking-diverged ] || repository_readiness=diverged
       status=present
       [ "$repository_readiness" = ready ] || status=partial
       data=$(jq -cn --arg name "$name" --arg path "$path" --arg expected_source "$expected" \
@@ -644,7 +957,7 @@ if has_section projects; then
         '{name:$name,path:$path,expected_source:$expected_source,origin:$origin,
           origin_matches:$origin_matches,head:$head,tree:$tree,branch:$branch,
           upstream:(if $upstream=="" then null else $upstream end),ahead:$ahead,behind:$behind,
-          sync_state:$sync_state,dirty_count:$dirty_count,repository_readiness:$readiness,
+          sync_state:$sync_state,tracking_freshness:"unknown",dirty_count:$dirty_count,repository_readiness:$readiness,
           codex_required:$codex_required,
           codex_saved_project_status:(if $codex_required then "requires-controller-check" else "not-required" end)}')
       emit project "$name" "$status" high "$data" '[{"source":"git","method":"rev-parse+status"}]'
@@ -728,7 +1041,7 @@ if has_section startup; then
         printf '%s\n' "$units" | awk 'NF {print $1}' | LC_ALL=C sort -u |
           while IFS= read -r unit; do
             if [ "$scope" = user ]; then
-              active=$(systemctl --user is-active "$unit" 2>/dev/null || printf inactive)
+              active=$(systemctl --user is-active "$unit" 2>/dev/null) || active=inactive
               path=$(systemctl --user show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
               action_line=$(systemctl --user show "$unit" -p ExecStart --value 2>/dev/null | head -1)
               working_directory=$(systemctl --user show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
@@ -736,7 +1049,7 @@ if has_section startup; then
               next_run=$(systemctl --user show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null | head -1)
               last_run=$(systemctl --user show "$unit" -p LastTriggerUSec --value 2>/dev/null | head -1)
             else
-              active=$(systemctl is-active "$unit" 2>/dev/null || printf inactive)
+              active=$(systemctl is-active "$unit" 2>/dev/null) || active=inactive
               path=$(systemctl show "$unit" -p FragmentPath --value 2>/dev/null | head -1)
               action_line=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null | head -1)
               working_directory=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null | head -1)
@@ -823,13 +1136,11 @@ if has_section chezmoi; then
         for (code in counts) print code "\t" counts[code]
       }' "$chezmoi_status" | LC_ALL=C sort | jq -Rsc '
         split("\n") | map(select(length > 0) | split("\t") | {code:.[0],count:(.[1]|tonumber)})')
-      drift_status=present
-      [ "$drift_count" -eq 0 ] || drift_status=partial
       data=$(jq -cn --arg source_path "$source_path" --arg digest "$status_digest" \
         --argjson drift_count "$drift_count" --argjson codes "$status_codes" \
         '{source_path:$source_path,drift_count:$drift_count,status_codes:$codes,
           status_digest:{algorithm:"sha256",value:$digest,scope:"chezmoi-status-output"}}')
-      emit chezmoi_state live "$drift_status" high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
+      emit chezmoi_state live present high "$data" '[{"source":"chezmoi","method":"source-path+status"}]'
     else
       emit chezmoi_state live unavailable high "$(jq -cn --arg source_path "$source_path" '{source_path:$source_path}')" \
         '[]' '[{"code":"chezmoi_status_failed","severity":"warning","retryable":true,"message":"chezmoi status failed"}]'

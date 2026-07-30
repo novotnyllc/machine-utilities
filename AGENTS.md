@@ -3,8 +3,8 @@
 ## Repo Purpose
 
 This repository owns the `machine-utilities` plugin for Codex and Claude Code.
-It orchestrates fleet maintenance while leaving generic single-host transport
-and SSH diagnosis in `agent-utilities`.
+It orchestrates fleet maintenance and owns fleet-aware single-host transport
+and SSH diagnosis.
 
 ## Release Coupling
 
@@ -12,8 +12,8 @@ When changing the plugin version, update:
 
 - `plugins/machine-utilities/.codex-plugin/plugin.json`
 - `plugins/machine-utilities/.claude-plugin/plugin.json`
-- `.claude-plugin/marketplace.json`
 - `<marketplace-repo>/.agents/plugins/plugin-versions.json`
+- `<marketplace-repo>/.claude-plugin/marketplace.json`
 
 When the plugin is newly added or renamed, also update:
 
@@ -34,6 +34,5 @@ Never treat an installed plugin cache as the source repository.
   target resolution, identity verification, preflight, and post-change checks.
 - Reuse existing chezmoi and package-manager commands instead of reimplementing
   them.
-- Keep generic SSH diagnosis and single-host remote mechanics in
-  `agent-utilities`.
+- Keep fleet-aware SSH diagnosis and remote-machine mechanics in this plugin.
 - Validate JSON manifests and skill frontmatter before committing.

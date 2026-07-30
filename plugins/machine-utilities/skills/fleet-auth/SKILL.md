@@ -31,6 +31,16 @@ then atomically rename it into the user-owned parent directory. Never copy
 through a world-readable location.
 Run the configured native verification command; on failure restore the prior
 file or remove the new file.
+For a local `encrypted-install`, use
+`"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; it resolves the configured `op://`
+reference directly into a private same-directory temporary file, replaces
+atomically, verifies, and rolls back on failure. Remote targets over SSH use
+`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`. Apply recaptures trusted preflight
+itself and preserves authoritative partial output after a failed operation or
+postcondition when post-inventory remains available. SSH uses bounded
+connection/keepalive timeouts and verifies the configured native hostname/user.
+Native Windows auth mutation is not supported by this release; reauthenticate
+interactively on that host rather than copying credentials through a task.
 
 Matching SHA-256 proves identical bytes, not valid authentication. Prefer
 per-machine least-privilege credentials for unattended work. For Windows,

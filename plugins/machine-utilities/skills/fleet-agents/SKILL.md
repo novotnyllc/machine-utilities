@@ -29,9 +29,20 @@ or hash, and desired action. Seal it with
 recapture inventory, and require
 `"$CLI" verify-preconditions PLAN CURRENT-SNAPSHOT` to succeed. Obtain
 separate user approval and execute only the exact sealed argv. Do not silently
-convert a standalone skill into a plugin or vice versa.
+convert a standalone skill into a plugin or vice versa. For a local target use
+`"$CLI" apply-plan PLAN PLAN-ID OUTPUT`; for SSH use
+`"$CLI" apply-ssh-plan PLAN PLAN-ID OUTPUT`; Windows uses the native worker
+contract in the remote-control reference. Apply recaptures trusted preflight
+itself. Preserve its authoritative partial output when an operation or
+postcondition fails.
+The executor supports exact updates for skills-cli, JSM, and Claude plugins.
+Codex replacement uses the native idempotent `codex plugin add
+PLUGIN@MARKETPLACE --json` operation. Installs, removals, and provider
+conversion are unsupported and fail before plan sealing.
 
-Use local/SSH execution where configured. For Windows Codex tasks read and
-follow `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
+Use local/SSH execution where configured. SSH uses bounded connection and
+keepalive timeouts and must match the configured native hostname/user before
+mutation. For Windows Codex tasks read and follow
+`"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
 unsupported rather than using WSL. Re-inventory after changes and report
 unresolved provenance as unknown, not guessed.

@@ -107,8 +107,18 @@ function Test-JsmVersion([object]$Value) {
         $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]
 }
 
+function Test-ManagerEntityName([object]$Value, [string]$Manager) {
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $false }
+    $Pattern = if ($Manager -eq "skills-cli") {
+        "^[A-Za-z0-9@._/][A-Za-z0-9@._/-]*$"
+    } else {
+        "^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"
+    }
+    return [string]$Value -match $Pattern
+}
+
 function Test-JsmSkill([object]$Skill) {
-    if ($null -eq $Skill -or [string]::IsNullOrWhiteSpace([string]$Skill.name)) { return $false }
+    if ($null -eq $Skill -or -not (Test-ManagerEntityName $Skill.name "jsm")) { return $false }
     if (-not (Test-JsmVersion $Skill.version) -or -not (Test-JsmVersion $Skill.latest_version)) { return $false }
     foreach ($Field in @("installed_at")) {
         if ($null -ne $Skill.$Field -and $Skill.$Field -isnot [string]) { return $false }
@@ -159,7 +169,15 @@ function Get-AuthHealth([object]$Definition) {
             Stop-Job -Job $Job -ErrorAction SilentlyContinue
             return @{ health = "timeout"; verify_exit_code = 124 }
         }
-        $ExitCode = [int](Receive-Job -Job $Job | Select-Object -Last 1)
+        if ($Job.State -ne "Completed" -or @($Job.ChildJobs | ForEach-Object { $_.Error }).Count -gt 0) {
+            return @{ health = "error"; verify_exit_code = $null }
+        }
+        $JobOutput = @(Receive-Job -Job $Job -ErrorAction SilentlyContinue)
+        [int]$ExitCode = 0
+        if ($JobOutput.Count -ne 1 -or
+            -not [int]::TryParse([string]$JobOutput[0], [ref]$ExitCode)) {
+            return @{ health = "error"; verify_exit_code = $null }
+        }
         return @{ health = $(if ($ExitCode -eq 0) { "healthy" } else { "unhealthy" }); verify_exit_code = $ExitCode }
     } finally {
         Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
@@ -168,7 +186,10 @@ function Get-AuthHealth([object]$Definition) {
 
 function Test-BoundedStrings([object]$Value) {
     if ($null -eq $Value) { return $true }
-    if ($Value -is [string]) { return $Value.Length -le 8192 }
+    if ($Value -is [string]) {
+        return $Value.Length -le 8192 -and $Value -notmatch "[\x00-\x1f\x7f-\x9f]"
+    }
+    if ($Value -is [ValueType]) { return $true }
     if ($Value -is [Collections.IDictionary]) {
         foreach ($Key in $Value.Keys) {
             if (-not (Test-BoundedStrings $Key) -or -not (Test-BoundedStrings $Value[$Key])) { return $false }
@@ -193,12 +214,25 @@ function Assert-WorkerConfig([object]$Value) {
     if ($HostId -notmatch '^[A-Za-z0-9._-]+$' -or $Value.version -ne 1 -or $null -eq $Value.machines.$HostId) {
         throw "Invalid version 1 configuration or unknown host"
     }
-    if (-not (Test-BoundedStrings $Value)) { throw "Configuration contains an oversized string" }
+    if (-not (Test-BoundedStrings $Value)) { throw "Configuration contains an oversized or control string" }
+    if ($null -eq $Value.worker -or
+        [string]$Value.worker.target -ne $HostId -or
+        [string]$Value.worker.controller_configuration_digest -ne $ControllerConfigDigest.ToLowerInvariant()) {
+        throw "Worker configuration is not bound to this controller and target"
+    }
     $ConfiguredMachine = $Value.machines.$HostId
     if ($ConfiguredMachine.platform -ne "windows" -or
         $ConfiguredMachine.transport -ne "codex-remote-control" -or
         [string]::IsNullOrWhiteSpace([string]$ConfiguredMachine.codex_host)) {
         throw "Windows worker requires direct codex-remote-control transport"
+    }
+    if ([string]$ConfiguredMachine.expected_hostname -notmatch "^[A-Za-z0-9._-]+$" -or
+        [string]$ConfiguredMachine.expected_user -notmatch "^[A-Za-z0-9._@-]+$") {
+        throw "Windows worker requires expected_hostname and expected_user"
+    }
+    if ([string]$env:COMPUTERNAME -ine [string]$ConfiguredMachine.expected_hostname -or
+        [string][Environment]::UserName -ine [string]$ConfiguredMachine.expected_user) {
+        throw "Windows target hostname or user does not match configuration"
     }
     if (@($ConfiguredMachine.groups | Where-Object { $_ -notmatch '^[A-Za-z0-9._-]+$' }).Count -gt 0) {
         throw "Invalid machine group"
@@ -223,7 +257,7 @@ function Assert-WorkerConfig([object]$Value) {
     }
     if ($null -ne $Value.capabilities) {
         foreach ($Property in $Value.capabilities.PSObject.Properties) {
-            if ($Property.Name -notmatch '^[A-Za-z0-9._-]+$') { throw "Invalid capability configuration" }
+            if ($Property.Name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') { throw "Invalid capability configuration" }
             $ProviderCount = 0
             foreach ($Agent in @("codex", "claude")) {
                 $Definition = $Property.Value.$Agent
@@ -233,8 +267,8 @@ function Assert-WorkerConfig([object]$Value) {
                     [string]::IsNullOrWhiteSpace([string]$Definition.source) -or
                     [string]$Definition.source -match '\?' -or
                     [string]$Definition.source -match '^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@' -or
-                    ($null -ne $Definition.skill -and [string]$Definition.skill -notmatch '^[A-Za-z0-9._-]+$') -or
-                    ($null -ne $Definition.name -and [string]$Definition.name -notmatch '^[A-Za-z0-9._-]+$')) {
+                    ($null -ne $Definition.skill -and [string]$Definition.skill -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') -or
+                    ($null -ne $Definition.name -and [string]$Definition.name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$')) {
                     throw "Invalid capability provider configuration"
                 }
                 if ([string]$Definition.provider -eq "plugin" -and
@@ -337,20 +371,75 @@ if (Test-Section "packages") {
             )
         } else {
             $Temp = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-winget-" + [Guid]::NewGuid().ToString("N") + ".json")
+            $Candidates = @{}
+            $CandidateQueryAuthoritative = $false
             try {
-                & winget export --output $Temp --include-versions --accept-source-agreements --disable-interactivity | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "winget export exited $LASTEXITCODE" }
+                $UpgradeLines = @(& winget upgrade --accept-source-agreements --disable-interactivity 2>$null)
+                $UpgradeSucceeded = $?
+                $UpgradeExitCode = $LASTEXITCODE
+                if ($UpgradeSucceeded -and ($null -eq $UpgradeExitCode -or $UpgradeExitCode -eq 0)) {
+                    $HeaderIndex = -1
+                    for ($Index = 0; $Index -lt $UpgradeLines.Count; $Index++) {
+                        if ([string]$UpgradeLines[$Index] -match '^Name\s{2,}Id\s{2,}Version\s{2,}Available\s{2,}Source\s*$') {
+                            $HeaderIndex = $Index
+                            break
+                        }
+                    }
+                    if ($HeaderIndex -ge 0 -and $HeaderIndex + 1 -lt $UpgradeLines.Count -and
+                        [string]$UpgradeLines[$HeaderIndex + 1] -match '^-{3,}(\s+-{2,}){4}\s*$') {
+                        $CandidateQueryAuthoritative = $true
+                        foreach ($Line in @($UpgradeLines | Select-Object -Skip ($HeaderIndex + 2))) {
+                            if ([string]::IsNullOrWhiteSpace([string]$Line)) { continue }
+                            if ([string]$Line -notmatch '^(?<name>.*?)\s{2,}(?<id>\S+)\s+(?<installed>\S+)\s+(?<available>\S+)\s+(?<source>\S+)\s*$' -or
+                                [string]$Matches.available -match '^-+$' -or
+                                $Candidates.ContainsKey([string]$Matches.id)) {
+                                $CandidateQueryAuthoritative = $false
+                                $Candidates.Clear()
+                                break
+                            }
+                            $Candidates[[string]$Matches.id] = [string]$Matches.available
+                        }
+                    } elseif (($UpgradeLines -join "`n") -match
+                        '(?m)^(No installed package found matching input criteria|No applicable upgrade found)\.?$') {
+                        $CandidateQueryAuthoritative = $true
+                    }
+                    if (-not $CandidateQueryAuthoritative) {
+                        Add-Record -Kind "error" -Id "packages:winget-updates" -Status "partial" -Confidence "high" -Errors @(
+                            @{ code = "candidate_query_unverified"; severity = "warning"; retryable = $true; message = "winget upgrade output was not an authoritative package table" }
+                        )
+                    }
+                } else {
+                    Add-Record -Kind "error" -Id "packages:winget-updates" -Status "unavailable" -Confidence "medium" -Errors @(
+                        @{ code = "candidate_query_failed"; severity = "warning"; retryable = $true; message = "winget upgrade inventory failed" }
+                    )
+                }
+                $null = & winget export --output $Temp --include-versions --accept-source-agreements --disable-interactivity
+                $WingetSucceeded = $?
+                $WingetExitCode = $LASTEXITCODE
+                if (-not $WingetSucceeded -or ($null -ne $WingetExitCode -and $WingetExitCode -ne 0)) {
+                    throw "winget export failed"
+                }
                 if (Test-Path -LiteralPath $Temp) {
                     $Export = Get-Content -LiteralPath $Temp -Raw | ConvertFrom-Json
                     foreach ($Source in @($Export.Sources)) {
                         foreach ($Package in @($Source.Packages)) {
                             $Name = Limit-Text $Package.PackageIdentifier
-                            Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" -Confidence "high" -Data @{
+                            $Candidate = if ($Candidates.ContainsKey([string]$Package.PackageIdentifier)) {
+                                Limit-Text $Candidates[[string]$Package.PackageIdentifier]
+                            } else {
+                                $null
+                            }
+                            Add-Record -Kind "package" -Id ("winget:" + $Name) -Status "present" `
+                                -Confidence $(if ($CandidateQueryAuthoritative) { "high" } else { "medium" }) -Data @{
                                 manager = "winget"
                                 name = $Name
                                 installed_version = Limit-Text $Package.Version
+                                candidate_version = $Candidate
+                                update_available = if ($CandidateQueryAuthoritative) {
+                                    $null -ne $Candidate -and $Candidate -ne [string]$Package.Version
+                                } else { $null }
                                 source = Limit-Text $Source.SourceDetails.Name
-                            } -Evidence @(@{ source = "package-manager"; method = "winget-export" })
+                            } -Evidence @(@{ source = "package-manager"; method = "winget-export+upgrade-list" })
                         }
                     }
                 }
@@ -368,6 +457,8 @@ if (Test-Section "packages") {
 if (Test-Section "agents") {
     $SkillLockEntries = @()
     $JsmInventory = $null
+    $ActivePluginsByAgent = @{ codex = @(); claude = @() }
+    $PluginManagerStates = @{ codex = "absent"; claude = "absent" }
     foreach ($Runtime in @("codex", "claude")) {
         $Command = Get-Command $Runtime -ErrorAction SilentlyContinue
         if ($null -eq $Command) {
@@ -382,6 +473,119 @@ if (Test-Section "agents") {
         }
     }
 
+    foreach ($Agent in @("codex", "claude")) {
+        if ($null -eq (Get-Command $Agent -ErrorAction SilentlyContinue)) {
+            Add-Record -Kind "plugin_manager" -Id $Agent -Status "absent" -Confidence "high" -Data @{
+                agent = $Agent; authoritative = $false
+            }
+            continue
+        }
+        try {
+            $PluginLines = @(& $Agent plugin list --json 2>$null)
+            $PluginSucceeded = $?
+            $PluginExitCode = $LASTEXITCODE
+            if (-not $PluginSucceeded -or ($null -ne $PluginExitCode -and $PluginExitCode -ne 0)) {
+                throw "plugin list failed"
+            }
+            $PluginOutput = ($PluginLines -join "`n").Trim()
+            if ([string]::IsNullOrWhiteSpace($PluginOutput)) { throw "plugin list was empty" }
+            $ParsedPlugins = $PluginOutput | ConvertFrom-Json
+            $Entries = if ($Agent -eq "codex") {
+                if (-not $PluginOutput.TrimStart().StartsWith("{") -or $null -eq $ParsedPlugins.installed) {
+                    throw "invalid codex plugin list"
+                }
+                @($ParsedPlugins.installed)
+            } else {
+                if (-not $PluginOutput.TrimStart().StartsWith("[")) { throw "invalid claude plugin list" }
+                @($ParsedPlugins)
+            }
+            $Normalized = @()
+            foreach ($PluginEntry in $Entries) {
+                if ($null -eq $PluginEntry) { throw "plugin entry is missing" }
+                if ($Agent -eq "codex") {
+                    if (
+                        $PluginEntry.pluginId -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.pluginId) -or
+                        $PluginEntry.name -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.name) -or
+                        $PluginEntry.marketplaceName -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.marketplaceName) -or
+                        $PluginEntry.version -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.version) -or
+                        $PluginEntry.installed -isnot [bool] -or
+                        $PluginEntry.enabled -isnot [bool]
+                    ) {
+                        throw "invalid codex plugin entry"
+                    }
+                    if (
+                        $null -ne $PluginEntry.source -and
+                        $null -ne $PluginEntry.source.path -and
+                        $PluginEntry.source.path -isnot [string]
+                    ) {
+                        throw "invalid codex plugin path"
+                    }
+                    if (-not $PluginEntry.installed) { continue }
+                } else {
+                    if (
+                        $PluginEntry.id -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.id) -or
+                        $PluginEntry.version -isnot [string] -or [string]::IsNullOrWhiteSpace($PluginEntry.version) -or
+                        $PluginEntry.enabled -isnot [bool] -or
+                        ($null -ne $PluginEntry.installPath -and $PluginEntry.installPath -isnot [string]) -or
+                        (
+                            $null -ne $PluginEntry.installedAt -and
+                            $PluginEntry.installedAt -isnot [string] -and
+                            $PluginEntry.installedAt -isnot [DateTime]
+                        ) -or
+                        (
+                            $null -ne $PluginEntry.lastUpdated -and
+                            $PluginEntry.lastUpdated -isnot [string] -and
+                            $PluginEntry.lastUpdated -isnot [DateTime]
+                        )
+                    ) {
+                        throw "invalid claude plugin entry"
+                    }
+                }
+                $ManagerId = Limit-Text $(if ($Agent -eq "codex") { $PluginEntry.pluginId } else { $PluginEntry.id })
+                $IdParts = $ManagerId -split "@", 2
+                if (
+                    $Agent -eq "claude" -and
+                    ($IdParts.Count -ne 2 -or
+                        [string]::IsNullOrWhiteSpace($IdParts[0]) -or
+                        [string]::IsNullOrWhiteSpace($IdParts[1]))
+                ) {
+                    throw "invalid claude plugin id"
+                }
+                $Name = Limit-Text $(if ($Agent -eq "codex") {
+                    $PluginEntry.name
+                } else {
+                    $IdParts[0]
+                })
+                $Marketplace = Limit-Text $(if ($Agent -eq "codex") {
+                    $PluginEntry.marketplaceName
+                } else {
+                    $IdParts[1]
+                })
+                $Normalized += [ordered]@{
+                    agent = $Agent
+                    manager_id = $ManagerId
+                    marketplace = $Marketplace
+                    name = $Name
+                    installed_version = Limit-Text $PluginEntry.version
+                    enabled = $PluginEntry.enabled
+                    path = Limit-Text $(if ($Agent -eq "codex") { $PluginEntry.source.path } else { $PluginEntry.installPath })
+                    installed_at = Limit-Text $(if ($Agent -eq "claude") { $PluginEntry.installedAt } else { $null })
+                    last_updated = Limit-Text $(if ($Agent -eq "claude") { $PluginEntry.lastUpdated } else { $null })
+                }
+            }
+            $ActivePluginsByAgent[$Agent] = @($Normalized)
+            $PluginManagerStates[$Agent] = "present"
+            Add-Record -Kind "plugin_manager" -Id $Agent -Status "present" -Confidence "high" -Data @{
+                agent = $Agent; authoritative = $true; installed_count = @($Normalized).Count
+            } -Evidence @(@{ source = "manager-cli"; method = "plugin-list-json" })
+        } catch {
+            $PluginManagerStates[$Agent] = "unavailable"
+            Add-Record -Kind "plugin_manager" -Id $Agent -Status "unavailable" -Confidence "high" -Data @{
+                agent = $Agent; authoritative = $false
+            } -Errors @(@{ code = "manager_query_failed"; severity = "warning"; retryable = $true; message = "plugin manager inventory failed" })
+        }
+    }
+
     $LockPath = Join-Path $HOME ".agents/.skill-lock.json"
     if (Test-Path -LiteralPath $LockPath -PathType Leaf) {
         try {
@@ -389,6 +593,9 @@ if (Test-Section "agents") {
             $Skills = if ($null -ne $Lock.skills) { $Lock.skills } else { $Lock }
             $SkillLockEntries = @($Skills.PSObject.Properties)
             foreach ($Property in $Skills.PSObject.Properties) {
+                if (-not (Test-ManagerEntityName $Property.Name "skills-cli")) {
+                    throw "skills-cli lock contains an option-shaped or invalid skill name"
+                }
                 $Value = $Property.Value
                 Add-Record -Kind "skill" -Id ("skills-cli:" + (Limit-Text $Property.Name)) -Status "present" -Confidence "high" -Data @{
                     manager = "skills-cli"
@@ -412,8 +619,13 @@ if (Test-Section "agents") {
     $Jsm = Get-Command jsm -ErrorAction SilentlyContinue
     if ($null -ne $Jsm) {
         try {
-            $JsmOutput = (& jsm --json --offline list 2>$null | Out-String)
-            if ($LASTEXITCODE -ne 0) { throw "jsm list exited $LASTEXITCODE" }
+            $JsmLines = @(& jsm --json --offline list 2>$null)
+            $JsmSucceeded = $?
+            $JsmExitCode = $LASTEXITCODE
+            if (-not $JsmSucceeded -or ($null -ne $JsmExitCode -and $JsmExitCode -ne 0)) {
+                throw "jsm list failed"
+            }
+            $JsmOutput = ($JsmLines | Out-String)
             $JsmInventory = $JsmOutput | ConvertFrom-Json
             if ($null -eq $JsmInventory.skills -or $JsmInventory.skills -isnot [Array]) {
                 throw "jsm skills payload is not an array"
@@ -465,16 +677,12 @@ if (Test-Section "agents") {
                 $Matches = @()
                 switch ($Provider) {
                     "plugin" {
-                        $Cache = Join-Path $HOME $(if ($Agent -eq "codex") { ".codex/plugins/cache" } else { ".claude/plugins/cache" })
                         $PluginName = Split-Path ([string]$Definition.source) -Leaf
-                        if (Test-Path -LiteralPath $Cache -PathType Container) {
-                            foreach ($Marketplace in @(Get-ChildItem -LiteralPath $Cache -Directory -Force -ErrorAction SilentlyContinue)) {
-                                $PluginDirectory = Join-Path $Marketplace.FullName $PluginName
-                                if (Test-Path -LiteralPath $PluginDirectory -PathType Container) {
-                                    foreach ($VersionDirectory in @(Get-ChildItem -LiteralPath $PluginDirectory -Directory -Force -ErrorAction SilentlyContinue)) {
-                                        $Matches += "plugin:$Agent`:$($Marketplace.Name):$PluginName`:$($VersionDirectory.Name)"
-                                    }
-                                }
+                        foreach ($ActivePlugin in @($ActivePluginsByAgent[$Agent])) {
+                            if ([bool]$ActivePlugin.enabled -and
+                                ($ActivePlugin.name -eq $PluginName -or
+                                $ActivePlugin.manager_id -eq [string]$Definition.source)) {
+                                $Matches += "plugin:$Agent`:$($ActivePlugin.marketplace):$($ActivePlugin.name):$($ActivePlugin.installed_version)"
                             }
                         }
                     }
@@ -519,19 +727,95 @@ if (Test-Section "agents") {
             }
             $ObservedCount = @($Providers | Where-Object { $_.observed }).Count
             $DuplicateCount = @($Providers | Where-Object { $_.duplicate }).Count
-            $CapabilityStatus = if ($Providers.Count -gt 0 -and $ObservedCount -eq $Providers.Count -and $DuplicateCount -eq 0) {
+            $AuthDependencies = @()
+            $ArtifactDependencies = @()
+            $DependenciesReady = $true
+            foreach ($RequiredAuth in @($Property.Value.requires_auth)) {
+                $DependencyStatus = "unconfigured"
+                $DependencyReady = $false
+                $AuthDefinition = if ($null -ne $Config.auth_artifacts) {
+                    $Config.auth_artifacts.PSObject.Properties[$RequiredAuth].Value
+                } else {
+                    $null
+                }
+                if ($null -ne $AuthDefinition) {
+                    $ConfiguredPath = if ($null -ne $AuthDefinition.paths -and
+                        $null -ne $AuthDefinition.paths.PSObject.Properties[$HostId]) {
+                        [string]$AuthDefinition.paths.PSObject.Properties[$HostId].Value
+                    } else {
+                        [string]$AuthDefinition.path
+                    }
+                    $DependencyPath = Resolve-UserPath $ConfiguredPath
+                    if (Test-Path -LiteralPath $DependencyPath) {
+                        $Item = Get-Item -LiteralPath $DependencyPath -Force
+                        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Item.PSIsContainer) {
+                            $DependencyStatus = "partial"
+                        } else {
+                            $Health = Get-AuthHealth $AuthDefinition
+                            $DependencyStatus = [string]$Health.health
+                            $DependencyReady = $DependencyStatus -in @("healthy", "not-configured")
+                        }
+                    } else {
+                        $DependencyStatus = "absent"
+                    }
+                }
+                if (-not $DependencyReady) { $DependenciesReady = $false }
+                $AuthDependencies += @{
+                    id = Limit-Text $RequiredAuth
+                    status = Limit-Text $DependencyStatus
+                    ready = $DependencyReady
+                }
+            }
+            foreach ($RequiredArtifact in @($Property.Value.requires_artifacts)) {
+                $DependencyStatus = "unconfigured"
+                $DependencyReady = $false
+                $ArtifactDefinition = @($Config.agent_artifacts | Where-Object {
+                    $_.id -eq $RequiredArtifact -and
+                    (@($_.groups).Count -eq 0 -or @($_.groups | Where-Object { $HostGroups -contains $_ }).Count -gt 0)
+                } | Select-Object -First 1)
+                if ($ArtifactDefinition.Count -gt 0) {
+                    $ArtifactPath = Resolve-UserPath ([string]$ArtifactDefinition[0].path)
+                    if (Test-Path -LiteralPath $ArtifactPath) {
+                        $Item = Get-Item -LiteralPath $ArtifactPath -Force
+                        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                            $DependencyStatus = "partial"
+                        } else {
+                            $DependencyStatus = "present"
+                            $DependencyReady = $true
+                        }
+                    } else {
+                        $DependencyStatus = "absent"
+                    }
+                }
+                if (-not $DependencyReady) { $DependenciesReady = $false }
+                $ArtifactDependencies += @{
+                    id = Limit-Text $RequiredArtifact
+                    status = Limit-Text $DependencyStatus
+                    ready = $DependencyReady
+                }
+            }
+            $ProviderAvailable = $Providers.Count -gt 0 -and $ObservedCount -eq $Providers.Count
+            $ProviderConsistent = $ProviderAvailable -and $DuplicateCount -eq 0
+            $CapabilityReady = $ProviderConsistent -and $DependenciesReady
+            $CapabilityStatus = if ($CapabilityReady) {
                 "present"
-            } elseif ($ObservedCount -gt 0) {
+            } elseif ($ObservedCount -gt 0 -or $AuthDependencies.Count -gt 0 -or $ArtifactDependencies.Count -gt 0) {
                 "partial"
             } else {
                 "absent"
             }
             Add-Record -Kind "capability" -Id $Name -Status $CapabilityStatus -Confidence "high" -Data @{
                 name = $Name
-                available = $Providers.Count -gt 0 -and $ObservedCount -eq $Providers.Count
-                consistent = $Providers.Count -gt 0 -and $ObservedCount -eq $Providers.Count -and $DuplicateCount -eq 0
+                available = $ProviderAvailable -and $DependenciesReady
+                ready = $CapabilityReady
+                consistent = $ProviderConsistent
                 providers = $Providers
-            } -Evidence @(@{ source = "configuration+filesystem"; method = "logical-provider-reconciliation" })
+                dependencies = @{
+                    ready = $DependenciesReady
+                    auth = $AuthDependencies
+                    artifacts = $ArtifactDependencies
+                }
+            } -Evidence @(@{ source = "configuration+manager-state+dependency-state"; method = "logical-provider-reconciliation" })
         }
     }
 
@@ -620,28 +904,80 @@ if (Test-Section "agents") {
     $SeenPlugins = @{}
     foreach ($Agent in @("codex", "claude")) {
         $Cache = Join-Path $HOME $(if ($Agent -eq "codex") { ".codex/plugins/cache" } else { ".claude/plugins/cache" })
-        if (-not (Test-Path -LiteralPath $Cache -PathType Container)) { continue }
-        foreach ($Manifest in @(Get-ChildItem -LiteralPath $Cache -Filter "plugin.json" -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Directory.Name -in @(".codex-plugin", ".claude-plugin") })) {
-            $VersionDirectory = $Manifest.Directory.Parent
-            $PluginDirectory = $VersionDirectory.Parent
-            $Plugin = $PluginDirectory.Name
-            $Marketplace = $PluginDirectory.Parent.Name
-            $Version = $VersionDirectory.Name
-            $Key = "$Agent`:$Marketplace`:$Plugin`:$Version"
-            if ($SeenPlugins.ContainsKey($Key)) { continue }
+        foreach ($ActivePlugin in @($ActivePluginsByAgent[$Agent])) {
+            $CachePath = Join-Path $Cache ([IO.Path]::Combine(
+                [string]$ActivePlugin.marketplace,
+                [string]$ActivePlugin.name,
+                [string]$ActivePlugin.installed_version
+            ))
+            $CacheItem = if (Test-Path -LiteralPath $CachePath -PathType Container) {
+                Get-Item -LiteralPath $CachePath -Force
+            } else {
+                $null
+            }
+            $InferredInstalledAt = if ($null -ne $ActivePlugin.installed_at -or $null -eq $CacheItem) {
+                $null
+            } else {
+                $CacheItem.CreationTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            }
+            $Key = "$Agent`:$($ActivePlugin.marketplace):$($ActivePlugin.name):$($ActivePlugin.installed_version)"
             $SeenPlugins[$Key] = $true
-            Add-Record -Kind "plugin" -Id $Key -Status "present" -Confidence "medium" -Data @{
+            Add-Record -Kind "plugin" -Id $Key -Status "present" -Confidence "high" -Data @{
                 agent = $Agent
-                marketplace = Limit-Text $Marketplace
-                name = Limit-Text $Plugin
-                installed_version = Limit-Text $Version
-                path = Limit-Text $VersionDirectory.FullName
-                installed_at = $null
-                inferred_installed_at = $VersionDirectory.CreationTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
-                inferred_installed_at_evidence = "filesystem_creation_time"
-                inferred_installed_at_confidence = "low"
-            } -Evidence @(@{ source = "filesystem"; method = "directory-observation+creation-time-inference" })
+                manager_id = Limit-Text $ActivePlugin.manager_id
+                marketplace = Limit-Text $ActivePlugin.marketplace
+                name = Limit-Text $ActivePlugin.name
+                installed_version = Limit-Text $ActivePlugin.installed_version
+                enabled = [bool]$ActivePlugin.enabled
+                path = Limit-Text $ActivePlugin.path
+                installed_at = Limit-Text $ActivePlugin.installed_at
+                last_updated = Limit-Text $ActivePlugin.last_updated
+                active = $true
+                install_state = "installed"
+                inventory_source = "manager"
+                cache_path = Limit-Text $(if ($null -ne $CacheItem) { $CachePath } else { $null })
+                inferred_installed_at = $InferredInstalledAt
+                inferred_installed_at_evidence = $(if ($null -ne $InferredInstalledAt) { "filesystem_creation_time" } else { $null })
+                inferred_installed_at_confidence = $(if ($null -ne $InferredInstalledAt) { "low" } else { "unknown" })
+            } -Evidence @(@{ source = "manager-cli"; method = "plugin-list-json" })
+        }
+
+        if (-not (Test-Path -LiteralPath $Cache -PathType Container)) { continue }
+        $CacheMarketplaces = @(Get-ChildItem -LiteralPath $Cache -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "plugin-eval" })
+        foreach ($MarketplaceDirectory in $CacheMarketplaces) {
+            foreach ($PluginDirectory in @(Get-ChildItem -LiteralPath $MarketplaceDirectory.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                foreach ($VersionDirectory in @(Get-ChildItem -LiteralPath $PluginDirectory.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                    $HasManifest = $false
+                    foreach ($ManifestDirectory in @(".codex-plugin", ".claude-plugin")) {
+                        if (Test-Path -LiteralPath (Join-Path $VersionDirectory.FullName "$ManifestDirectory/plugin.json") -PathType Leaf) {
+                            $HasManifest = $true
+                            break
+                        }
+                    }
+                    if (-not $HasManifest) { continue }
+                    $Plugin = $PluginDirectory.Name
+                    $Marketplace = $MarketplaceDirectory.Name
+                    $Version = $VersionDirectory.Name
+                    $Key = "$Agent`:$Marketplace`:$Plugin`:$Version"
+                    if ($SeenPlugins.ContainsKey($Key)) { continue }
+                    $SeenPlugins[$Key] = $true
+                    $ManagerUnverified = $PluginManagerStates[$Agent] -eq "unavailable"
+                    Add-Record -Kind "plugin_cache" -Id $Key -Status "present" -Confidence "low" -Data @{
+                        agent = $Agent
+                        marketplace = Limit-Text $Marketplace
+                        name = Limit-Text $Plugin
+                        cached_version = Limit-Text $Version
+                        path = Limit-Text $VersionDirectory.FullName
+                        active = $(if ($ManagerUnverified) { $null } else { $false })
+                        install_state = $(if ($ManagerUnverified) { "manager-unverified" } else { "cache-only" })
+                        inventory_source = "cache"
+                        inferred_cached_at = $VersionDirectory.CreationTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                        inferred_cached_at_evidence = "filesystem_creation_time"
+                        inferred_cached_at_confidence = "low"
+                    } -Evidence @(@{ source = "filesystem"; method = "cache-directory-observation+creation-time-inference" })
+                }
+            }
         }
     }
 }
@@ -753,8 +1089,15 @@ if (Test-Section "projects") {
             if (Test-Path -LiteralPath $Path -PathType Container) {
                 try {
                     if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) { throw "git is not installed" }
-                    $Head = (& git -C $Path rev-parse HEAD 2>$null | Select-Object -First 1)
-                    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Head)) { throw "not a Git checkout" }
+                    $HeadLines = @(& git -C $Path rev-parse HEAD 2>$null)
+                    $GitSucceeded = $?
+                    $GitExitCode = $LASTEXITCODE
+                    $Head = ($HeadLines | Select-Object -First 1)
+                    if (-not $GitSucceeded -or
+                        ($null -ne $GitExitCode -and $GitExitCode -ne 0) -or
+                        [string]::IsNullOrWhiteSpace($Head)) {
+                        throw "not a Git checkout"
+                    }
                     $Tree = (& git -C $Path rev-parse "HEAD^{tree}" 2>$null | Select-Object -First 1)
                     $Branch = (& git -C $Path symbolic-ref --short -q HEAD 2>$null | Select-Object -First 1)
                     if ([string]::IsNullOrWhiteSpace($Branch)) { $Branch = "detached" }
@@ -766,7 +1109,7 @@ if (Test-Section "projects") {
                     $Upstream = (& git -C $Path rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>$null | Select-Object -First 1)
                     $Ahead = 0
                     $Behind = 0
-                    $SyncState = "no-upstream"
+                    $SyncState = "local-no-upstream"
                     if (-not [string]::IsNullOrWhiteSpace($Upstream)) {
                         $Counts = ((& git -C $Path rev-list --left-right --count ("HEAD..." + $Upstream) 2>$null | Select-Object -First 1) -split '\s+')
                         if ($Counts.Count -ge 2) {
@@ -774,16 +1117,16 @@ if (Test-Section "projects") {
                             $Behind = [int]$Counts[1]
                         }
                         $SyncState = if ($Ahead -gt 0 -and $Behind -gt 0) {
-                            "diverged"
+                            "local-tracking-diverged"
                         } elseif ($Ahead -gt 0) {
-                            "ahead"
+                            "local-tracking-ahead"
                         } elseif ($Behind -gt 0) {
-                            "behind"
+                            "local-tracking-behind"
                         } else {
-                            "up-to-date"
+                            "local-tracking-up-to-date"
                         }
                     }
-                    $Readiness = if ($SyncState -eq "diverged") {
+                    $Readiness = if ($SyncState -eq "local-tracking-diverged") {
                         "diverged"
                     } elseif ($Branch -eq "detached") {
                         "detached"
@@ -808,6 +1151,7 @@ if (Test-Section "projects") {
                         ahead = $Ahead
                         behind = $Behind
                         sync_state = $SyncState
+                        tracking_freshness = "unknown"
                         dirty_count = $Dirty
                         repository_readiness = $Readiness
                         codex_required = $CodexRequired
@@ -928,8 +1272,15 @@ if (Test-Section "chezmoi") {
     }
     if (Test-Path -LiteralPath $SourcePath -PathType Container) {
         try {
-            $Head = (& git -C $SourcePath rev-parse HEAD 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -ne 0) { throw "chezmoi source is not a Git repository" }
+            $HeadLines = @(& git -C $SourcePath rev-parse HEAD 2>$null)
+            $GitSucceeded = $?
+            $GitExitCode = $LASTEXITCODE
+            $Head = ($HeadLines | Select-Object -First 1)
+            if (-not $GitSucceeded -or
+                ($null -ne $GitExitCode -and $GitExitCode -ne 0) -or
+                [string]::IsNullOrWhiteSpace($Head)) {
+                throw "chezmoi source is not a Git repository"
+            }
             $Dirty = @(& git -C $SourcePath status --porcelain 2>$null).Count
             Add-Record -Kind "file" -Id "chezmoi:source" -Status $(if ($Dirty -eq 0) { "present" } else { "partial" }) -Confidence "medium" -Data @{
                 role = "chezmoi-source"
@@ -952,12 +1303,18 @@ if (Test-Section "chezmoi") {
     } else {
         $StatusFile = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-chezmoi-" + [Guid]::NewGuid().ToString("N"))
         try {
-            & chezmoi status 2>$null | Set-Content -LiteralPath $StatusFile -Encoding utf8NoBOM
-            if ($LASTEXITCODE -ne 0) { throw "chezmoi status exited $LASTEXITCODE" }
+            $StatusOutput = @(& chezmoi status 2>$null)
+            $ChezmoiSucceeded = $?
+            $ChezmoiExitCode = $LASTEXITCODE
+            if (-not $ChezmoiSucceeded -or ($null -ne $ChezmoiExitCode -and $ChezmoiExitCode -ne 0)) {
+                throw "chezmoi status failed"
+            }
+            $StatusText = if ($StatusOutput.Count -gt 0) { ($StatusOutput -join "`n") + "`n" } else { "" }
+            [IO.File]::WriteAllText($StatusFile, $StatusText, [Text.UTF8Encoding]::new($false))
             $StatusLines = @(Get-Content -LiteralPath $StatusFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             $Codes = @($StatusLines | Group-Object { if ($_.Length -ge 2) { $_.Substring(0, 2) } else { $_ } } |
                 Sort-Object Name | ForEach-Object { @{ code = Limit-Text $_.Name; count = $_.Count } })
-            Add-Record -Kind "chezmoi_state" -Id "live" -Status $(if ($StatusLines.Count -eq 0) { "present" } else { "partial" }) -Confidence "high" -Data @{
+            Add-Record -Kind "chezmoi_state" -Id "live" -Status "present" -Confidence "high" -Data @{
                 source_path = Limit-Text $SourcePath
                 drift_count = $StatusLines.Count
                 status_codes = $Codes

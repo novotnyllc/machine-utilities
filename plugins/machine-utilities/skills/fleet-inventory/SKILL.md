@@ -14,8 +14,12 @@ snapshot when another agent will consume it.
 
 For `local` and `ssh` targets, run `collect --target HOST --section SECTION`.
 Exit 2 means a usable partial snapshot; show its errors instead of discarding
-valid records. Use `validate`, `render`, and `compare` rather than parsing the
-records ad hoc.
+valid records. SSH collection uses the exact installed executor and returns
+`executor_update_required` when its version or hashes are stale; inventory
+does not update the plugin implicitly. Its connection and keepalive waits are
+bounded; mutating skills additionally require the target's configured native
+hostname/user to match. Use `validate`, `render`, and `compare` rather than
+parsing the records ad hoc.
 
 Inventory is private but not cosmetically redacted: show operational values the
 owner requested. Never include credential contents, tokens, environment values,
