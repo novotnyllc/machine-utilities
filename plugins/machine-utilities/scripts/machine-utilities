@@ -1207,8 +1207,8 @@ verify_preconditions_command() {
   planning_snapshot_id=$(jq -r '.planning_snapshot_id' "$plan")
   jq -e -s --arg planning_snapshot_id "$planning_snapshot_id" '
     any(.[]; .kind == "snapshot" and .snapshot_id != $planning_snapshot_id and
-      (.observed_at | fromdateiso8601) as $observed |
-      (now - $observed) >= 0 and (now - $observed) <= 900)
+      ((.observed_at | fromdateiso8601) as $observed |
+        (now - $observed) >= 0 and (now - $observed) <= 900))
   ' "$snapshot" >/dev/null || {
     printf 'machine-utilities: apply requires a distinct inventory captured within the last 15 minutes\n' >&2
     exit 65
