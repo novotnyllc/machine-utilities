@@ -209,14 +209,30 @@ cat >"$tmp/bin/apt" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = list ] && [ "${2:-}" = --upgradable ] || exit 64
 [ "${APT_LIST_FAIL:-0}" != 1 ] || exit 1
-printf '%s\n' 'Listing...' 'example/stable 2.0.0 amd64 [upgradable from: 1.0.0]'
+printf '%s\n' \
+  'Listing...' \
+  'example/stable 2.0.0 amd64 [upgradable from: 1.0.0]' \
+  'native-qualified/stable 2.0.0 amd64 [upgradable from: 1.0.0]' \
+  'foreign-unqualified/stable 9.0.0 amd64 [upgradable from: 1.0.0]' \
+  'foreign-explicit:i386/stable 3.0.0 i386 [upgradable from: 1.0.0]'
 SH
 chmod +x "$tmp/bin/apt"
+
+cat >"$tmp/bin/dpkg" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --print-architecture ] || exit 64
+printf '%s\n' amd64
+SH
+chmod +x "$tmp/bin/dpkg"
 
 cat >"$tmp/bin/dpkg-query" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = -W ] || exit 64
-printf 'example\t1.0.0\n'
+printf '%s\n' \
+  'example	1.0.0' \
+  'native-qualified:amd64	1.0.0' \
+  'foreign-unqualified:i386	1.0.0' \
+  'foreign-explicit:i386	1.0.0'
 SH
 chmod +x "$tmp/bin/dpkg-query"
 
@@ -479,6 +495,8 @@ if [ "$#" -eq 4 ] && [ "$1" = clone ] && [ "$2" = -- ] &&
     "$REAL_GIT" -C "$4" remote set-url origin "$3"
   exit
 fi
+[ "$#" -ne 4 ] || [ "$1" != -C ] || [ "$3" != pull ] || [ "$4" != --ff-only ] ||
+  [ -z "${GIT_PULL_MARKER:-}" ] || : >"$GIT_PULL_MARKER"
 exec "$REAL_GIT" "$@"
 SH
 chmod +x "$tmp/bin/git"
@@ -500,6 +518,7 @@ export SCP_COMMAND_LOG="$tmp/scp-commands"
 export SSH_REMOTE_DIR_LOG="$tmp/ssh-remote-dir"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
+export GIT_PULL_MARKER="$tmp/git-pull-executed"
 mkdir -p "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.0"
 cp -R "$script_dir/../." "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.0/"
 chmod -R go-w "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.0"
@@ -760,6 +779,18 @@ brew_cask_failed_rc=$?
 set -e
 [ "$brew_cask_failed_rc" -eq 2 ] || fail "failed brew cask query did not produce partial inventory"
 assert_contains "$(cat "$tmp/brew-cask-failed.jsonl")" '"id":"packages:homebrew-cask"'
+
+"$cli" collect --target test-apt --section packages --output "$tmp/apt.jsonl"
+"$cli" validate "$tmp/apt.jsonl"
+[ "$(jq -r 'select(.id == "apt:native-qualified:amd64") | .data.candidate_version' \
+  "$tmp/apt.jsonl")" = 2.0.0 ] ||
+  fail "unqualified APT candidate did not join its native architecture-qualified package"
+[ "$(jq -r 'select(.id == "apt:foreign-unqualified:i386") | .data.candidate_version' \
+  "$tmp/apt.jsonl")" = null ] ||
+  fail "unqualified APT candidate was conflated with a foreign architecture package"
+[ "$(jq -r 'select(.id == "apt:foreign-explicit:i386") | .data.candidate_version' \
+  "$tmp/apt.jsonl")" = 3.0.0 ] ||
+  fail "explicit foreign-architecture APT candidate did not join its installed package"
 
 set +e
 APT_LIST_FAIL=1 "$cli" collect --target test-apt --section packages \
@@ -1411,6 +1442,47 @@ rm "$tmp/home/dev/nested"
   fail "GitHub shorthand project source was not expanded and cloned"
 [ -d "$tmp/home/dev/nested/clone-example/.git" ] ||
   fail "project clone did not create its missing nested parent"
+
+cat >"$tmp/project-update-plan-draft.json" <<JSON
+{
+  "domain": "projects",
+  "target": "test-host",
+  "operations": [
+    {
+      "type": "project-update",
+      "kind": "project",
+      "id": "clone-example",
+      "argv": ["git", "-C", "$tmp/home/dev/nested/clone-example", "pull", "--ff-only"]
+    }
+  ]
+}
+JSON
+"$cli" collect --target test-host --section projects \
+  --output "$tmp/project-update-snapshot.jsonl"
+"$cli" seal-plan "$tmp/project-update-plan-draft.json" \
+  "$tmp/project-update-snapshot.jsonl" "$tmp/project-update-plan.json"
+project_update_plan_id=$(jq -r '.plan_id' "$tmp/project-update-plan.json")
+mv "$tmp/home/dev/nested" "$tmp/home/dev/nested-real"
+ln -s "$tmp/home/dev/nested-real" "$tmp/home/dev/nested"
+rm -f "$GIT_PULL_MARKER"
+if "$cli" apply-plan "$tmp/project-update-plan.json" "$project_update_plan_id" \
+  "$tmp/symlink-project-update-result.jsonl" >/dev/null 2>&1; then
+  fail "project update followed a symlinked parent below dev_root"
+fi
+[ ! -e "$GIT_PULL_MARKER" ] ||
+  fail "symlinked project update reached Git"
+rm "$tmp/home/dev/nested"
+mv "$tmp/home/dev/nested-real" "$tmp/home/dev/nested"
+mv "$tmp/home/dev/nested/clone-example" "$tmp/home/dev/clone-example-real"
+ln -s "$tmp/home/dev/clone-example-real" "$tmp/home/dev/nested/clone-example"
+if "$cli" apply-plan "$tmp/project-update-plan.json" "$project_update_plan_id" \
+  "$tmp/symlink-checkout-update-result.jsonl" >/dev/null 2>&1; then
+  fail "project update followed a symlinked checkout"
+fi
+[ ! -e "$GIT_PULL_MARKER" ] ||
+  fail "symlinked checkout update reached Git"
+rm "$tmp/home/dev/nested/clone-example"
+mv "$tmp/home/dev/clone-example-real" "$tmp/home/dev/nested/clone-example"
 
 "$cli" record-codex-readiness "$tmp/project-applied.jsonl" "$tmp/codex-readiness.json" \
   "$tmp/project-enriched.jsonl"

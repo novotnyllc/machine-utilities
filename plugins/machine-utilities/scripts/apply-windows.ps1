@@ -25,13 +25,6 @@ $PluginRoot = Split-Path -Parent $PSScriptRoot
 $CollectScript = Join-Path $PSScriptRoot "collect-windows.ps1"
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw "Windows apply requires PowerShell 7 or newer" }
 
-trap {
-    if ($env:MACHINE_UTILITIES_SELFTEST_TRACE -eq "1") {
-        [Console]::Error.WriteLine("machine-utilities self-test stack: $($_.ScriptStackTrace)")
-    }
-    throw $_
-}
-
 function Assert-RegularFile([string]$Path, [string]$Label, [long]$MaximumBytes = 10485760) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Label is not a regular file" }
     $Item = Get-Item -LiteralPath $Path -Force
@@ -62,6 +55,12 @@ function ConvertTo-CanonicalJson([object]$Value) {
     if ($null -eq $Value) { return "null" }
     if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
     if ($Value -is [string]) { return ($Value | ConvertTo-Json -Compress) }
+    if ($Value -is [DateTime]) {
+        return ($Value.ToUniversalTime().ToString(
+            "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture
+        ) | ConvertTo-Json -Compress)
+    }
     if ($Value -is [byte] -or $Value -is [sbyte] -or
         $Value -is [int16] -or $Value -is [uint16] -or
         $Value -is [int32] -or $Value -is [uint32] -or
@@ -813,6 +812,14 @@ if ($SelfTest) {
         if (-not (Test-BoundedStrings ([DateTime]::UtcNow))) {
             throw "JSON scalar self-test failed"
         }
+        $CanonicalTimestamp = ConvertTo-CanonicalJson ([DateTime]::Parse(
+            "2026-01-02T03:04:05Z",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal
+        ))
+        if ($CanonicalTimestamp -ne '"2026-01-02T03:04:05Z"') {
+            throw "Canonical timestamp self-test failed"
+        }
 
         $Operation = [pscustomobject]@{
             type = "package-upgrade"
@@ -1108,10 +1115,8 @@ if ($SelfTest) {
             )
             $FixturePlanFileDigest = Get-FileSha256 $FixturePlanPath
             $PriorNativePreference = $PSNativeCommandUseErrorActionPreference
-            $PriorSelfTestTrace = $env:MACHINE_UTILITIES_SELFTEST_TRACE
             try {
                 $PSNativeCommandUseErrorActionPreference = $false
-                $env:MACHINE_UTILITIES_SELFTEST_TRACE = "1"
                 $FixtureApplyOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File $PSCommandPath `
                     -ConfigPath $FixtureConfigPath `
                     -PlanPath $FixturePlanPath `
@@ -1124,7 +1129,6 @@ if ($SelfTest) {
                 $FixtureApplyExitCode = $LASTEXITCODE
             } finally {
                 $PSNativeCommandUseErrorActionPreference = $PriorNativePreference
-                $env:MACHINE_UTILITIES_SELFTEST_TRACE = $PriorSelfTestTrace
             }
             if ($FixtureApplyExitCode -ne 70 -or
                 -not (Test-Path -LiteralPath $FixtureApplyResultPath -PathType Leaf)) {

@@ -10,11 +10,11 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "e17a8e187aebd5927f88ec80cc6fdfe8e2e2a9dfde8af3c7f3e709fb165d81d9"
+      "sha256": "c2c81bbfc7764c4dc75f905c07afe8d7edd529066dec29b7efa0176f2596f6c0"
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "3a20a3e7bf44873ada22f05f6005e595cab024c85712ca40572928a78faa2cf1"
+      "sha256": "360d8f51632615f6f10d88936b489f3e2e605da176d5a563bc37fb21e17a0866"
     },
     {
       "path": "scripts/collect-windows.ps1",
@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "275ecfb241288b2604f355ac8cb287d5fbab2759f7238f6dc528f85ac418f3ff"
+      "sha256": "78758a59ee9b10f8231754d4e471b587ae1aeb02e45e1b09827ad0183729830e"
     }
   ],
   "marketplace": "novotnyllc",

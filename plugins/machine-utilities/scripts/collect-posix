@@ -71,9 +71,18 @@ emit_package_lines() {
 join_package_candidates() {
   installed=$1
   candidates=$2
-  awk -F '\t' '
+  native_arch=${3:-}
+  awk -F '\t' -v native_arch="$native_arch" '
     FILENAME == ARGV[1] { candidate[$1] = $2; next }
-    NF >= 2 { print $1 "\t" $2 "\t" candidate[$1] }
+    NF >= 2 {
+      name = $1
+      version = candidate[name]
+      if (version == "" && native_arch != "" && name ~ (":" native_arch "$")) {
+        sub(":" native_arch "$", "", name)
+        version = candidate[name]
+      }
+      print $1 "\t" $2 "\t" version
+    }
   ' "$candidates" "$installed"
 }
 
@@ -355,7 +364,11 @@ if has_section packages; then
           fi
           if apt_packages=$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null); then
             printf '%s\n' "$apt_packages" >"$installed_apt"
-            join_package_candidates "$installed_apt" "$candidate_apt" |
+            native_apt_arch=
+            if command -v dpkg >/dev/null 2>&1; then
+              native_apt_arch=$(dpkg --print-architecture 2>/dev/null) || native_apt_arch=
+            fi
+            join_package_candidates "$installed_apt" "$candidate_apt" "$native_apt_arch" |
               emit_package_lines apt dpkg-query+apt-upgradable
           else
             emit error packages:apt unavailable high '{}' '[]' \

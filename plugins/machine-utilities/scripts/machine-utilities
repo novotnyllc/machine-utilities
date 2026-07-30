@@ -1250,6 +1250,7 @@ expand_user_path() {
 ensure_project_parent() {
   dev_root=$1
   project_relative=$2
+  create_missing=${3:-true}
   [ -d "$dev_root" ] && [ ! -L "$dev_root" ] || {
     printf 'machine-utilities: project dev root must be a non-symlink directory\n' >&2
     return 64
@@ -1271,6 +1272,10 @@ ensure_project_parent() {
         return 64
       }
     else
+      [ "$create_missing" = true ] || {
+        printf 'machine-utilities: project parent does not exist: %s\n' "$current" >&2
+        return 64
+      }
       mkdir -- "$current" || return
     fi
   done
@@ -1558,6 +1563,11 @@ EOF
           [ "$3" = "$project_path" ] && [ "$4" = pull ] &&
           [ "$5" = --ff-only ]; } || {
           printf 'machine-utilities: project update argv does not match configured path\n' >&2
+          return 64
+        }
+        ensure_project_parent "$dev_root" "$project_relative" false || return
+        [ -d "$project_path" ] && [ ! -L "$project_path" ] || {
+          printf 'machine-utilities: project checkout must be a non-symlink directory\n' >&2
           return 64
         }
       fi
