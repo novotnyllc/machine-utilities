@@ -999,7 +999,6 @@ if ($SelfTest) {
 
             $FixtureDevRoot = Join-Path $SelfTestRoot "apply-dev"
             $OriginUri = [Uri]::new((Resolve-Path -LiteralPath $OriginPath).Path).AbsoluteUri
-            $MissingUri = [Uri]::new([IO.Path]::GetFullPath((Join-Path $SelfTestRoot "missing.git"))).AbsoluteUri
             $FixtureConfig.machines.$FixtureHostId.dev_root = $FixtureDevRoot
             $FixtureConfig.projects = [ordered]@{
                 good = [ordered]@{
@@ -1009,12 +1008,14 @@ if ($SelfTest) {
                     codex = $false
                 }
                 bad = [ordered]@{
-                    path = "nested/team/bad"
-                    source = $MissingUri
+                    path = "blocked/bad"
+                    source = $OriginUri
                     groups = @()
                     codex = $false
                 }
             }
+            [void][IO.Directory]::CreateDirectory($FixtureDevRoot)
+            [IO.File]::WriteAllText((Join-Path $FixtureDevRoot "blocked"), "not-a-directory", $OutputEncoding)
             [IO.File]::WriteAllText(
                 $FixtureConfigPath,
                 ($FixtureConfig | ConvertTo-Json -Depth 20),
@@ -1098,7 +1099,7 @@ if ($SelfTest) {
             $PriorNativePreference = $PSNativeCommandUseErrorActionPreference
             try {
                 $PSNativeCommandUseErrorActionPreference = $false
-                & pwsh -NoLogo -NoProfile -NonInteractive -File $PSCommandPath `
+                $FixtureApplyOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File $PSCommandPath `
                     -ConfigPath $FixtureConfigPath `
                     -PlanPath $FixturePlanPath `
                     -ExpectedPlanFileSha256 $FixturePlanFileDigest `
@@ -1106,14 +1107,17 @@ if ($SelfTest) {
                     -PlanId $FixturePlanId `
                     -HostId $FixtureHostId `
                     -ControllerConfigDigest $FixtureControllerDigest `
-                    -ResultPath $FixtureApplyResultPath *> $null
+                    -ResultPath $FixtureApplyResultPath 2>&1)
                 $FixtureApplyExitCode = $LASTEXITCODE
             } finally {
                 $PSNativeCommandUseErrorActionPreference = $PriorNativePreference
             }
             if ($FixtureApplyExitCode -ne 70 -or
                 -not (Test-Path -LiteralPath $FixtureApplyResultPath -PathType Leaf)) {
-                throw "Normal partial-apply boundary self-test failed"
+                $FixtureApplyDiagnostic = (@($FixtureApplyOutput | Select-Object -Last 8) -join " | ")
+                throw "Normal partial-apply boundary self-test failed: exit=$FixtureApplyExitCode result=$(
+                    Test-Path -LiteralPath $FixtureApplyResultPath -PathType Leaf
+                ) output=$FixtureApplyDiagnostic"
             }
             $FixtureApplyRecords = @(Get-Content -LiteralPath $FixtureApplyResultPath |
                 ForEach-Object { $_ | ConvertFrom-Json })

@@ -5,6 +5,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cli="$script_dir/machine-utilities"
 pwsh_command=$(command -v pwsh 2>/dev/null || true)
 real_git=$(command -v git)
+real_stat=$(command -v stat)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/home/dev/example" "$tmp/bin"
@@ -492,6 +493,30 @@ printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 [ "$(jq -r '.verified' "$tmp/executor.json")" = true ] ||
   fail "executor status was not verified"
 "$cli" verify-executor "$tmp/executor.json" >/dev/null
+mkdir -p "$tmp/gnu-stat-bin"
+cat >"$tmp/gnu-stat-bin/stat" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -f ] && [ "${2:-}" = %Su ]; then
+  printf '  File: fake GNU stat filesystem report\n'
+  exit 1
+fi
+if [ "${1:-}" = -c ] && [ "${2:-}" = %U ]; then
+  id -un
+  exit
+fi
+if [ "${1:-}" = -f ] && [ "${2:-}" = %Lp ]; then
+  if "$REAL_STAT" -f %Lp "$3" >/dev/null 2>&1; then
+    exec "$REAL_STAT" -f %Lp "$3"
+  fi
+  exec "$REAL_STAT" -c %a "$3"
+fi
+exec "$REAL_STAT" "$@"
+SH
+chmod +x "$tmp/gnu-stat-bin/stat"
+REAL_STAT="$real_stat" PATH="$tmp/gnu-stat-bin:$PATH" \
+  "$cli" executor-status "$tmp/gnu-stat-executor.json"
+[ "$(jq -r '.verified' "$tmp/gnu-stat-executor.json")" = true ] ||
+  fail "executor status captured failed GNU stat output as the file owner"
 jq '.files[0].sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
   "$tmp/executor.json" >"$tmp/stale-executor.json"
 if "$cli" verify-executor "$tmp/stale-executor.json" >/dev/null 2>&1; then
@@ -502,6 +527,13 @@ fi
   fail "bounded worker config did not retain its target"
 [ "$(jq '.machines | length' "$tmp/ssh-worker-config.json")" -eq 1 ] ||
   fail "bounded worker config leaked unrelated machines"
+"$cli" worker-config test-windows updates "$tmp/windows-updates-worker-config.json"
+[ "$(jq -r '.machines["test-windows"].codex_control_project' \
+  "$tmp/windows-updates-worker-config.json")" = example ] ||
+  fail "Windows worker config did not retain its Codex control project"
+[ "$(jq -r '.projects | keys == ["example"]' \
+  "$tmp/windows-updates-worker-config.json")" = true ] ||
+  fail "Windows worker config did not retain only its required control project"
 jq '.capabilities."example-research".requires_auth = ["missing-auth"]' \
   "$tmp/config.json" >"$tmp/invalid-capability-reference.json"
 if MACHINE_UTILITIES_CONFIG="$tmp/invalid-capability-reference.json" \
@@ -1318,6 +1350,15 @@ if "$cli" apply-plan "$tmp/unsafe-project-plan.json" "$unsafe_project_plan_id" \
 fi
 [ ! -e "$tmp/home/dev/outside-clone" ] ||
   fail "unsafe project argv reached Git"
+mkdir -p "$tmp/home/dev/symlink-escape"
+ln -s "$tmp/home/dev/symlink-escape" "$tmp/home/dev/nested"
+if "$cli" apply-plan "$tmp/project-plan.json" "$project_plan_id" \
+  "$tmp/symlink-project-result.jsonl" >/dev/null 2>&1; then
+  fail "project clone followed a symlinked parent below dev_root"
+fi
+[ ! -e "$tmp/home/dev/symlink-escape/clone-example" ] ||
+  fail "project clone wrote through a symlinked parent"
+rm "$tmp/home/dev/nested"
 "$cli" apply-plan "$tmp/project-plan.json" \
   "$project_plan_id" "$tmp/project-applied.jsonl"
 [ "$(jq -r 'select(.kind == "project" and .id == "clone-example") | .data.repository_readiness' \

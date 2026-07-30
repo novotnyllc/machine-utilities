@@ -10,7 +10,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "3e713584aa1ecf6893dcdbf1c722daffcd90dcbfde1ddae786388f2f4dabe0ae"
+      "sha256": "6c55a600b73ef07b6f595014377f49e029955ee3bf924402a958b9fc1ab143cb"
     },
     {
       "path": "scripts/collect-posix",
@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "6de04e617827f376288ad71aed69b40c03625ba03203b65b0c81008e5208246d"
+      "sha256": "18d2708a61102283504ac7b79e40d093c4cb2b8ec0500a4b721dcc148edb7e14"
     }
   ],
   "marketplace": "novotnyllc",

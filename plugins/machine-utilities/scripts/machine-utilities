@@ -207,7 +207,10 @@ file_mode() {
 }
 
 file_owner() {
-  stat -f %Su "$1" 2>/dev/null || stat -c %U "$1" 2>/dev/null || printf unknown
+  owner=$(stat -f %Su "$1" 2>/dev/null) ||
+    owner=$(stat -c %U "$1" 2>/dev/null) ||
+    owner=unknown
+  printf '%s\n' "$owner"
 }
 
 check_safe_owned_path() (
@@ -455,7 +458,14 @@ worker_config_command() (
       version,
       worker:{target:$target,controller_configuration_digest:$controller_digest},
       machines:{($target):.machines[$target]},
-      projects:(if ($domain == "projects" or $domain == "inventory") then (.projects // {}) else {} end),
+      projects:(
+        if ($domain == "projects" or $domain == "inventory") then
+          (.projects // {})
+        elif (.machines[$target].codex_control_project // null) != null then
+          .machines[$target].codex_control_project as $control |
+          {($control):.projects[$control]}
+        else {} end
+      ),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),
       agent_artifacts:(if ($domain == "agents" or $domain == "inventory") then (.agent_artifacts // []) else [] end),
@@ -1234,6 +1244,35 @@ expand_user_path() {
   esac
 }
 
+ensure_project_parent() {
+  dev_root=$1
+  project_relative=$2
+  [ -d "$dev_root" ] && [ ! -L "$dev_root" ] || {
+    printf 'machine-utilities: project dev root must be a non-symlink directory\n' >&2
+    return 64
+  }
+  parent_relative=$(dirname -- "$project_relative")
+  [ "$parent_relative" != . ] || return 0
+  current=$dev_root
+  IFS=/ read -r -a components <<<"$parent_relative"
+  for component in "${components[@]}"; do
+    [ -n "$component" ] && [ "$component" != . ] || continue
+    current=${current%/}/$component
+    [ ! -L "$current" ] || {
+      printf 'machine-utilities: refusing symlinked project parent: %s\n' "$current" >&2
+      return 64
+    }
+    if [ -e "$current" ]; then
+      [ -d "$current" ] || {
+        printf 'machine-utilities: project parent is not a directory: %s\n' "$current" >&2
+        return 64
+      }
+    else
+      mkdir -- "$current" || return
+    fi
+  done
+}
+
 install_auth_artifact() (
   operation=$1
   config=$2
@@ -1510,7 +1549,7 @@ EOF
           printf 'machine-utilities: project clone argv does not match configured source/path\n' >&2
           return 64
         }
-        mkdir -p "$(dirname "$project_path")"
+        ensure_project_parent "$dev_root" "$project_relative" || return
       else
         { [ $# -eq 5 ] && [ "$1" = git ] && [ "$2" = -C ] &&
           [ "$3" = "$project_path" ] && [ "$4" = pull ] &&
