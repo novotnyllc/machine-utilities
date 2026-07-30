@@ -1030,9 +1030,15 @@ seal_plan_command() {
         any($records[]; .kind == $operation.kind and .id == $operation.id and
           .status == "present" and .data.candidate_version == $operation.candidate_version and
           .data.update_available == true)
+      elif .type == "project-update" then
+        . as $operation |
+        any($records[]; .kind == $operation.kind and .id == $operation.id and
+          .status == "present" and .data.origin_matches == true and
+          .data.repository_readiness == "ready" and .data.dirty_count == 0 and
+          .data.sync_state == "local-tracking-behind")
       else true end)
   ' >/dev/null || {
-    printf 'machine-utilities: package upgrade plan does not match an observed candidate version\n' >&2
+    printf 'machine-utilities: plan does not match an actionable observed state\n' >&2
     exit 65
   }
 
@@ -1697,6 +1703,14 @@ apply_plan_command() {
               .inferred_installed_at_evidence,.inferred_installed_at_confidence)) !=
             ($after.data | del(.installed_at,.updated_at,.inferred_installed_at,
               .inferred_installed_at_evidence,.inferred_installed_at_confidence))))
+      elif .type == "project-update" then
+        . as $operation |
+        any($records[]; . as $after |
+          .kind == $operation.kind and .id == $operation.id and
+          .status == "present" and .data.origin_matches == true and
+          .data.repository_readiness == "ready" and .data.dirty_count == 0 and
+          any($before[]; .kind == $operation.kind and .id == $operation.id and
+            .data.head != $after.data.head))
       else true end)
   ' >/dev/null; then
     printf 'machine-utilities: post-change state did not satisfy the sealed plan\n' >&2

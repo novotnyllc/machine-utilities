@@ -506,8 +506,12 @@ if [ "$#" -eq 4 ] && [ "$1" = clone ] && [ "$2" = -- ] &&
     "$REAL_GIT" -C "$4" remote set-url origin "$3"
   exit
 fi
-[ "$#" -ne 4 ] || [ "$1" != -C ] || [ "$3" != pull ] || [ "$4" != --ff-only ] ||
+if [ "$#" -eq 4 ] && [ "$1" = -C ] && [ "$3" = pull ] && [ "$4" = --ff-only ]; then
   [ -z "${GIT_PULL_MARKER:-}" ] || : >"$GIT_PULL_MARKER"
+  [ "${GIT_PULL_NOOP:-0}" != 1 ] || exit 0
+  branch=$("$REAL_GIT" -C "$2" symbolic-ref --short HEAD)
+  exec "$REAL_GIT" -C "$2" merge --ff-only "refs/remotes/origin/$branch"
+fi
 exec "$REAL_GIT" "$@"
 SH
 chmod +x "$tmp/bin/git"
@@ -1480,6 +1484,15 @@ rm "$tmp/home/dev/nested"
 [ -d "$tmp/home/dev/nested/clone-example/.git" ] ||
   fail "project clone did not create its missing nested parent"
 
+clone_branch=$("$REAL_GIT" -C "$tmp/home/dev/nested/clone-example" symbolic-ref --short HEAD)
+printf 'updated\n' >>"$tmp/home/dev/example/file.txt"
+"$REAL_GIT" -C "$tmp/home/dev/example" add file.txt
+"$REAL_GIT" -C "$tmp/home/dev/example" -c commit.gpgsign=false commit -qm update
+"$REAL_GIT" -C "$tmp/home/dev/example" push -q "$GIT_CLONE_FIXTURE" \
+  "HEAD:refs/heads/$clone_branch"
+"$REAL_GIT" -C "$tmp/home/dev/nested/clone-example" fetch -q "$GIT_CLONE_FIXTURE" \
+  "refs/heads/$clone_branch:refs/remotes/origin/$clone_branch"
+
 cat >"$tmp/project-update-plan-draft.json" <<JSON
 {
   "domain": "projects",
@@ -1520,6 +1533,23 @@ fi
   fail "symlinked checkout update reached Git"
 rm "$tmp/home/dev/nested/clone-example"
 mv "$tmp/home/dev/clone-example-real" "$tmp/home/dev/nested/clone-example"
+
+if GIT_PULL_NOOP=1 "$cli" apply-plan "$tmp/project-update-plan.json" \
+  "$project_update_plan_id" "$tmp/noop-project-update-result.jsonl" >/dev/null 2>&1; then
+  fail "project update accepted an unchanged HEAD"
+fi
+"$cli" apply-plan "$tmp/project-update-plan.json" "$project_update_plan_id" \
+  "$tmp/project-update-result.jsonl"
+[ "$(jq -r --arg plan "$project_update_plan_id" '
+  select(.kind == "operation" and .id == ("apply:" + $plan)) |
+  .data.operation_status' "$tmp/project-update-result.jsonl")" = completed ] ||
+  fail "behind project update was not verified as completed"
+"$cli" collect --target test-host --section projects \
+  --output "$tmp/project-current-snapshot.jsonl"
+if "$cli" seal-plan "$tmp/project-update-plan-draft.json" \
+  "$tmp/project-current-snapshot.jsonl" "$tmp/project-current-plan.json" >/dev/null 2>&1; then
+  fail "up-to-date project checkout was accepted for update"
+fi
 
 "$cli" record-codex-readiness "$tmp/project-applied.jsonl" "$tmp/codex-readiness.json" \
   "$tmp/project-enriched.jsonl"
