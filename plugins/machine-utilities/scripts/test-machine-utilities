@@ -423,6 +423,13 @@ if command -v pwsh >/dev/null 2>&1; then
 
   HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections projects >"$tmp/windows-projects.jsonl"
+  "$cli" validate "$tmp/windows-projects.jsonl"
+  [ "$(jq -r 'select(.kind == "project" and .id == "example") | .data.repository_readiness' "$tmp/windows-projects.jsonl")" = ready ] ||
+    fail "Windows collector did not recognize a readable Git checkout"
+
+  HOME="$tmp/home" pwsh -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections auth -AllowAuthVerify >"$tmp/windows-auth.jsonl"
   "$cli" validate "$tmp/windows-auth.jsonl"
   [ "$(jq -r 'select(.id == "test-auth") | .data.health' "$tmp/windows-auth.jsonl")" = healthy ] ||

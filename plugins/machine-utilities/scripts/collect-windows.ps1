@@ -338,8 +338,13 @@ if (Test-Section "packages") {
         } else {
             $Temp = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-winget-" + [Guid]::NewGuid().ToString("N") + ".json")
             try {
-                & winget export --output $Temp --include-versions --accept-source-agreements --disable-interactivity | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "winget export exited $LASTEXITCODE" }
+                $WingetOutput = @(& winget export --output $Temp --include-versions --accept-source-agreements --disable-interactivity)
+                $WingetSucceeded = $?
+                $WingetExitCode = $LASTEXITCODE
+                $WingetOutput | Out-Null
+                if (-not $WingetSucceeded -or ($null -ne $WingetExitCode -and $WingetExitCode -ne 0)) {
+                    throw "winget export failed"
+                }
                 if (Test-Path -LiteralPath $Temp) {
                     $Export = Get-Content -LiteralPath $Temp -Raw | ConvertFrom-Json
                     foreach ($Source in @($Export.Sources)) {
@@ -412,8 +417,13 @@ if (Test-Section "agents") {
     $Jsm = Get-Command jsm -ErrorAction SilentlyContinue
     if ($null -ne $Jsm) {
         try {
-            $JsmOutput = (& jsm --json --offline list 2>$null | Out-String)
-            if ($LASTEXITCODE -ne 0) { throw "jsm list exited $LASTEXITCODE" }
+            $JsmLines = @(& jsm --json --offline list 2>$null)
+            $JsmSucceeded = $?
+            $JsmExitCode = $LASTEXITCODE
+            if (-not $JsmSucceeded -or ($null -ne $JsmExitCode -and $JsmExitCode -ne 0)) {
+                throw "jsm list failed"
+            }
+            $JsmOutput = ($JsmLines | Out-String)
             $JsmInventory = $JsmOutput | ConvertFrom-Json
             if ($null -eq $JsmInventory.skills -or $JsmInventory.skills -isnot [Array]) {
                 throw "jsm skills payload is not an array"
@@ -753,8 +763,15 @@ if (Test-Section "projects") {
             if (Test-Path -LiteralPath $Path -PathType Container) {
                 try {
                     if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) { throw "git is not installed" }
-                    $Head = (& git -C $Path rev-parse HEAD 2>$null | Select-Object -First 1)
-                    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Head)) { throw "not a Git checkout" }
+                    $HeadLines = @(& git -C $Path rev-parse HEAD 2>$null)
+                    $GitSucceeded = $?
+                    $GitExitCode = $LASTEXITCODE
+                    $Head = ($HeadLines | Select-Object -First 1)
+                    if (-not $GitSucceeded -or
+                        ($null -ne $GitExitCode -and $GitExitCode -ne 0) -or
+                        [string]::IsNullOrWhiteSpace($Head)) {
+                        throw "not a Git checkout"
+                    }
                     $Tree = (& git -C $Path rev-parse "HEAD^{tree}" 2>$null | Select-Object -First 1)
                     $Branch = (& git -C $Path symbolic-ref --short -q HEAD 2>$null | Select-Object -First 1)
                     if ([string]::IsNullOrWhiteSpace($Branch)) { $Branch = "detached" }
@@ -928,8 +945,15 @@ if (Test-Section "chezmoi") {
     }
     if (Test-Path -LiteralPath $SourcePath -PathType Container) {
         try {
-            $Head = (& git -C $SourcePath rev-parse HEAD 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -ne 0) { throw "chezmoi source is not a Git repository" }
+            $HeadLines = @(& git -C $SourcePath rev-parse HEAD 2>$null)
+            $GitSucceeded = $?
+            $GitExitCode = $LASTEXITCODE
+            $Head = ($HeadLines | Select-Object -First 1)
+            if (-not $GitSucceeded -or
+                ($null -ne $GitExitCode -and $GitExitCode -ne 0) -or
+                [string]::IsNullOrWhiteSpace($Head)) {
+                throw "chezmoi source is not a Git repository"
+            }
             $Dirty = @(& git -C $SourcePath status --porcelain 2>$null).Count
             Add-Record -Kind "file" -Id "chezmoi:source" -Status $(if ($Dirty -eq 0) { "present" } else { "partial" }) -Confidence "medium" -Data @{
                 role = "chezmoi-source"
@@ -952,8 +976,13 @@ if (Test-Section "chezmoi") {
     } else {
         $StatusFile = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-chezmoi-" + [Guid]::NewGuid().ToString("N"))
         try {
-            & chezmoi status 2>$null | Set-Content -LiteralPath $StatusFile -Encoding utf8NoBOM
-            if ($LASTEXITCODE -ne 0) { throw "chezmoi status exited $LASTEXITCODE" }
+            $StatusOutput = @(& chezmoi status 2>$null)
+            $ChezmoiSucceeded = $?
+            $ChezmoiExitCode = $LASTEXITCODE
+            if (-not $ChezmoiSucceeded -or ($null -ne $ChezmoiExitCode -and $ChezmoiExitCode -ne 0)) {
+                throw "chezmoi status failed"
+            }
+            $StatusOutput | Set-Content -LiteralPath $StatusFile -Encoding utf8NoBOM
             $StatusLines = @(Get-Content -LiteralPath $StatusFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             $Codes = @($StatusLines | Group-Object { if ($_.Length -ge 2) { $_.Substring(0, 2) } else { $_ } } |
                 Sort-Object Name | ForEach-Object { @{ code = Limit-Text $_.Name; count = $_.Count } })
