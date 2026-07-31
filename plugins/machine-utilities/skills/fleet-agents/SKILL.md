@@ -42,7 +42,10 @@ conversion are unsupported and fail before plan sealing.
 
 Use local/SSH execution where configured. SSH uses bounded connection and
 keepalive timeouts and must match the configured native hostname/user before
-mutation. For Windows Codex tasks read and follow
+mutation. Run every SSH operation through the target user's configured login
+shell (`$SHELL -lc`) so user-level paths such as `$HOME/.local/bin` are
+available. Never use raw non-login SSH command execution or infer that tooling
+is absent from its restricted `PATH`. For Windows Codex tasks read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
 unsupported rather than using WSL. Re-inventory after changes and report
 unresolved provenance as unknown, not guessed.

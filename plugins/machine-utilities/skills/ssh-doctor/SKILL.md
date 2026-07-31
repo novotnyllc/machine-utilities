@@ -7,7 +7,9 @@ description: Diagnose macOS SSH and Remote Login failures, including pre-auth cl
 
 Resolve the target from the Machine Utilities config and verify its identity
 before changing anything. Do not print secrets, tokens, broad environment
-output, or credential files.
+output, or credential files. Run SSH commands through the target user's
+configured login shell (`$SHELL -lc`) so user-level paths are present; never
+diagnose a tool as missing from a raw non-login SSH `PATH`.
 
 Validate loopback first. Loopback failure points to sshd, launchd, or server
 configuration; loopback success with remote failure points to the network,
@@ -21,7 +23,7 @@ sudo lsof -nP -iTCP:22 -sTCP:LISTEN
 nc -vz 127.0.0.1 22
 ssh -4 -F /dev/null -o RequestTTY=no -o RemoteCommand=none \
   -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
-  USER@127.0.0.1 'hostname; id -un'
+  USER@127.0.0.1 "exec \"\$SHELL\" -lc 'hostname; id -un'"
 ```
 
 Use `BatchMode=yes` when password fallback would hang. Enabling Remote Login

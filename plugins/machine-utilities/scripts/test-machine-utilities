@@ -454,6 +454,14 @@ fi
 SH
 chmod +x "$tmp/bin/ssh"
 
+cat >"$tmp/bin/login-shell" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -lc ] && [ "$#" -eq 2 ] || exit 64
+[ -z "${SSH_LOGIN_SHELL_LOG:-}" ] || printf '%s\n' "$2" >>"$SSH_LOGIN_SHELL_LOG"
+exec sh -c "$2"
+SH
+chmod +x "$tmp/bin/login-shell"
+
 cat >"$tmp/bin/scp" <<'SH'
 #!/usr/bin/env bash
 original=$*
@@ -532,12 +540,14 @@ export CLAUDE_STATE_FILE="$tmp/claude-state"
 export SSH_COMMAND_LOG="$tmp/ssh-commands"
 export SCP_COMMAND_LOG="$tmp/scp-commands"
 export SSH_REMOTE_DIR_LOG="$tmp/ssh-remote-dir"
+export SSH_LOGIN_SHELL_LOG="$tmp/ssh-login-shell"
+export SHELL="$tmp/bin/login-shell"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 export GIT_PULL_MARKER="$tmp/git-pull-executed"
-mkdir -p "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.1"
-cp -R "$script_dir/../." "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.1/"
-chmod -R go-w "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.1"
+mkdir -p "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.2"
+cp -R "$script_dir/../." "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.2/"
+chmod -R go-w "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.2"
 printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 printf '%s\n' 2.0.0 >"$CLAUDE_STATE_FILE"
@@ -545,7 +555,7 @@ printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 
 "$cli" validate-config
 "$cli" executor-status "$tmp/executor.json"
-[ "$(jq -r '.version' "$tmp/executor.json")" = 0.2.1 ] ||
+[ "$(jq -r '.version' "$tmp/executor.json")" = 0.2.2 ] ||
   fail "executor status did not report release version"
 [ "$(jq -r '.verified' "$tmp/executor.json")" = true ] ||
   fail "executor status was not verified"
@@ -782,6 +792,10 @@ mv "$tmp/missing-agent-definition" "$tmp/home/.agents/agents/example.md"
 "$cli" validate "$tmp/ssh.jsonl"
 [ "$(jq -r 'select(.kind == "operation") | .data.transport' "$tmp/ssh.jsonl")" = ssh ] ||
   fail "SSH transport did not complete through the remote collector"
+[ -s "$SSH_LOGIN_SHELL_LOG" ] || fail "SSH transport did not use the configured login shell"
+if grep -vF 'exec "$SHELL" -lc' "$SSH_COMMAND_LOG" >/dev/null; then
+  fail "SSH transport bypassed the configured login shell"
+fi
 
 set +e
 BREW_FAIL=1 "$cli" collect --target test-host --section packages --output "$tmp/brew-failed.jsonl"
@@ -1204,7 +1218,7 @@ fi
 "$cli" seal-plan "$tmp/plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/plan.json"
 [ "$(jq -r '.schema_version' "$tmp/plan.json")" -eq 2 ] ||
   fail "sealed plan did not use executor-bound schema version"
-[ "$(jq -r '.required_executor.version' "$tmp/plan.json")" = 0.2.1 ] ||
+[ "$(jq -r '.required_executor.version' "$tmp/plan.json")" = 0.2.2 ] ||
   fail "sealed plan did not bind the exact executor"
 "$cli" worker-config test-host updates "$tmp/local-worker-config.json"
 [ "$(jq -r '.worker_configuration_digest.value' "$tmp/plan.json")" = \
@@ -1406,6 +1420,7 @@ jq '.target = "test-ssh"' "$tmp/plugin-agent-plan-draft.json" \
 ssh_agent_plan_id=$(jq -r '.plan_id' "$tmp/ssh-agent-plan.json")
 : >"$SSH_COMMAND_LOG"
 : >"$SCP_COMMAND_LOG"
+: >"$SSH_LOGIN_SHELL_LOG"
 rm -f "$SSH_REMOTE_DIR_LOG"
 CLAUDE_MANAGER_STDOUT=1 "$cli" apply-ssh-plan "$tmp/ssh-agent-plan.json" \
   "$ssh_agent_plan_id" "$tmp/ssh-agent-result.jsonl"
@@ -1417,7 +1432,7 @@ CLAUDE_MANAGER_STDOUT=1 "$cli" apply-ssh-plan "$tmp/ssh-agent-plan.json" \
   fail "SSH apply returned no authoritative completed operation"
 [ "$(jq -r --arg plan "$ssh_agent_plan_id" '
   select(.kind == "operation" and .id == ("apply:" + $plan)) |
-  .data.executor.version' "$tmp/ssh-agent-result.jsonl")" = 0.2.1 ] ||
+  .data.executor.version' "$tmp/ssh-agent-result.jsonl")" = 0.2.2 ] ||
   fail "SSH apply did not report the exact sealed executor version"
 [ "$(jq -s 'map(select(.kind == "plugin" and .id == "claude:test-market:claude-example:3.0.0")) | length' \
   "$tmp/ssh-agent-result.jsonl")" -eq 1 ] ||
@@ -1432,6 +1447,10 @@ assert_contains "$(cat "$SCP_COMMAND_LOG")" '/plan.json'
 assert_contains "$(cat "$SSH_COMMAND_LOG")" 'ConnectTimeout=10'
 assert_contains "$(cat "$SSH_COMMAND_LOG")" 'ServerAliveInterval=15'
 assert_contains "$(cat "$SSH_COMMAND_LOG")" 'ServerAliveCountMax=2'
+[ -s "$SSH_LOGIN_SHELL_LOG" ] || fail "SSH apply did not use the configured login shell"
+if grep -vF 'exec "$SHELL" -lc' "$SSH_COMMAND_LOG" >/dev/null; then
+  fail "SSH apply bypassed the configured login shell"
+fi
 ssh_remote_dir=$(cat "$SSH_REMOTE_DIR_LOG")
 case $ssh_remote_dir in
   /tmp/machine-utilities-apply.*) ;;

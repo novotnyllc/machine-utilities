@@ -12,21 +12,24 @@ machine, then its configured `ssh_alias`, SSH config, and Tailscale state.
 Treat inventory as routing hints until `hostname`, `id -un`, `sw_vers`, and
 `pwd` confirm the destination.
 
-Use non-interactive SSH for one-shot checks:
+Use non-interactive SSH for one-shot checks, and always execute the command
+through the target user's configured login shell. This preserves user-level
+paths such as `$HOME/.local/bin`; never infer that tooling is absent from a raw
+non-login SSH `PATH`.
 
 ```bash
 ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
   -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
-  ALIAS 'hostname; id -un; sw_vers'
+  ALIAS "exec \"\$SHELL\" -lc 'hostname; id -un; sw_vers'"
 ```
 
-Override aliases that auto-attach tmux or run a remote command. Use a login
-shell only when checking developer tools that depend on shell initialization:
+Override aliases that auto-attach tmux or run a remote command. Use the same
+configured-login-shell form for developer tools:
 
 ```bash
 ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
   -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 ALIAS \
-  'zsh -lc "command -v brew; command -v pnpm; command -v node"'
+  "exec \"\$SHELL\" -lc 'command -v brew; command -v pnpm; command -v node'"
 ```
 
 If Tailscale is involved, inspect `tailscale status --json` before trying

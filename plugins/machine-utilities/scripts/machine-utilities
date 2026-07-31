@@ -44,8 +44,25 @@ require_jq() {
 }
 
 ssh_run() {
+  host=$1
+  shift
+  [ "$#" -gt 0 ] || {
+    printf 'machine-utilities: SSH command is required\n' >&2
+    return 64
+  }
+  if [ "$#" -eq 1 ]; then
+    remote_command=$1
+  else
+    remote_command=
+    for arg in "$@"; do
+      quoted=$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")
+      remote_command="${remote_command}${remote_command:+ }'$quoted'"
+    done
+  fi
+  quoted_command=$(printf '%s' "$remote_command" | sed "s/'/'\\\\''/g")
   ssh -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none \
-    -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$@"
+    -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+    "$host" "if [ -z \"\${SHELL:-}\" ] || [ ! -x \"\$SHELL\" ]; then printf 'machine-utilities: configured login shell is unavailable\\n' >&2; exit 69; fi; exec \"\$SHELL\" -lc '$quoted_command'"
 }
 
 scp_run() {
