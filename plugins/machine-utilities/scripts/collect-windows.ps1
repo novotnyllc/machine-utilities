@@ -197,10 +197,17 @@ function Test-AgentSettingValue([string]$Key, [object]$Value) {
     return $Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$Value)
 }
 
-function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$ArtifactPath, [switch]$UnknownPath) {
+function Add-AgentSettings(
+    [object]$Definition,
+    [string]$ArtifactId,
+    [string]$ArtifactPath,
+    [switch]$UnknownPath,
+    [switch]$LinkedPath
+) {
     $Format = [string]$Definition.format
     $ArtifactExists = -not $UnknownPath -and (Test-Path -LiteralPath $ArtifactPath)
-    $ArtifactIsFile = -not $UnknownPath -and (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)
+    $ArtifactIsFile = -not $UnknownPath -and -not $LinkedPath -and
+        (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)
     $Parsed = $null
     if ($Format -eq "json" -and $ArtifactIsFile) {
         try { $Parsed = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate } catch { $Parsed = $null }
@@ -213,7 +220,7 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
         $Desired = $Setting.Value
         $Present = $false
         $Observed = $null
-        $ParseFailed = $UnknownPath -or ($ArtifactExists -and -not $ArtifactIsFile)
+        $ParseFailed = $UnknownPath -or $LinkedPath -or ($ArtifactExists -and -not $ArtifactIsFile)
         if ($Format -eq "json") {
             if (-not $ArtifactExists) {
                 # An absent artifact means every configured setting is absent, not unparseable.
@@ -259,6 +266,8 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
             $SettingPath = if ($UnknownPath) { $null } else { Limit-Text $ArtifactPath }
             $Error = if ($UnknownPath) {
                 @{ code = "artifact_path_missing"; severity = "warning"; retryable = $false; message = "agent setting artifact has no path for this host" }
+            } elseif ($LinkedPath) {
+                @{ code = "symlink_not_followed"; severity = "warning"; retryable = $false; message = "agent setting artifact path is a link" }
             } else {
                 @{ code = "setting_parse_failed"; severity = "warning"; retryable = $false; message = "allowlisted agent setting could not be parsed" }
             }
@@ -1070,6 +1079,10 @@ if (Test-Section "agents") {
                         id = $ArtifactId; path = Limit-Text $ArtifactPath; artifact_kind = Limit-Text $Definition.kind
                         agent_exposure = @($Definition.agents)
                     } -Errors @(@{ code = "symlink_not_followed"; severity = "warning"; retryable = $false; message = "agent artifact path is a link" })
+                    if ($null -ne $Definition.settings -and
+                        $Definition.settings.PSObject.Properties.Count -gt 0) {
+                        Add-AgentSettings $Definition $ArtifactId $ArtifactPath -LinkedPath
+                    }
                 } else {
                     $Digest = if ($Item.PSIsContainer) {
                         Get-DirectoryDigest $ArtifactPath

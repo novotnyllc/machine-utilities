@@ -239,8 +239,9 @@ emit_agent_settings() {
   artifact_path_state=${6:-resolved}
   parsed_json=
   parsed_json_valid=true
-  if [ "$artifact_format" = json ] && [ -e "$artifact_path" ]; then
-    if [ -d "$artifact_path" ] ||
+  if [ "$artifact_path_state" = resolved ] && [ "$artifact_format" = json ] &&
+    [ -e "$artifact_path" ]; then
+    if [ -L "$artifact_path" ] || [ ! -f "$artifact_path" ] ||
       ! parsed_json=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected one object") end' \
         "$artifact_path" 2>/dev/null); then
       parsed_json_valid=false
@@ -251,10 +252,12 @@ emit_agent_settings() {
     desired=$(printf '%s' "$setting" | jq -c '.value')
     present=false
     observed=null
-    if [ "$artifact_path_state" = unknown ]; then parsed=false; else parsed=true; fi
+    if [ "$artifact_path_state" = resolved ]; then parsed=true; else parsed=false; fi
     case $artifact_format in
       json)
-        if [ ! -e "$artifact_path" ]; then
+        if [ "$artifact_path_state" != resolved ]; then
+          :
+        elif [ ! -e "$artifact_path" ]; then
           :
         elif [ "$parsed_json_valid" != true ]; then
           parsed=false
@@ -265,9 +268,11 @@ emit_agent_settings() {
         ;;
       toml)
         raw=
-        if [ -d "$artifact_path" ]; then
+        if [ "$artifact_path_state" != resolved ]; then
+          :
+        elif [ -L "$artifact_path" ] || { [ -e "$artifact_path" ] && [ ! -f "$artifact_path" ]; }; then
           parsed=false
-        elif [ -e "$artifact_path" ]; then
+        elif [ -f "$artifact_path" ]; then
           raw=$(awk -v key="$key" '
           BEGIN { key_pattern = "(\"" key "\"|\047" key "\047|" key ")" }
           /^[[:space:]]*\[/ { exit }
@@ -324,17 +329,32 @@ emit_agent_settings() {
       observed=null
     fi
     if [ "$parsed" != true ]; then
-      if [ "$artifact_path_state" = unknown ]; then
-        setting_data=$(jq -cn --arg artifact "$artifact_id" --arg format "$artifact_format" \
-          --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
-          '{artifact:$artifact,path:null,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
-        setting_errors='[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent setting artifact has no path for this host"}]'
-      else
-        setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
-          --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
-          '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
-        setting_errors='[{"code":"setting_parse_failed","severity":"warning","retryable":false,"message":"allowlisted agent setting could not be parsed"}]'
-      fi
+      case $artifact_path_state in
+        unknown)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:null,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent setting artifact has no path for this host"}]'
+          ;;
+        symlink)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent setting artifact path is a symlink"}]'
+          ;;
+        non-regular)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"non_regular_file","severity":"warning","retryable":false,"message":"agent setting artifact path is not a regular file"}]'
+          ;;
+        *)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"setting_parse_failed","severity":"warning","retryable":false,"message":"allowlisted agent setting could not be parsed"}]'
+          ;;
+      esac
       emit agent_setting "$artifact_id:$key" unavailable medium \
         "$setting_data" '[]' "$setting_errors"
       continue
@@ -908,6 +928,10 @@ EOF
         "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
           --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
         '[]' '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent artifact path is a symlink"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" symlink
+      fi
     elif [ -f "$artifact_path" ]; then
       data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
         --arg digest "$(sha256_file "$artifact_path")" --arg mtime "$(file_mtime "$artifact_path")" \
@@ -928,6 +952,15 @@ EOF
       if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
         emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
           "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
+    elif [ -e "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" partial medium \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"non_regular_file","severity":"warning","retryable":false,"message":"agent artifact path is not a regular file or directory"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" non-regular
       fi
     else
       emit agent_artifact "$artifact_id" absent high \

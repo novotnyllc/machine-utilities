@@ -947,6 +947,48 @@ mv "$tmp/claude-settings-file-posix.json" "$tmp/home/.claude/settings.json"
   fail "POSIX settings directory artifact type was not reported truthfully"
 [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/directory-settings-posix.jsonl")" -eq 5 ] ||
   fail "POSIX settings directory dropped configured setting records"
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-link-posix.json"
+printf '%s\n' '{"model":"linked-settings-secret-posix"}' \
+  >"$tmp/linked-claude-settings-posix.json"
+ln -s "$tmp/linked-claude-settings-posix.json" "$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/linked-settings-posix.jsonl"
+linked_settings_posix_rc=$?
+set -e
+rm "$tmp/home/.claude/settings.json" "$tmp/linked-claude-settings-posix.json"
+mv "$tmp/claude-settings-file-before-link-posix.json" "$tmp/home/.claude/settings.json"
+[ "$linked_settings_posix_rc" -eq 2 ] || fail "linked POSIX settings artifact was not partial"
+"$cli" validate "$tmp/linked-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-posix.jsonl")" -eq 1 ] ||
+  fail "linked POSIX settings artifact was not reported without following it"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-posix.jsonl")" -eq 5 ] ||
+  fail "linked POSIX settings artifact dropped configured setting records"
+if grep -q 'linked-settings-secret-posix' "$tmp/linked-settings-posix.jsonl"; then
+  fail "POSIX settings inventory followed a linked artifact"
+fi
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-fifo-posix.json"
+mkfifo "$tmp/home/.claude/settings.json"
+(printf '%s\n' '{"model":"fifo-settings-secret-posix"}' >"$tmp/home/.claude/settings.json") &
+fifo_settings_writer=$!
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/fifo-settings-posix.jsonl"
+fifo_settings_posix_rc=$?
+set -e
+kill "$fifo_settings_writer" >/dev/null 2>&1 || true
+wait "$fifo_settings_writer" >/dev/null 2>&1 || true
+rm "$tmp/home/.claude/settings.json"
+mv "$tmp/claude-settings-file-before-fifo-posix.json" "$tmp/home/.claude/settings.json"
+[ "$fifo_settings_posix_rc" -eq 2 ] || fail "FIFO POSIX settings artifact was not partial"
+"$cli" validate "$tmp/fifo-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "non_regular_file")) | length' "$tmp/fifo-settings-posix.jsonl")" -eq 1 ] ||
+  fail "FIFO POSIX settings artifact was not reported as non-regular"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "non_regular_file")) | length' "$tmp/fifo-settings-posix.jsonl")" -eq 5 ] ||
+  fail "FIFO POSIX settings artifact dropped configured setting records"
+if grep -q 'fifo-settings-secret-posix' "$tmp/fifo-settings-posix.jsonl"; then
+  fail "POSIX settings inventory read a FIFO artifact"
+fi
 oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
 cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-posix.json"
 jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
@@ -1461,6 +1503,23 @@ if [ -n "$pwsh_command" ]; then
     fail "Windows settings directory artifact type was not reported truthfully"
   [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/directory-settings-windows.jsonl")" -eq 5 ] ||
     fail "Windows settings directory dropped configured setting records"
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-link-windows.json"
+  printf '%s\n' '{"model":"linked-settings-secret-windows"}' \
+    >"$tmp/linked-claude-settings-windows.json"
+  ln -s "$tmp/linked-claude-settings-windows.json" "$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/linked-settings-windows.jsonl"
+  rm "$tmp/home/.claude/settings.json" "$tmp/linked-claude-settings-windows.json"
+  mv "$tmp/claude-settings-file-before-link-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/linked-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-windows.jsonl")" -eq 1 ] ||
+    fail "linked Windows settings artifact was not reported without following it"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-windows.jsonl")" -eq 5 ] ||
+    fail "linked Windows settings artifact dropped configured setting records"
+  if grep -q 'linked-settings-secret-windows' "$tmp/linked-settings-windows.jsonl"; then
+    fail "Windows settings inventory followed a linked artifact"
+  fi
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-windows.json"
   jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
     >"$tmp/home/.claude/settings.json"
