@@ -202,11 +202,13 @@ function Add-AgentSettings(
     [string]$ArtifactId,
     [string]$ArtifactPath,
     [switch]$UnknownPath,
-    [switch]$LinkedPath
+    [switch]$LinkedPath,
+    [switch]$UnavailablePath
 ) {
     $Format = [string]$Definition.format
-    $ArtifactExists = -not $UnknownPath -and (Test-Path -LiteralPath $ArtifactPath)
-    $ArtifactIsFile = -not $UnknownPath -and -not $LinkedPath -and
+    $ArtifactExists = -not $UnknownPath -and -not $LinkedPath -and -not $UnavailablePath -and
+        (Test-Path -LiteralPath $ArtifactPath)
+    $ArtifactIsFile = -not $UnknownPath -and -not $LinkedPath -and -not $UnavailablePath -and
         (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)
     $Parsed = $null
     if ($Format -eq "json" -and $ArtifactIsFile) {
@@ -220,7 +222,8 @@ function Add-AgentSettings(
         $Desired = $Setting.Value
         $Present = $false
         $Observed = $null
-        $ParseFailed = $UnknownPath -or $LinkedPath -or ($ArtifactExists -and -not $ArtifactIsFile)
+        $ParseFailed = $UnknownPath -or $LinkedPath -or $UnavailablePath -or
+            ($ArtifactExists -and -not $ArtifactIsFile)
         if ($Format -eq "json") {
             if (-not $ArtifactExists) {
                 # An absent artifact means every configured setting is absent, not unparseable.
@@ -268,6 +271,8 @@ function Add-AgentSettings(
                 @{ code = "artifact_path_missing"; severity = "warning"; retryable = $false; message = "agent setting artifact has no path for this host" }
             } elseif ($LinkedPath) {
                 @{ code = "symlink_not_followed"; severity = "warning"; retryable = $false; message = "agent setting artifact path is a link" }
+            } elseif ($UnavailablePath) {
+                @{ code = "artifact_path_unavailable"; severity = "warning"; retryable = $true; message = "agent setting artifact path could not be inspected" }
             } else {
                 @{ code = "setting_parse_failed"; severity = "warning"; retryable = $false; message = "allowlisted agent setting could not be parsed" }
             }
@@ -1064,6 +1069,19 @@ if (Test-Section "agents") {
             $ArtifactId = Limit-Text $Definition.id
             $ConfiguredArtifactPath = Get-ConfiguredPath $Definition $HostId
             $ArtifactPath = Resolve-UserPath $ConfiguredArtifactPath
+            $PathAttributes = $null
+            $PathProbeFailed = $false
+            if (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) {
+                try {
+                    $PathAttributes = [IO.File]::GetAttributes($ArtifactPath)
+                } catch [IO.FileNotFoundException] {
+                    # A missing leaf is an authoritative absent observation.
+                } catch [IO.DirectoryNotFoundException] {
+                    # A missing parent is an authoritative absent observation.
+                } catch {
+                    $PathProbeFailed = $true
+                }
+            }
             if ([string]::IsNullOrWhiteSpace($ArtifactPath)) {
                 Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "unavailable" -Confidence "high" -Data @{
                     id = $ArtifactId; path = $null; artifact_kind = Limit-Text $Definition.kind
@@ -1072,9 +1090,17 @@ if (Test-Section "agents") {
                 if ($null -ne $Definition.settings -and $Definition.settings.PSObject.Properties.Count -gt 0) {
                     Add-AgentSettings $Definition $ArtifactId "" -UnknownPath
                 }
-            } elseif (Test-Path -LiteralPath $ArtifactPath) {
-                $Item = Get-Item -LiteralPath $ArtifactPath -Force
-                if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            } elseif ($PathProbeFailed) {
+                Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "unavailable" -Confidence "medium" -Data @{
+                    id = $ArtifactId; path = Limit-Text $ArtifactPath; artifact_kind = Limit-Text $Definition.kind
+                    agent_exposure = @($Definition.agents)
+                } -Errors @(@{ code = "artifact_path_unavailable"; severity = "warning"; retryable = $true; message = "agent artifact path could not be inspected" })
+                if ($null -ne $Definition.settings -and
+                    $Definition.settings.PSObject.Properties.Count -gt 0) {
+                    Add-AgentSettings $Definition $ArtifactId $ArtifactPath -UnavailablePath
+                }
+            } elseif ($null -ne $PathAttributes) {
+                if (($PathAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                     Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "partial" -Confidence "medium" -Data @{
                         id = $ArtifactId; path = Limit-Text $ArtifactPath; artifact_kind = Limit-Text $Definition.kind
                         agent_exposure = @($Definition.agents)
@@ -1084,6 +1110,7 @@ if (Test-Section "agents") {
                         Add-AgentSettings $Definition $ArtifactId $ArtifactPath -LinkedPath
                     }
                 } else {
+                    $Item = Get-Item -LiteralPath $ArtifactPath -Force -ErrorAction Stop
                     $Digest = if ($Item.PSIsContainer) {
                         Get-DirectoryDigest $ArtifactPath
                     } else {

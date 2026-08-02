@@ -1520,6 +1520,18 @@ if [ -n "$pwsh_command" ]; then
   if grep -q 'linked-settings-secret-windows' "$tmp/linked-settings-windows.jsonl"; then
     fail "Windows settings inventory followed a linked artifact"
   fi
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-dangling-link-windows.json"
+  ln -s "$tmp/missing-claude-settings-windows.json" "$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/dangling-linked-settings-windows.jsonl"
+  rm "$tmp/home/.claude/settings.json"
+  mv "$tmp/claude-settings-file-before-dangling-link-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/dangling-linked-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/dangling-linked-settings-windows.jsonl")" -eq 1 ] ||
+    fail "dangling Windows settings link was reported as an absent artifact"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/dangling-linked-settings-windows.jsonl")" -eq 5 ] ||
+    fail "dangling Windows settings link dropped configured setting records"
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-windows.json"
   jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
     >"$tmp/home/.claude/settings.json"
