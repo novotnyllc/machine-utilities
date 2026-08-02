@@ -14,11 +14,11 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "f5b31521eb4d3d1f5217fff2e0de036bcb8f3be516cce0933b7b78bc72532ecd"
+      "sha256": "dc78e2c8ce449d0422436822051977fb9bff7d2cf88de0ba6325996395d9f8d5"
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "ea851c62c9349e6846ba2cd6d66a7528b45bb92a56cdcbd4b7deafe293131764"
+      "sha256": "031401a9ff85fdd103c96183be3f4730280f0138f7c4a9d3b3254739b89ef2fc"
     },
     {
       "path": "scripts/machine-utilities",

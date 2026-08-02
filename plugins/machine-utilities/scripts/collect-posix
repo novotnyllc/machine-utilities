@@ -236,6 +236,7 @@ emit_agent_settings() {
   artifact_path=$3
   artifact_format=$4
   artifact_agents=$5
+  artifact_path_state=${6:-resolved}
   parsed_json=
   parsed_json_valid=true
   if [ "$artifact_format" = json ] && [ -e "$artifact_path" ]; then
@@ -250,7 +251,7 @@ emit_agent_settings() {
     desired=$(printf '%s' "$setting" | jq -c '.value')
     present=false
     observed=null
-    parsed=true
+    if [ "$artifact_path_state" = unknown ]; then parsed=false; else parsed=true; fi
     case $artifact_format in
       json)
         if [ ! -e "$artifact_path" ]; then
@@ -306,11 +307,12 @@ emit_agent_settings() {
         ;;
     esac
     if [ "$parsed" = true ] && [ "$present" = true ] &&
-      ! printf '%s' "$observed" | jq -e --arg key "$key" '
+      ! printf '%s' "$observed" | jq -e --arg key "$key" --argjson desired "$desired" '
         ([.. | strings |
           length <= 8192 and (test("[[:cntrl:]]") | not)
         ] | all) and (tojson | utf8bytelength <= 8192) and
-        (if $key | IN("remoteControlAtStartup","switchModelsOnFlag","agentPushNotifEnabled",
+        (if . == null then $desired == null
+        elif $key | IN("remoteControlAtStartup","switchModelsOnFlag","agentPushNotifEnabled",
             "check_for_update_on_startup") then type == "boolean"
         elif $key == "availableModels" then
           type == "array" and ([.[] | type == "string" and length > 0] | all)
@@ -322,11 +324,19 @@ emit_agent_settings() {
       observed=null
     fi
     if [ "$parsed" != true ]; then
-      emit agent_setting "$artifact_id:$key" unavailable medium \
-        "$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+      if [ "$artifact_path_state" = unknown ]; then
+        setting_data=$(jq -cn --arg artifact "$artifact_id" --arg format "$artifact_format" \
           --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
-          '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')" \
-        '[]' '[{"code":"setting_parse_failed","severity":"warning","retryable":false,"message":"allowlisted agent setting could not be parsed"}]'
+          '{artifact:$artifact,path:null,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+        setting_errors='[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent setting artifact has no path for this host"}]'
+      else
+        setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+          --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+          '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+        setting_errors='[{"code":"setting_parse_failed","severity":"warning","retryable":false,"message":"allowlisted agent setting could not be parsed"}]'
+      fi
+      emit agent_setting "$artifact_id:$key" unavailable medium \
+        "$setting_data" '[]' "$setting_errors"
       continue
     fi
     in_sync=$(jq -cn --argjson present "$present" --argjson observed "$observed" --argjson desired "$desired" \
@@ -889,6 +899,10 @@ EOF
         "$(jq -cn --arg id "$artifact_id" --arg kind "$artifact_kind" --argjson agents "$artifact_agents" \
           '{id:$id,path:null,artifact_kind:$kind,agent_exposure:$agents}')" \
         '[]' '[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent artifact has no path for this host"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" unknown
+      fi
     elif [ -L "$artifact_path" ]; then
       emit agent_artifact "$artifact_id" partial medium \
         "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \

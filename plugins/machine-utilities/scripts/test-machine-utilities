@@ -748,7 +748,7 @@ if MACHINE_UTILITIES_CONFIG="$tmp/invalid-pathless-encrypted-auth.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "pathless encrypted auth install was accepted"
 fi
-jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-windows":"~/.missing"},kind:"instruction",agents:["codex"],groups:["development"]}]' \
+jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-windows":"~/.missing"},kind:"config",format:"json",settings:{fallbackModel:null,model:"fixture-model"},agents:["claude"],groups:["development"]}]' \
   "$tmp/config.json" >"$tmp/missing-agent-path.json"
 set +e
 MACHINE_UTILITIES_CONFIG="$tmp/missing-agent-path.json" "$cli" collect --target test-host \
@@ -756,8 +756,11 @@ MACHINE_UTILITIES_CONFIG="$tmp/missing-agent-path.json" "$cli" collect --target 
 missing_agent_path_rc=$?
 set -e
 [ "$missing_agent_path_rc" -eq 2 ] || fail "missing per-host artifact path was not partial"
+"$cli" validate "$tmp/missing-agent-path.jsonl"
 [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "missing-host-path" and .status == "unavailable" and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path.jsonl")" -eq 1 ] ||
   fail "missing per-host artifact path was not explicit"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "missing-host-path" and .status == "unavailable" and .data.path == null and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path.jsonl")" -eq 2 ] ||
+  fail "missing per-host artifact path dropped configured settings or treated them as observed absent"
 "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
 [ "$(test_file_mode "$tmp/snapshot.jsonl")" = 600 ] ||
   fail "snapshot mode is not 600"
@@ -878,8 +881,16 @@ mv "$tmp/claude-settings-absent-posix.json" "$tmp/home/.claude/settings.json"
   fail "absent POSIX non-null setting was not reported as drift"
 [ "$(jq -s 'map(select(.id == "claude-settings:fallbackModel" and .data.observed_present == false and .data.in_sync == true)) | length' "$tmp/absent-settings-posix.jsonl")" -eq 1 ] ||
   fail "absent POSIX desired-null setting was not reported in sync"
+cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-null-posix.json"
+printf '%s\n' '{"fallbackModel":null}' >"$tmp/home/.claude/settings.json"
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/explicit-null-setting-posix.jsonl"
+mv "$tmp/claude-settings-null-posix.json" "$tmp/home/.claude/settings.json"
+"$cli" validate "$tmp/explicit-null-setting-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "present" and .data.observed_present == true and .data.observed == null and .data.desired == null and .data.in_sync == false)) | length' "$tmp/explicit-null-setting-posix.jsonl")" -eq 1 ] ||
+  fail "explicit POSIX null setting was not reported as observed drift"
 cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid.json"
-printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"}}' >"$tmp/home/.claude/settings.json"
+printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"},"fallbackModel":{"apiKey":"nested-null-desired-secret"}}' >"$tmp/home/.claude/settings.json"
 set +e
 "$cli" collect --target test-host --section agents --section auth \
   --output "$tmp/invalid-observed-setting-posix.jsonl"
@@ -887,8 +898,11 @@ invalid_observed_setting_rc=$?
 set -e
 mv "$tmp/claude-settings-valid.json" "$tmp/home/.claude/settings.json"
 [ "$invalid_observed_setting_rc" -eq 2 ] || fail "invalid observed POSIX setting was not partial"
+"$cli" validate "$tmp/invalid-observed-setting-posix.jsonl"
 [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:model" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-posix.jsonl")" -eq 1 ] ||
   fail "invalid observed POSIX setting value was not suppressed"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-posix.jsonl")" -eq 1 ] ||
+  fail "nested POSIX value for a null-desired setting was not suppressed"
 invalid_observed_setting_human=$("$cli" render --format human "$tmp/invalid-observed-setting-posix.jsonl")
 assert_contains "$invalid_observed_setting_human" 'setting_parse_failed'
 if printf '%s' "$invalid_observed_setting_human" |
@@ -897,6 +911,9 @@ if printf '%s' "$invalid_observed_setting_human" |
 fi
 if grep -q 'nested-observed-secret' "$tmp/invalid-observed-setting-posix.jsonl"; then
   fail "nested data under an allowlisted POSIX setting leaked into inventory"
+fi
+if grep -q 'nested-null-desired-secret' "$tmp/invalid-observed-setting-posix.jsonl"; then
+  fail "nested data under a null-desired POSIX setting leaked into inventory"
 fi
 cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-single-document-posix.json"
 printf '%s\n' '{"model":"fixture-model"}' '{"model":"fixture-model"}' \
@@ -1251,6 +1268,17 @@ set -e
 cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
 if [ -n "$pwsh_command" ]; then
   "$cli" worker-config test-windows inventory "$tmp/windows-worker-config.json"
+  jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-host":"~/.missing"},kind:"config",format:"json",settings:{fallbackModel:null,model:"fixture-model"},agents:["claude"],groups:["development"]}]' \
+    "$tmp/windows-worker-config.json" >"$tmp/missing-agent-path-windows-config.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/missing-agent-path-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents -AllowAuthVerify \
+    >"$tmp/missing-agent-path-windows.jsonl"
+  "$cli" validate "$tmp/missing-agent-path-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "missing-host-path" and .status == "unavailable" and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path-windows.jsonl")" -eq 1 ] ||
+    fail "missing Windows per-host artifact path was not explicit"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "missing-host-path" and .status == "unavailable" and .data.path == null and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path-windows.jsonl")" -eq 2 ] ||
+    fail "missing Windows per-host artifact path dropped configured settings or treated them as observed absent"
   jq '.auth_artifacts["test-auth"].paths = {"TEST-WINDOWS":"~/.wrong-case-auth"}' \
     "$tmp/windows-worker-config.json" >"$tmp/wrong-case-host-path-windows-config.json"
   HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
@@ -1361,8 +1389,17 @@ if [ -n "$pwsh_command" ]; then
   "$cli" validate "$tmp/mixed-case-enum-settings-windows.jsonl"
   [ "$(jq -s 'map(select((.id == "claude-settings:autoUpdatesChannel" or .id == "codex-settings:cli_auth_credentials_store") and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/mixed-case-enum-settings-windows.jsonl")" -eq 2 ] ||
     fail "Windows observed settings accepted mixed-case enum values"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-null-windows.json"
+  printf '%s\n' '{"fallbackModel":null}' >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/explicit-null-setting-windows.jsonl"
+  mv "$tmp/claude-settings-null-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/explicit-null-setting-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "present" and .data.observed_present == true and .data.observed == null and .data.desired == null and .data.in_sync == false)) | length' "$tmp/explicit-null-setting-windows.jsonl")" -eq 1 ] ||
+    fail "explicit Windows null setting was not reported as observed drift"
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid-windows.json"
-  printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"}}' >"$tmp/home/.claude/settings.json"
+  printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"},"fallbackModel":{"apiKey":"nested-null-desired-secret"}}' >"$tmp/home/.claude/settings.json"
   set +e
   HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
@@ -1371,12 +1408,18 @@ if [ -n "$pwsh_command" ]; then
   set -e
   mv "$tmp/claude-settings-valid-windows.json" "$tmp/home/.claude/settings.json"
   [ "$invalid_observed_setting_windows_rc" -eq 0 ] || fail "Windows invalid-setting inventory did not return JSONL"
+  "$cli" validate "$tmp/invalid-observed-setting-windows.jsonl"
   [ "$(jq -r 'select(.kind == "operation") | .data.operation_status' "$tmp/invalid-observed-setting-windows.jsonl")" = partial ] ||
     fail "invalid observed Windows setting did not mark inventory partial"
   [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:model" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-windows.jsonl")" -eq 1 ] ||
     fail "invalid observed Windows setting value was not suppressed"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-windows.jsonl")" -eq 1 ] ||
+    fail "nested Windows value for a null-desired setting was not suppressed"
   if grep -q 'nested-observed-secret' "$tmp/invalid-observed-setting-windows.jsonl"; then
     fail "nested data under an allowlisted Windows setting leaked into inventory"
+  fi
+  if grep -q 'nested-null-desired-secret' "$tmp/invalid-observed-setting-windows.jsonl"; then
+    fail "nested data under a null-desired Windows setting leaked into inventory"
   fi
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-single-document-windows.json"
   printf '%s\n' '{"model":"fixture-model"}' '{"model":"fixture-model"}' \

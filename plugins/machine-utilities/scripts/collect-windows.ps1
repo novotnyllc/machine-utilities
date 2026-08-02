@@ -197,10 +197,10 @@ function Test-AgentSettingValue([string]$Key, [object]$Value) {
     return $Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$Value)
 }
 
-function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$ArtifactPath) {
+function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$ArtifactPath, [switch]$UnknownPath) {
     $Format = [string]$Definition.format
-    $ArtifactExists = Test-Path -LiteralPath $ArtifactPath
-    $ArtifactIsFile = Test-Path -LiteralPath $ArtifactPath -PathType Leaf
+    $ArtifactExists = -not $UnknownPath -and (Test-Path -LiteralPath $ArtifactPath)
+    $ArtifactIsFile = -not $UnknownPath -and (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)
     $Parsed = $null
     if ($Format -eq "json" -and $ArtifactIsFile) {
         try { $Parsed = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate } catch { $Parsed = $null }
@@ -213,7 +213,7 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
         $Desired = $Setting.Value
         $Present = $false
         $Observed = $null
-        $ParseFailed = $ArtifactExists -and -not $ArtifactIsFile
+        $ParseFailed = $UnknownPath -or ($ArtifactExists -and -not $ArtifactIsFile)
         if ($Format -eq "json") {
             if (-not $ArtifactExists) {
                 # An absent artifact means every configured setting is absent, not unparseable.
@@ -248,16 +248,24 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
                 }
             }
         }
+        $SettingValueValid = $null -eq $Observed -and $null -eq $Desired
+        if ($null -ne $Observed) { $SettingValueValid = Test-AgentSettingValue $Key $Observed }
         if ($Present -and
-            (-not (Test-AgentSettingValue $Key $Observed) -or -not (Test-BoundedSemanticValue $Observed))) {
+            (-not $SettingValueValid -or -not (Test-BoundedSemanticValue $Observed))) {
             $ParseFailed = $true
             $Observed = $null
         }
         if ($ParseFailed) {
+            $SettingPath = if ($UnknownPath) { $null } else { Limit-Text $ArtifactPath }
+            $Error = if ($UnknownPath) {
+                @{ code = "artifact_path_missing"; severity = "warning"; retryable = $false; message = "agent setting artifact has no path for this host" }
+            } else {
+                @{ code = "setting_parse_failed"; severity = "warning"; retryable = $false; message = "allowlisted agent setting could not be parsed" }
+            }
             Add-Record -Kind "agent_setting" -Id "$ArtifactId`:$Key" -Status "unavailable" -Confidence "medium" -Data @{
-                artifact = $ArtifactId; path = Limit-Text $ArtifactPath; format = $Format; key = $Key
+                artifact = $ArtifactId; path = $SettingPath; format = $Format; key = $Key
                 desired = $Desired; agent_exposure = @($Definition.agents)
-            } -Errors @(@{ code = "setting_parse_failed"; severity = "warning"; retryable = $false; message = "allowlisted agent setting could not be parsed" })
+            } -Errors @($Error)
             continue
         }
         $ObservedJson = ConvertTo-Json $Observed -Compress -Depth 20
@@ -1052,6 +1060,9 @@ if (Test-Section "agents") {
                     id = $ArtifactId; path = $null; artifact_kind = Limit-Text $Definition.kind
                     agent_exposure = @($Definition.agents)
                 } -Errors @(@{ code = "artifact_path_missing"; severity = "warning"; retryable = $false; message = "agent artifact has no path for this host" })
+                if ($null -ne $Definition.settings -and $Definition.settings.PSObject.Properties.Count -gt 0) {
+                    Add-AgentSettings $Definition $ArtifactId "" -UnknownPath
+                }
             } elseif (Test-Path -LiteralPath $ArtifactPath) {
                 $Item = Get-Item -LiteralPath $ArtifactPath -Force
                 if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
