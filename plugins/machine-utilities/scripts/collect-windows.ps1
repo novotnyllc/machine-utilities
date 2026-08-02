@@ -430,6 +430,8 @@ function Assert-WorkerConfig([object]$Value) {
     if ($null -ne $Value.auth_artifacts) {
         foreach ($Property in $Value.auth_artifacts.PSObject.Properties) {
             $Verify = @($Property.Value.verify)
+            $ReauthValue = $Property.Value.reauth
+            $Reauth = if ($null -eq $ReauthValue) { @() } else { @($ReauthValue) }
             $Strategy = if ($null -eq $Property.Value.strategy) { "ignore" } else { [string]$Property.Value.strategy }
             $Portability = if ($null -eq $Property.Value.portability) { "per-machine" } else { [string]$Property.Value.portability }
             $HasPath = -not [string]::IsNullOrWhiteSpace([string]$Property.Value.path) -or
@@ -443,6 +445,12 @@ function Assert-WorkerConfig([object]$Value) {
                 @("chezmoi", "encrypted-install", "reauth", "ignore") -notcontains $Strategy -or
                 @("declarative", "secret-reference", "portable-session", "native-store", "per-machine", "regenerable-cache") -notcontains $Portability -or
                 $Verify.Count -gt 32 -or
+                ($null -ne $ReauthValue -and $ReauthValue -isnot [Collections.IList]) -or
+                $Reauth.Count -gt 32 -or
+                ($Strategy -eq "reauth" -and $Reauth.Count -eq 0) -or
+                ($Reauth.Count -gt 0 -and
+                    ([string]$Reauth[0] -notmatch '^[A-Za-z0-9._+-]+$' -or
+                     @($Reauth | Where-Object { $_ -isnot [string] -or [string]::IsNullOrEmpty($_) }).Count -gt 0)) -or
                 ($PathlessAuthStatus -and $Strategy -notin @("reauth", "ignore")) -or
                 ($PathlessAuthStatus -and $Verify.Count -eq 0) -or
                 ($Verify.Count -gt 0 -and [string]$Verify[0] -notmatch '^[A-Za-z0-9._+-]+$')) {

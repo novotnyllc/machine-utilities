@@ -729,6 +729,12 @@ if MACHINE_UTILITIES_CONFIG="$tmp/invalid-native-auth.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "pathless native auth accepted no verification command"
 fi
+jq 'del(.auth_artifacts["native-test-auth"].reauth)' "$tmp/config.json" \
+  >"$tmp/invalid-reauth-command.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-reauth-command.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "reauth strategy accepted no reauthentication command"
+fi
 jq 'del(.auth_artifacts["test-auth"].path) | .auth_artifacts["test-auth"].portability = "per-machine"' \
   "$tmp/config.json" >"$tmp/invalid-pathless-encrypted-auth.json"
 if MACHINE_UTILITIES_CONFIG="$tmp/invalid-pathless-encrypted-auth.json" \
@@ -1388,6 +1394,13 @@ if [ -n "$pwsh_command" ]; then
     -ConfigPath "$tmp/invalid-pathless-encrypted-windows.json" -HostId test-windows \
     -ControllerConfigDigest "$config_hash" -Sections auth >/dev/null 2>&1; then
     fail "Windows worker accepted a pathless encrypted auth install"
+  fi
+  jq 'del(.auth_artifacts["native-test-auth"].reauth)' \
+    "$tmp/windows-worker-config.json" >"$tmp/invalid-reauth-command-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/invalid-reauth-command-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth >/dev/null 2>&1; then
+    fail "Windows worker accepted a reauth strategy without a command"
   fi
 fi
 

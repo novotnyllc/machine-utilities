@@ -18,11 +18,11 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "65a512eae4eb2a57a18807d1b10255355f0ab26cace6d548e34aa89c4a203068"
+      "sha256": "36fa7c9828d1349a686e5ce162ca3550bd4e9eaf3960f8e8a56a7263aef5aa7f"
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "776e030f8fdf3086f473eafb79eccae52055210e6e31d28bb34dcbe63777479f"
+      "sha256": "1a3f263e6abaf8c68b83b0a473452caa31394bf84b5e78040abd2db29017fcf1"
     }
   ],
   "marketplace": "novotnyllc",
