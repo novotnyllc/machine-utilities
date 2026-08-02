@@ -212,8 +212,8 @@ mkdir -p "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin
 printf '%s\n' \
   '{"remoteControlAtStartup":false,"switchModelsOnFlag":false,"model":"fixture-model","unlistedSecret":"must-not-leak"}' \
   >"$tmp/home/.claude/settings.json"
-printf '%s\n' "model = 'fixture#model' # literal TOML string" \
-  'check_for_update_on_startup = true' '[profile.fixture]' \
+printf '%s\n' "\"model\" = 'fixture#model' # quoted TOML key and literal string" \
+  "'check_for_update_on_startup' = true" '[profile.fixture]' \
   'service_tier = "must-not-leak"' \
   >"$tmp/home/.codex/config.toml"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin/plugin.json"

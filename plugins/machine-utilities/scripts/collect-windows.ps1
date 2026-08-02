@@ -221,13 +221,14 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
             }
         } elseif ($Format -eq "toml") {
             $Escaped = [Regex]::Escape($Key)
+            $KeyPattern = '(?:{0}|"{0}"|''{0}'')' -f $Escaped
             $Line = $null
             foreach ($ConfigLine in @(Get-Content -LiteralPath $ArtifactPath)) {
                 if ($ConfigLine -match '^\s*\[') { break }
-                if ($ConfigLine -match "^\s*$Escaped\s*=") { $Line = $ConfigLine; break }
+                if ($ConfigLine -match "^\s*$KeyPattern\s*=") { $Line = $ConfigLine; break }
             }
             if ($null -ne $Line) {
-                $Raw = $Line -replace "^\s*$Escaped\s*=\s*", ""
+                $Raw = $Line -replace "^\s*$KeyPattern\s*=\s*", ""
                 if ($Raw -match "^\s*'([^']*)'\s*(?:#.*)?$") {
                     $Observed = $Matches[1]
                     $Present = $true
