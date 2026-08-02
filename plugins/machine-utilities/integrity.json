@@ -18,7 +18,7 @@
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "f867426bcc5086aa7c0ecc372e9062235a3bcd3f2aa452cbf07dda4f15ca4909"
+      "sha256": "ea851c62c9349e6846ba2cd6d66a7528b45bb92a56cdcbd4b7deafe293131764"
     },
     {
       "path": "scripts/machine-utilities",

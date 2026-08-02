@@ -186,14 +186,14 @@ function Get-AuthHealth([object]$Definition) {
 
 function Test-AgentSettingValue([string]$Key, [object]$Value) {
     if ($null -eq $Value) { return $false }
-    if ($Key -in @("remoteControlAtStartup", "switchModelsOnFlag", "agentPushNotifEnabled",
+    if ($Key -cin @("remoteControlAtStartup", "switchModelsOnFlag", "agentPushNotifEnabled",
             "check_for_update_on_startup")) { return $Value -is [bool] }
-    if ($Key -eq "availableModels") {
+    if ($Key -ceq "availableModels") {
         return $Value -isnot [string] -and $Value -is [Collections.IEnumerable] -and
             @($Value | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -eq 0
     }
-    if ($Key -eq "autoUpdatesChannel") { return [string]$Value -in @("latest", "stable") }
-    if ($Key -eq "cli_auth_credentials_store") { return [string]$Value -in @("file", "keyring", "auto") }
+    if ($Key -ceq "autoUpdatesChannel") { return [string]$Value -cin @("latest", "stable") }
+    if ($Key -ceq "cli_auth_credentials_store") { return [string]$Value -cin @("file", "keyring", "auto") }
     return $Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$Value)
 }
 
@@ -426,17 +426,17 @@ function Assert-WorkerConfig([object]$Value) {
             }
             foreach ($Setting in $SettingProperties) {
                 if ($null -eq $Setting.Value) { continue }
-                if ($Setting.Name -in @("remoteControlAtStartup", "switchModelsOnFlag",
+                if ($Setting.Name -cin @("remoteControlAtStartup", "switchModelsOnFlag",
                         "agentPushNotifEnabled", "check_for_update_on_startup")) {
                     $InvalidSettingValue = $Setting.Value -isnot [bool]
-                } elseif ($Setting.Name -eq "availableModels") {
+                } elseif ($Setting.Name -ceq "availableModels") {
                     $InvalidSettingValue = $Setting.Value -is [string] -or
                         $Setting.Value -isnot [Collections.IEnumerable] -or
                         @($Setting.Value | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
-                } elseif ($Setting.Name -eq "autoUpdatesChannel") {
-                    $InvalidSettingValue = [string]$Setting.Value -notin @("latest", "stable")
-                } elseif ($Setting.Name -eq "cli_auth_credentials_store") {
-                    $InvalidSettingValue = [string]$Setting.Value -notin @("file", "keyring", "auto")
+                } elseif ($Setting.Name -ceq "autoUpdatesChannel") {
+                    $InvalidSettingValue = [string]$Setting.Value -cnotin @("latest", "stable")
+                } elseif ($Setting.Name -ceq "cli_auth_credentials_store") {
+                    $InvalidSettingValue = [string]$Setting.Value -cnotin @("file", "keyring", "auto")
                 } else {
                     $InvalidSettingValue = $Setting.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Setting.Value)
                 }
@@ -456,9 +456,9 @@ function Assert-WorkerConfig([object]$Value) {
                      ([string]$Definition.format -eq "toml" -and
                       (@($Definition.agents).Count -ne 1 -or ([string](@($Definition.agents)[0])) -cne "codex")))) -or
                 ([string]$Definition.format -eq "json" -and
-                    @($SettingKeys | Where-Object { $_ -notin $AllowedJsonSettings }).Count -gt 0) -or
+                    @($SettingKeys | Where-Object { $_ -cnotin $AllowedJsonSettings }).Count -gt 0) -or
                 ([string]$Definition.format -eq "toml" -and
-                    @($SettingKeys | Where-Object { $_ -notin $AllowedTomlSettings }).Count -gt 0) -or
+                    @($SettingKeys | Where-Object { $_ -cnotin $AllowedTomlSettings }).Count -gt 0) -or
                 $InvalidSettingValue) {
                 throw "Invalid agent artifact configuration"
             }

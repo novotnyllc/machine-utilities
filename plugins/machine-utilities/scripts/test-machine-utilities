@@ -1345,6 +1345,22 @@ if [ -n "$pwsh_command" ]; then
     fail "Windows TOML setting lookup did not select the exact-case key"
   [ "$(jq -s 'map(select(.id == "codex-settings:check_for_update_on_startup" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/case-sensitive-toml-settings-windows.jsonl")" -eq 1 ] ||
     fail "Windows TOML parser accepted a mixed-case boolean literal"
+  jq '(.agent_artifacts[] | select(.id == "claude-settings").settings.autoUpdatesChannel) = "latest" |
+      (.agent_artifacts[] | select(.id == "codex-settings").settings.cli_auth_credentials_store) = "auto"' \
+    "$tmp/windows-worker-config.json" >"$tmp/enum-settings-windows-config.json"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-enum-windows.json"
+  cp -p "$tmp/home/.codex/config.toml" "$tmp/codex-settings-enum-windows.toml"
+  printf '%s\n' '{"autoUpdatesChannel":"Latest"}' >"$tmp/home/.claude/settings.json"
+  printf '%s\n' "cli_auth_credentials_store = 'Auto'" >"$tmp/home/.codex/config.toml"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/enum-settings-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents -AllowAuthVerify \
+    >"$tmp/mixed-case-enum-settings-windows.jsonl"
+  mv "$tmp/claude-settings-enum-windows.json" "$tmp/home/.claude/settings.json"
+  mv "$tmp/codex-settings-enum-windows.toml" "$tmp/home/.codex/config.toml"
+  "$cli" validate "$tmp/mixed-case-enum-settings-windows.jsonl"
+  [ "$(jq -s 'map(select((.id == "claude-settings:autoUpdatesChannel" or .id == "codex-settings:cli_auth_credentials_store") and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/mixed-case-enum-settings-windows.jsonl")" -eq 2 ] ||
+    fail "Windows observed settings accepted mixed-case enum values"
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid-windows.json"
   printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"}}' >"$tmp/home/.claude/settings.json"
   set +e
@@ -1546,6 +1562,20 @@ if [ -n "$pwsh_command" ]; then
     -ConfigPath "$tmp/invalid-agent-setting-aggregate-windows.json" -HostId test-windows \
     -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
     fail "Windows worker accepted an oversized aggregate desired setting"
+  fi
+  jq '(.agent_artifacts[] | select(.id == "claude-settings").settings.autoUpdatesChannel) = "Latest"' \
+    "$tmp/windows-worker-config.json" >"$tmp/mixed-case-desired-enum-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/mixed-case-desired-enum-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
+    fail "Windows worker accepted a mixed-case desired setting enum"
+  fi
+  jq '(.agent_artifacts[] | select(.id == "claude-settings").settings.AutoUpdatesChannel) = "latest"' \
+    "$tmp/windows-worker-config.json" >"$tmp/mixed-case-desired-key-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/mixed-case-desired-key-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
+    fail "Windows worker accepted a mixed-case desired setting key"
   fi
   jq '.capabilities["example-research"].Codex = .capabilities["example-research"].codex |
       .capabilities["example-research"].Claude = .capabilities["example-research"].claude |
