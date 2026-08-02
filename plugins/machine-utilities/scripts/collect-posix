@@ -244,7 +244,9 @@ emit_agent_settings() {
     parsed=true
     case $artifact_format in
       json)
-        if ! jq -e 'type == "object"' "$artifact_path" >/dev/null 2>&1; then
+        if [ ! -e "$artifact_path" ]; then
+          :
+        elif ! jq -e 'type == "object"' "$artifact_path" >/dev/null 2>&1; then
           parsed=false
         elif jq -e --arg key "$key" 'has($key)' "$artifact_path" >/dev/null; then
           present=true
@@ -252,7 +254,9 @@ emit_agent_settings() {
         fi
         ;;
       toml)
-        raw=$(awk -v key="$key" '
+        raw=
+        if [ -e "$artifact_path" ]; then
+          raw=$(awk -v key="$key" '
           BEGIN { key_pattern = "(\"" key "\"|\047" key "\047|" key ")" }
           /^[[:space:]]*\[/ { exit }
           $0 ~ "^[[:space:]]*" key_pattern "[[:space:]]*=" {
@@ -275,6 +279,7 @@ emit_agent_settings() {
             print
             exit
           }' "$artifact_path")
+        fi
         if [ -n "$raw" ]; then
           if observed=$(printf '%s' "$raw" | jq -Rce 'fromjson' 2>/dev/null); then
             present=true
@@ -896,6 +901,10 @@ EOF
       emit agent_artifact "$artifact_id" absent high \
         "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
           --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')"
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
     fi
   done
 

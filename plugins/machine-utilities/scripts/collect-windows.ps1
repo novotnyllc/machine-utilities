@@ -199,10 +199,11 @@ function Test-AgentSettingValue([string]$Key, [object]$Value) {
 
 function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$ArtifactPath) {
     $Format = [string]$Definition.format
+    $ArtifactExists = Test-Path -LiteralPath $ArtifactPath -PathType Leaf
     $Parsed = $null
-    if ($Format -eq "json") {
-        try { $Parsed = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -NoEnumerate } catch { $Parsed = $null }
-        if ($null -eq $Parsed -or $Parsed.GetType() -ne [Management.Automation.PSCustomObject]) {
+    if ($Format -eq "json" -and $ArtifactExists) {
+        try { $Parsed = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate } catch { $Parsed = $null }
+        if ($null -eq $Parsed -or $Parsed -isnot [Collections.IDictionary]) {
             $Parsed = $null
         }
     }
@@ -213,17 +214,21 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
         $Observed = $null
         $ParseFailed = $false
         if ($Format -eq "json") {
-            if ($null -eq $Parsed) {
+            if (-not $ArtifactExists) {
+                # An absent artifact means every configured setting is absent, not unparseable.
+            } elseif ($null -eq $Parsed) {
                 $ParseFailed = $true
             } else {
-                $Property = $Parsed.PSObject.Properties[$Key]
-                if ($null -ne $Property) { $Present = $true; $Observed = $Property.Value }
+                if ($Parsed.Contains($Key)) {
+                    $Present = $true
+                    $Observed = $Parsed[$Key]
+                }
             }
         } elseif ($Format -eq "toml") {
             $Escaped = [Regex]::Escape($Key)
             $KeyPattern = '(?:{0}|"{0}"|''{0}'')' -f $Escaped
             $Line = $null
-            foreach ($ConfigLine in @(Get-Content -LiteralPath $ArtifactPath)) {
+            foreach ($ConfigLine in $(if ($ArtifactExists) { @(Get-Content -LiteralPath $ArtifactPath) } else { @() })) {
                 if ($ConfigLine -match '^\s*\[') { break }
                 if ($ConfigLine -match "^\s*$KeyPattern\s*=") { $Line = $ConfigLine; break }
             }
@@ -1055,6 +1060,9 @@ if (Test-Section "agents") {
                 Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "absent" -Confidence "high" -Data @{
                     id = $ArtifactId; path = Limit-Text $ArtifactPath; artifact_kind = Limit-Text $Definition.kind
                     agent_exposure = @($Definition.agents)
+                }
+                if ($null -ne $Definition.settings -and $Definition.settings.PSObject.Properties.Count -gt 0) {
+                    Add-AgentSettings $Definition $ArtifactId $ArtifactPath
                 }
             }
         }

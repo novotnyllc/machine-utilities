@@ -860,6 +860,17 @@ fi
 if grep -q 'lock-secret' "$tmp/snapshot.jsonl"; then
   fail "authenticated skills lock URL leaked into inventory"
 fi
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-absent-posix.json"
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/absent-settings-posix.jsonl"
+mv "$tmp/claude-settings-absent-posix.json" "$tmp/home/.claude/settings.json"
+"$cli" validate "$tmp/absent-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings")) | length' "$tmp/absent-settings-posix.jsonl")" -eq 4 ] ||
+  fail "absent POSIX settings artifact did not emit every configured setting"
+[ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == false and .data.in_sync == false)) | length' "$tmp/absent-settings-posix.jsonl")" -eq 1 ] ||
+  fail "absent POSIX non-null setting was not reported as drift"
+[ "$(jq -s 'map(select(.id == "claude-settings:fallbackModel" and .data.observed_present == false and .data.in_sync == true)) | length' "$tmp/absent-settings-posix.jsonl")" -eq 1 ] ||
+  fail "absent POSIX desired-null setting was not reported in sync"
 cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid.json"
 printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"}}' >"$tmp/home/.claude/settings.json"
 set +e
@@ -1225,6 +1236,27 @@ if [ -n "$pwsh_command" ]; then
   if grep -q 'must-not-leak' "$tmp/windows.jsonl"; then
     fail "Windows collector leaked an unlisted agent setting"
   fi
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-absent-windows.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/absent-settings-windows.jsonl"
+  mv "$tmp/claude-settings-absent-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/absent-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings")) | length' "$tmp/absent-settings-windows.jsonl")" -eq 4 ] ||
+    fail "absent Windows settings artifact did not emit every configured setting"
+  [ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == false and .data.in_sync == false)) | length' "$tmp/absent-settings-windows.jsonl")" -eq 1 ] ||
+    fail "absent Windows non-null setting was not reported as drift"
+  [ "$(jq -s 'map(select(.id == "claude-settings:fallbackModel" and .data.observed_present == false and .data.in_sync == true)) | length' "$tmp/absent-settings-windows.jsonl")" -eq 1 ] ||
+    fail "absent Windows desired-null setting was not reported in sync"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-case-windows.json"
+  printf '%s\n' '{"RemoteControlAtStartup":true,"remoteControlAtStartup":false}' >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/case-sensitive-settings-windows.jsonl"
+  mv "$tmp/claude-settings-case-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/case-sensitive-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == true and .data.observed == false and .data.in_sync == false)) | length' "$tmp/case-sensitive-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows JSON setting lookup did not select the exact-case key"
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid-windows.json"
   printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"}}' >"$tmp/home/.claude/settings.json"
   set +e
