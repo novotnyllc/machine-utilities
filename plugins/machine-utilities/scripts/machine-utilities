@@ -238,7 +238,8 @@ validate_config_file() {
       ((.value.verify // []) | length <= 32) and
       (if (((.value.portability // "per-machine") | IN("native-store","per-machine")) and
            ((.value.path // null) == null) and ((.value.paths // {}) | length) == 0) then
-        ((.value.verify // []) | length) > 0
+        (((.value.strategy // "ignore") | IN("reauth","ignore")) and
+         ((.value.verify // []) | length) > 0)
       else true end) and
       (if ((.value.verify // []) | length) > 0 then
         (.value.verify[0] | type == "string" and test("^[A-Za-z0-9._+-]+$")) and

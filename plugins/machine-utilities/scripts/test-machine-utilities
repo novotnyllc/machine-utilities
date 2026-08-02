@@ -161,6 +161,7 @@ cat >"$tmp/config.json" <<'JSON'
       "kind": "config",
       "format": "toml",
       "settings": {
+        "model": "fixture#model",
         "check_for_update_on_startup": true,
         "service_tier": null
       },
@@ -211,7 +212,8 @@ mkdir -p "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin
 printf '%s\n' \
   '{"remoteControlAtStartup":false,"switchModelsOnFlag":false,"model":"fixture-model","unlistedSecret":"must-not-leak"}' \
   >"$tmp/home/.claude/settings.json"
-printf '%s\n' 'check_for_update_on_startup = true' '[profile.fixture]' \
+printf '%s\n' "model = 'fixture#model' # literal TOML string" \
+  'check_for_update_on_startup = true' '[profile.fixture]' \
   'service_tier = "must-not-leak"' \
   >"$tmp/home/.codex/config.toml"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin/plugin.json"
@@ -727,6 +729,12 @@ if MACHINE_UTILITIES_CONFIG="$tmp/invalid-native-auth.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "pathless native auth accepted no verification command"
 fi
+jq 'del(.auth_artifacts["test-auth"].path) | .auth_artifacts["test-auth"].portability = "per-machine"' \
+  "$tmp/config.json" >"$tmp/invalid-pathless-encrypted-auth.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-pathless-encrypted-auth.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "pathless encrypted auth install was accepted"
+fi
 jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-windows":"~/.missing"},kind:"instruction",agents:["codex"],groups:["development"]}]' \
   "$tmp/config.json" >"$tmp/missing-agent-path.json"
 set +e
@@ -789,6 +797,8 @@ assert_contains "$json" '"id":"claude-settings:remoteControlAtStartup"'
   fail "absent Claude fallback setting was not recognized as desired"
 [ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "codex-settings:check_for_update_on_startup" and .data.in_sync == true)] | length')" -eq 1 ] ||
   fail "Codex TOML setting was not parsed"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "codex-settings:model" and .data.observed == "fixture#model" and .data.in_sync == true)] | length')" -eq 1 ] ||
+  fail "Codex literal TOML string was not parsed"
 [ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "codex-settings:service_tier" and .data.observed_present == false and .data.in_sync == true)] | length')" -eq 1 ] ||
   fail "nested TOML key was mistaken for a top-level Codex setting"
 [ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "auth_artifact" and .id == "native-test-auth" and .status == "present" and .data.type == "native-status" and .data.path == null and .data.health == "healthy")] | length')" -eq 1 ] ||
@@ -1204,6 +1214,8 @@ if [ -n "$pwsh_command" ]; then
     fail "Windows collector did not report Claude Remote Control setting drift"
   [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:check_for_update_on_startup" and .data.in_sync == true)) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
     fail "Windows collector did not parse the allowlisted Codex TOML setting"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:model" and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector did not parse the Codex literal TOML string"
   if grep -q 'must-not-leak' "$tmp/windows.jsonl"; then
     fail "Windows collector leaked an unlisted agent setting"
   fi
@@ -1369,6 +1381,13 @@ if [ -n "$pwsh_command" ]; then
     -ConfigPath "$tmp/invalid-worker-config.json" -HostId test-windows \
     -ControllerConfigDigest "$config_hash" -Sections projects >/dev/null 2>&1; then
     fail "Windows worker accepted a traversal project path"
+  fi
+  jq 'del(.auth_artifacts["test-auth"].path) | .auth_artifacts["test-auth"].portability = "per-machine"' \
+    "$tmp/windows-worker-config.json" >"$tmp/invalid-pathless-encrypted-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/invalid-pathless-encrypted-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth >/dev/null 2>&1; then
+    fail "Windows worker accepted a pathless encrypted auth install"
   fi
 fi
 

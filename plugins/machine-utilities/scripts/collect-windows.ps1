@@ -227,8 +227,18 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
                 if ($ConfigLine -match "^\s*$Escaped\s*=") { $Line = $ConfigLine; break }
             }
             if ($null -ne $Line) {
-                $Raw = ($Line -replace "^\s*$Escaped\s*=\s*", "") -replace '\s+#\s.*$', ''
-                try { $Observed = $Raw | ConvertFrom-Json; $Present = $true } catch { $ParseFailed = $true }
+                $Raw = $Line -replace "^\s*$Escaped\s*=\s*", ""
+                if ($Raw -match "^\s*'([^']*)'\s*(?:#.*)?$") {
+                    $Observed = $Matches[1]
+                    $Present = $true
+                } elseif ($Raw -match '^\s*(?<value>"(?:[^"\\]|\\.)*")\s*(?:#.*)?$') {
+                    try { $Observed = $Matches.value | ConvertFrom-Json; $Present = $true } catch { $ParseFailed = $true }
+                } elseif ($Raw -match '^\s*(?<value>true|false)\s*(?:#.*)?$') {
+                    $Observed = $Matches.value -eq "true"
+                    $Present = $true
+                } else {
+                    $ParseFailed = $true
+                }
             }
         }
         if ($Present -and -not (Test-AgentSettingValue $Key $Observed)) {
@@ -432,6 +442,7 @@ function Assert-WorkerConfig([object]$Value) {
                 @("chezmoi", "encrypted-install", "reauth", "ignore") -notcontains $Strategy -or
                 @("declarative", "secret-reference", "portable-session", "native-store", "per-machine", "regenerable-cache") -notcontains $Portability -or
                 $Verify.Count -gt 32 -or
+                ($PathlessAuthStatus -and $Strategy -notin @("reauth", "ignore")) -or
                 ($PathlessAuthStatus -and $Verify.Count -eq 0) -or
                 ($Verify.Count -gt 0 -and [string]$Verify[0] -notmatch '^[A-Za-z0-9._+-]+$')) {
                 throw "Invalid auth artifact configuration"
