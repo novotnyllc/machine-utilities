@@ -1059,9 +1059,14 @@ seal_plan_command() {
         .id as $id |
         (($config.auth_artifacts[$id].path // null) != null or
          ($config.auth_artifacts[$id].paths[$target] // null) != null)
+      elif .type == "auth-reauth" then
+        . as $operation |
+        .id as $id |
+        ($config.auth_artifacts[$id].strategy == "reauth") and
+        ($config.auth_artifacts[$id].reauth == $operation.argv)
       else true end)
   ' "$config" >/dev/null || {
-    printf 'machine-utilities: auth install has no configured path for target %s\n' "$target" >&2
+    printf 'machine-utilities: auth operation is not configured for target %s\n' "$target" >&2
     exit 65
   }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")

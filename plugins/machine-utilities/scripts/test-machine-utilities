@@ -748,6 +748,10 @@ if MACHINE_UTILITIES_CONFIG="$tmp/invalid-pathless-encrypted-auth.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "pathless encrypted auth install was accepted"
 fi
+jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
+  "$tmp/config.json" >"$tmp/ignore-native-auth.json"
+chmod 600 "$tmp/ignore-native-auth.json"
+MACHINE_UTILITIES_CONFIG="$tmp/ignore-native-auth.json" "$cli" validate-config
 jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-windows":"~/.missing"},kind:"config",format:"json",settings:{fallbackModel:null,model:"fixture-model"},agents:["claude"],groups:["development"]}]' \
   "$tmp/config.json" >"$tmp/missing-agent-path.json"
 set +e
@@ -1013,6 +1017,20 @@ set -e
   fail "unhealthy required auth did not make the POSIX capability unavailable"
 [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "unhealthy" and .ready == false)] | length' "$tmp/unhealthy-capability-auth-posix.jsonl")" -eq 1 ] ||
   fail "POSIX capability did not report unhealthy auth dependency state"
+
+set +e
+AUTH_CHECK_FAIL=1 MACHINE_UTILITIES_CONFIG="$tmp/ignore-native-auth.json" \
+  "$cli" collect --target test-host --section auth --output "$tmp/ignore-unhealthy-auth-posix.jsonl"
+ignore_unhealthy_auth_rc=$?
+set -e
+[ "$ignore_unhealthy_auth_rc" -eq 2 ] ||
+  fail "unhealthy ignored POSIX auth did not remain report-only"
+"$cli" validate "$tmp/ignore-unhealthy-auth-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "auth_artifact" and .id == "native-test-auth" and
+  .status == "partial" and .data.strategy == "ignore" and .data.health == "unhealthy" and
+  .data.reauth_required == false and .data.manual_action == null)) | length' \
+  "$tmp/ignore-unhealthy-auth-posix.jsonl")" -eq 1 ] ||
+  fail "unhealthy ignored POSIX auth emitted actionable reauthentication state"
 
 mv "$tmp/home/.agents/agents/example.md" "$tmp/missing-agent-definition"
 set +e
@@ -1521,6 +1539,19 @@ if [ -n "$pwsh_command" ]; then
   [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "unhealthy" and .ready == false)] | length' "$tmp/unhealthy-capability-auth-windows.jsonl")" -eq 1 ] ||
     fail "Windows capability did not report unhealthy auth dependency state"
 
+  jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
+    "$tmp/windows-worker-config.json" >"$tmp/ignore-native-auth-windows.json"
+  AUTH_CHECK_FAIL=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/ignore-native-auth-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth -AllowAuthVerify \
+    >"$tmp/ignore-unhealthy-auth-windows.jsonl"
+  "$cli" validate "$tmp/ignore-unhealthy-auth-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "auth_artifact" and .id == "native-test-auth" and
+    .status == "partial" and .data.strategy == "ignore" and .data.health == "unhealthy" and
+    .data.reauth_required == false and .data.manual_action == null)) | length' \
+    "$tmp/ignore-unhealthy-auth-windows.jsonl")" -eq 1 ] ||
+    fail "unhealthy ignored Windows auth emitted actionable reauthentication state"
+
   mv "$tmp/home/.agents/agents/example.md" "$tmp/missing-agent-definition-windows"
   HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
@@ -1644,6 +1675,38 @@ if [ -n "$pwsh_command" ]; then
     fail "Windows worker accepted a reauth strategy without a command"
   fi
 fi
+
+AUTH_CHECK_FAIL=1 "$cli" collect --target test-host --section auth \
+  --output "$tmp/reauth-required-auth-posix.jsonl"
+"$cli" validate "$tmp/reauth-required-auth-posix.jsonl"
+cat >"$tmp/reauth-plan-draft.json" <<'JSON'
+{
+  "domain": "auth",
+  "target": "test-host",
+  "operations": [{
+    "type": "auth-reauth",
+    "kind": "auth_artifact",
+    "id": "native-test-auth",
+    "argv": ["auth-check", "login"]
+  }]
+}
+JSON
+if MACHINE_UTILITIES_CONFIG="$tmp/ignore-native-auth.json" \
+  "$cli" seal-plan "$tmp/reauth-plan-draft.json" "$tmp/reauth-required-auth-posix.jsonl" \
+  "$tmp/ignored-reauth-plan.json" >/dev/null 2>&1; then
+  fail "seal-plan accepted reauthentication for an ignored auth artifact"
+fi
+jq '.operations[0].argv += ["--unexpected"]' "$tmp/reauth-plan-draft.json" \
+  >"$tmp/mismatched-reauth-plan-draft.json"
+if "$cli" seal-plan "$tmp/mismatched-reauth-plan-draft.json" \
+  "$tmp/reauth-required-auth-posix.jsonl" "$tmp/mismatched-reauth-plan.json" \
+  >/dev/null 2>&1; then
+  fail "seal-plan accepted a reauthentication command that did not match configuration"
+fi
+"$cli" seal-plan "$tmp/reauth-plan-draft.json" "$tmp/reauth-required-auth-posix.jsonl" \
+  "$tmp/reauth-plan.json"
+[ "$(jq -r '.operations[0].type' "$tmp/reauth-plan.json")" = auth-reauth ] ||
+  fail "seal-plan rejected a configured reauthentication operation"
 
 cat >"$tmp/plan-draft.json" <<JSON
 {

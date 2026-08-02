@@ -1193,7 +1193,7 @@ if (Test-Section "auth") {
             $Path = Resolve-UserPath $ConfiguredPath
             if ([string]::IsNullOrWhiteSpace($Path) -and $Portability -in @("native-store", "per-machine")) {
                 $Health = Get-AuthHealth $Definition
-                $ReauthRequired = $Health.health -eq "unhealthy"
+                $ReauthRequired = $Strategy -ceq "reauth" -and $Health.health -eq "unhealthy"
                 Add-Record -Kind "auth_artifact" -Id $Name -Status $(if ($Health.health -eq "healthy") { "present" } elseif ($ReauthRequired) { "absent" } else { "partial" }) -Confidence "high" -Data @{
                     tool = $Name; path = $null; strategy = $Strategy; portability = $Portability
                     type = "native-status"; health = $Health.health; verify_exit_code = $Health.verify_exit_code

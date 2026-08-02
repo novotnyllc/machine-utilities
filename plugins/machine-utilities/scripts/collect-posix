@@ -1024,7 +1024,15 @@ if has_section auth; then
       run_auth_health "$entry"
       case $auth_health_status in
         healthy) auth_status=present; reauth_required=false ;;
-        unhealthy) auth_status=absent; reauth_required=true ;;
+        unhealthy)
+          if [ "$strategy" = reauth ]; then
+            auth_status=absent
+            reauth_required=true
+          else
+            auth_status=partial
+            reauth_required=false
+          fi
+          ;;
         *) auth_status=partial; reauth_required=false ;;
       esac
       data=$(jq -cn --arg tool "$name" --arg strategy "$strategy" --arg portability "$portability" \
