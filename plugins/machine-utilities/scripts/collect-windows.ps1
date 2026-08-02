@@ -230,17 +230,17 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
             $Line = $null
             foreach ($ConfigLine in $(if ($ArtifactExists) { @(Get-Content -LiteralPath $ArtifactPath) } else { @() })) {
                 if ($ConfigLine -match '^\s*\[') { break }
-                if ($ConfigLine -match "^\s*$KeyPattern\s*=") { $Line = $ConfigLine; break }
+                if ($ConfigLine -cmatch "^\s*$KeyPattern\s*=") { $Line = $ConfigLine; break }
             }
             if ($null -ne $Line) {
-                $Raw = $Line -replace "^\s*$KeyPattern\s*=\s*", ""
+                $Raw = $Line -creplace "^\s*$KeyPattern\s*=\s*", ""
                 if ($Raw -match "^\s*'([^']*)'\s*(?:#.*)?$") {
                     $Observed = $Matches[1]
                     $Present = $true
                 } elseif ($Raw -match '^\s*(?<value>"(?:[^"\\]|\\.)*")\s*(?:#.*)?$') {
                     try { $Observed = $Matches.value | ConvertFrom-Json; $Present = $true } catch { $ParseFailed = $true }
-                } elseif ($Raw -match '^\s*(?<value>true|false)\s*(?:#.*)?$') {
-                    $Observed = $Matches.value -eq "true"
+                } elseif ($Raw -cmatch '^\s*(?<value>true|false)\s*(?:#.*)?$') {
+                    $Observed = $Matches.value -ceq "true"
                     $Present = $true
                 } else {
                     $ParseFailed = $true

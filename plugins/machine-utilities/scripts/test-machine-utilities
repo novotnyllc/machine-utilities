@@ -1257,6 +1257,18 @@ if [ -n "$pwsh_command" ]; then
   "$cli" validate "$tmp/case-sensitive-settings-windows.jsonl"
   [ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == true and .data.observed == false and .data.in_sync == false)) | length' "$tmp/case-sensitive-settings-windows.jsonl")" -eq 1 ] ||
     fail "Windows JSON setting lookup did not select the exact-case key"
+  cp -p "$tmp/home/.codex/config.toml" "$tmp/codex-settings-case-windows.toml"
+  printf '%s\n' "Model = 'wrong-case'" "model = 'fixture#model'" \
+    'check_for_update_on_startup = True' >"$tmp/home/.codex/config.toml"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/case-sensitive-toml-settings-windows.jsonl"
+  mv "$tmp/codex-settings-case-windows.toml" "$tmp/home/.codex/config.toml"
+  "$cli" validate "$tmp/case-sensitive-toml-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.id == "codex-settings:model" and .data.observed_present == true and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/case-sensitive-toml-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows TOML setting lookup did not select the exact-case key"
+  [ "$(jq -s 'map(select(.id == "codex-settings:check_for_update_on_startup" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/case-sensitive-toml-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows TOML parser accepted a mixed-case boolean literal"
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid-windows.json"
   printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"}}' >"$tmp/home/.claude/settings.json"
   set +e
