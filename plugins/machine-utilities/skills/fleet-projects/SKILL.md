@@ -50,3 +50,12 @@ the controller-observed status in canonical JSONL. Direct Windows task creation 
 Cross-host handoff requires matching saved-project repository identity at both
 ends; creating a remote task directly only requires the destination saved
 project.
+
+Use each project's own Git repository and exact commit as the authoritative
+handoff substrate for project work. A separately configured private
+coordination repository may hold structured pointers, ownership, status, and
+evidence for machine-wide or cross-repository handoffs. One coordination
+repository can cover the fleet; it must not copy project source, replace the
+project repository, or depend on an unrelated utility checkout. Treat it like
+any other configured project: clone it into each host's `dev_root` and register
+it as a saved Codex project only where coordination tasks will run.

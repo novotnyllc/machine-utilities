@@ -322,6 +322,13 @@ saved-project worktree on the destination. Ordinary in-thread subagents are
 different: they inherit the parent task's working directory and selected
 environments and cannot independently select a new host.
 
+The project repository and exact commit are authoritative for project handoff.
+A single private coordination repository may record pointers, ownership,
+status, and evidence across the fleet and across projects, but it does not copy
+project source or replace those repositories. Configure it as an ordinary
+project on hosts that run coordination tasks; never substitute an unrelated
+utility checkout as a control project.
+
 Do not edit Codex Desktop's internal SQLite, LevelDB, or path-keyed trust config
 to simulate registration. Audit registration and use a supported Desktop/API
 action when one is exposed; otherwise report the one remaining UI action.

@@ -70,6 +70,12 @@ The controller does not need a local copy of the remote path. Task creation
 uses the saved remote project. Cross-host handoff is separate and requires the
 same repository to be saved on both source and destination hosts.
 
+Project work is handed off through that project's Git repository and exact
+commit. An optional private coordination repository may track pointers and
+status across projects, but it does not replace their repositories or provide
+their working trees. Never use an unrelated development checkout as the
+control project merely because it already exists on the destination.
+
 The native Windows saved-project workflow was exercised on 2026-07-30 with
 small byte-for-byte payloads and a 323-record inventory split and exactly
 reassembled at record boundaries. Revalidate the protocol if the Desktop task
