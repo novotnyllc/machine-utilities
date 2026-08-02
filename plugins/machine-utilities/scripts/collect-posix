@@ -296,13 +296,16 @@ emit_agent_settings() {
     esac
     if [ "$parsed" = true ] && [ "$present" = true ] &&
       ! printf '%s' "$observed" | jq -e --arg key "$key" '
-        if $key | IN("remoteControlAtStartup","switchModelsOnFlag","agentPushNotifEnabled",
+        ([.. | strings |
+          length <= 8192 and (test("[[:cntrl:]]") | not)
+        ] | all) and (tojson | utf8bytelength <= 8192) and
+        (if $key | IN("remoteControlAtStartup","switchModelsOnFlag","agentPushNotifEnabled",
             "check_for_update_on_startup") then type == "boolean"
         elif $key == "availableModels" then
           type == "array" and ([.[] | type == "string" and length > 0] | all)
         elif $key == "autoUpdatesChannel" then IN("latest","stable")
         elif $key == "cli_auth_credentials_store" then IN("file","keyring","auto")
-        else type == "string" and length > 0 end
+        else type == "string" and length > 0 end)
       ' >/dev/null; then
       parsed=false
       observed=null

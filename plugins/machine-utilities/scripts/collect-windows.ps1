@@ -247,7 +247,8 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
                 }
             }
         }
-        if ($Present -and -not (Test-AgentSettingValue $Key $Observed)) {
+        if ($Present -and
+            (-not (Test-AgentSettingValue $Key $Observed) -or -not (Test-BoundedSemanticValue $Observed))) {
             $ParseFailed = $true
             $Observed = $null
         }
@@ -295,17 +296,44 @@ function Test-BoundedStrings([object]$Value) {
     return $true
 }
 
+function Test-BoundedSemanticValue([object]$Value) {
+    if (-not (Test-BoundedStrings $Value)) { return $false }
+    try {
+        $Json = ConvertTo-Json $Value -Compress -Depth 20
+        return [Text.Encoding]::UTF8.GetByteCount($Json) -le 8192
+    } catch {
+        return $false
+    }
+}
+
+function Get-ExactPropertyValue([object]$Value, [string]$Name) {
+    if ($null -eq $Value) { return $null }
+    $Property = $Value.PSObject.Properties | Where-Object { $_.Name -ceq $Name } | Select-Object -First 1
+    if ($null -eq $Property) { return $null }
+    return $Property.Value
+}
+
+function Test-ExactMember([object[]]$Values, [object]$Value) {
+    return @($Values | Where-Object { [string]$_ -ceq [string]$Value }).Count -gt 0
+}
+
+function Get-ConfiguredPath([object]$Definition, [string]$ConfiguredHostId) {
+    $HostPath = Get-ExactPropertyValue $Definition.paths $ConfiguredHostId
+    if ($null -ne $HostPath) { return [string]$HostPath }
+    return [string]$Definition.path
+}
+
 function Assert-WorkerConfig([object]$Value) {
-    if ($HostId -notmatch '^[A-Za-z0-9._-]+$' -or $Value.version -ne 1 -or $null -eq $Value.machines.$HostId) {
+    $ConfiguredMachine = Get-ExactPropertyValue $Value.machines $HostId
+    if ($HostId -notmatch '^[A-Za-z0-9._-]+$' -or $Value.version -ne 1 -or $null -eq $ConfiguredMachine) {
         throw "Invalid version 1 configuration or unknown host"
     }
     if (-not (Test-BoundedStrings $Value)) { throw "Configuration contains an oversized or control string" }
     if ($null -eq $Value.worker -or
-        [string]$Value.worker.target -ne $HostId -or
+        [string]$Value.worker.target -cne $HostId -or
         [string]$Value.worker.controller_configuration_digest -ne $ControllerConfigDigest.ToLowerInvariant()) {
         throw "Worker configuration is not bound to this controller and target"
     }
-    $ConfiguredMachine = $Value.machines.$HostId
     if ($ConfiguredMachine.platform -ne "windows" -or
         $ConfiguredMachine.transport -ne "codex-remote-control" -or
         [string]::IsNullOrWhiteSpace([string]$ConfiguredMachine.codex_host)) {
@@ -345,7 +373,7 @@ function Assert-WorkerConfig([object]$Value) {
             if ($Property.Name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') { throw "Invalid capability configuration" }
             $ProviderCount = 0
             foreach ($Agent in @("codex", "claude")) {
-                $Definition = $Property.Value.$Agent
+                $Definition = Get-ExactPropertyValue $Property.Value $Agent
                 if ($null -eq $Definition) { continue }
                 $ProviderCount++
                 if (@("plugin", "skills-cli", "jsm", "manual", "plugin-source") -notcontains [string]$Definition.provider -or
@@ -411,6 +439,9 @@ function Assert-WorkerConfig([object]$Value) {
                 } else {
                     $InvalidSettingValue = $Setting.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Setting.Value)
                 }
+                if (-not $InvalidSettingValue -and -not (Test-BoundedSemanticValue $Setting.Value)) {
+                    $InvalidSettingValue = $true
+                }
                 if ($InvalidSettingValue) { break }
             }
             if ([string]$Definition.id -notmatch '^[A-Za-z0-9._-]+$' -or
@@ -474,7 +505,7 @@ if (($ConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
 }
 $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 Assert-WorkerConfig $Config
-$Machine = $Config.machines.$HostId
+$Machine = Get-ExactPropertyValue $Config.machines $HostId
 $HostGroups = @($Machine.groups)
 $AllowedSections = @("all", "host", "packages", "agents", "auth", "projects", "startup", "chezmoi")
 if (@($Sections | Where-Object { $AllowedSections -notcontains $_ }).Count -gt 0) {
@@ -503,7 +534,7 @@ if (Test-Section "host") {
 }
 
 if (Test-Section "packages") {
-    $Managers = @($Config.machines.$HostId.package_managers)
+    $Managers = @($Machine.package_managers)
     if ($Managers -contains "winget") {
         $Winget = Get-Command winget -ErrorAction SilentlyContinue
         if ($null -eq $Winget) {
@@ -800,11 +831,11 @@ if (Test-Section "agents") {
     if ($null -ne $Config.capabilities) {
         foreach ($Property in $Config.capabilities.PSObject.Properties) {
             $Groups = @($Property.Value.groups)
-            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { $HostGroups -contains $_ }).Count -eq 0) { continue }
+            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { Test-ExactMember $HostGroups $_ }).Count -eq 0) { continue }
             $Name = Limit-Text $Property.Name
             $Providers = @()
             foreach ($Agent in @("codex", "claude")) {
-                $Definition = $Property.Value.$Agent
+                $Definition = Get-ExactPropertyValue $Property.Value $Agent
                 if ($null -eq $Definition) { continue }
                 $Provider = Limit-Text $Definition.provider
                 $Source = Get-SafeRemote ([string]$Definition.source)
@@ -821,33 +852,33 @@ if (Test-Section "agents") {
                         $PluginName = Split-Path ([string]$Definition.source) -Leaf
                         foreach ($ActivePlugin in @($ActivePluginsByAgent[$Agent])) {
                             if ([bool]$ActivePlugin.enabled -and
-                                ($ActivePlugin.name -eq $PluginName -or
-                                $ActivePlugin.manager_id -eq [string]$Definition.source)) {
+                                ($ActivePlugin.name -ceq $PluginName -or
+                                $ActivePlugin.manager_id -ceq [string]$Definition.source)) {
                                 $Matches += "plugin:$Agent`:$($ActivePlugin.marketplace):$($ActivePlugin.name):$($ActivePlugin.installed_version)"
                             }
                         }
                     }
                     "skills-cli" {
                         foreach ($Entry in $SkillLockEntries) {
-                            if ($Entry.Name -eq $ExpectedName -or
-                                [string]$Entry.Value.source -eq [string]$Definition.source -or
-                                [string]$Entry.Value.sourceUrl -eq [string]$Definition.source) {
+                            if ($Entry.Name -ceq $ExpectedName -or
+                                [string]$Entry.Value.source -ceq [string]$Definition.source -or
+                                [string]$Entry.Value.sourceUrl -ceq [string]$Definition.source) {
                                 $Matches += "skills-cli:$($Entry.Name)"
                             }
                         }
                     }
                     "jsm" {
                         foreach ($Skill in @($JsmInventory.skills)) {
-                            if ($Skill.name -eq $ExpectedName -or $Skill.name -eq [string]$Definition.source) {
+                            if ($Skill.name -ceq $ExpectedName -or $Skill.name -ceq [string]$Definition.source) {
                                 $Matches += "jsm:$($Skill.name)"
                             }
                         }
                     }
                     { $_ -in @("manual", "plugin-source") } {
                         foreach ($Root in @($Config.skill_roots)) {
-                            if (@($Root.agents) -notcontains $Agent) { continue }
+                            if (-not (Test-ExactMember @($Root.agents) $Agent)) { continue }
                             $RootGroups = @($Root.groups)
-                            if ($RootGroups.Count -gt 0 -and @($RootGroups | Where-Object { $HostGroups -contains $_ }).Count -eq 0) { continue }
+                            if ($RootGroups.Count -gt 0 -and @($RootGroups | Where-Object { Test-ExactMember $HostGroups $_ }).Count -eq 0) { continue }
                             $SkillPath = Join-Path (Resolve-UserPath ([string]$Root.path)) $ExpectedName
                             if (Test-Path -LiteralPath (Join-Path $SkillPath "SKILL.md") -PathType Leaf) {
                                 $Matches += "standalone:$($Root.id):$ExpectedName"
@@ -875,17 +906,12 @@ if (Test-Section "agents") {
                 $DependencyStatus = "unconfigured"
                 $DependencyReady = $false
                 $AuthDefinition = if ($null -ne $Config.auth_artifacts) {
-                    $Config.auth_artifacts.PSObject.Properties[$RequiredAuth].Value
+                    Get-ExactPropertyValue $Config.auth_artifacts $RequiredAuth
                 } else {
                     $null
                 }
                 if ($null -ne $AuthDefinition) {
-                    $ConfiguredPath = if ($null -ne $AuthDefinition.paths -and
-                        $null -ne $AuthDefinition.paths.PSObject.Properties[$HostId]) {
-                        [string]$AuthDefinition.paths.PSObject.Properties[$HostId].Value
-                    } else {
-                        [string]$AuthDefinition.path
-                    }
+                    $ConfiguredPath = Get-ConfiguredPath $AuthDefinition $HostId
                     $DependencyPath = Resolve-UserPath $ConfiguredPath
                     $Portability = if ($null -eq $AuthDefinition.portability) { "per-machine" } else { [string]$AuthDefinition.portability }
                     if ([string]::IsNullOrWhiteSpace($DependencyPath) -and $Portability -in @("native-store", "per-machine")) {
@@ -916,14 +942,11 @@ if (Test-Section "agents") {
                 $DependencyStatus = "unconfigured"
                 $DependencyReady = $false
                 $ArtifactDefinition = @($Config.agent_artifacts | Where-Object {
-                    $_.id -eq $RequiredArtifact -and
-                    (@($_.groups).Count -eq 0 -or @($_.groups | Where-Object { $HostGroups -contains $_ }).Count -gt 0)
+                    $_.id -ceq $RequiredArtifact -and
+                    (@($_.groups).Count -eq 0 -or @($_.groups | Where-Object { Test-ExactMember $HostGroups $_ }).Count -gt 0)
                 } | Select-Object -First 1)
                 if ($ArtifactDefinition.Count -gt 0) {
-                    $ConfiguredArtifactPath = if ($null -ne $ArtifactDefinition[0].paths -and
-                        $null -ne $ArtifactDefinition[0].paths.PSObject.Properties[$HostId]) {
-                        [string]$ArtifactDefinition[0].paths.PSObject.Properties[$HostId].Value
-                    } else { [string]$ArtifactDefinition[0].path }
+                    $ConfiguredArtifactPath = Get-ConfiguredPath $ArtifactDefinition[0] $HostId
                     $ArtifactPath = Resolve-UserPath $ConfiguredArtifactPath
                     if ([string]::IsNullOrWhiteSpace($ArtifactPath)) {
                         $DependencyStatus = "unavailable"
@@ -974,7 +997,7 @@ if (Test-Section "agents") {
     if ($null -ne $Config.skill_roots) {
         foreach ($Definition in @($Config.skill_roots)) {
             $Groups = @($Definition.groups)
-            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { $HostGroups -contains $_ }).Count -eq 0) { continue }
+            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { Test-ExactMember $HostGroups $_ }).Count -eq 0) { continue }
             $RootId = Limit-Text $Definition.id
             $RootPath = Resolve-UserPath ([string]$Definition.path)
             if (-not (Test-Path -LiteralPath $RootPath -PathType Container)) {
@@ -1019,11 +1042,9 @@ if (Test-Section "agents") {
     if ($null -ne $Config.agent_artifacts) {
         foreach ($Definition in @($Config.agent_artifacts)) {
             $Groups = @($Definition.groups)
-            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { $HostGroups -contains $_ }).Count -eq 0) { continue }
+            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { Test-ExactMember $HostGroups $_ }).Count -eq 0) { continue }
             $ArtifactId = Limit-Text $Definition.id
-            $ConfiguredArtifactPath = if ($null -ne $Definition.paths -and $null -ne $Definition.paths.$HostId) {
-                [string]$Definition.paths.$HostId
-            } else { [string]$Definition.path }
+            $ConfiguredArtifactPath = Get-ConfiguredPath $Definition $HostId
             $ArtifactPath = Resolve-UserPath $ConfiguredArtifactPath
             if ([string]::IsNullOrWhiteSpace($ArtifactPath)) {
                 Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "unavailable" -Confidence "high" -Data @{
@@ -1156,11 +1177,7 @@ if (Test-Section "auth") {
             $Definition = $Property.Value
             $Strategy = if ($null -eq $Definition.strategy) { "ignore" } else { Limit-Text $Definition.strategy }
             $Portability = if ($null -eq $Definition.portability) { "per-machine" } else { Limit-Text $Definition.portability }
-            $ConfiguredPath = if ($null -ne $Definition.paths -and $null -ne $Definition.paths.$HostId) {
-                [string]$Definition.paths.$HostId
-            } else {
-                [string]$Definition.path
-            }
+            $ConfiguredPath = Get-ConfiguredPath $Definition $HostId
             $Path = Resolve-UserPath $ConfiguredPath
             if ([string]::IsNullOrWhiteSpace($Path) -and $Portability -in @("native-store", "per-machine")) {
                 $Health = Get-AuthHealth $Definition
@@ -1250,7 +1267,7 @@ if (Test-Section "auth") {
 }
 
 if (Test-Section "projects") {
-    $DevRoot = Resolve-UserPath ([string]$Config.machines.$HostId.dev_root)
+    $DevRoot = Resolve-UserPath ([string]$Machine.dev_root)
     if ([string]::IsNullOrWhiteSpace($DevRoot)) {
         Add-Record -Kind "error" -Id "projects:dev-root" -Status "unavailable" -Confidence "high" -Errors @(
             @{ code = "dev_root_missing"; severity = "error"; retryable = $false; message = "project inventory requires a configured dev_root" }
@@ -1259,7 +1276,7 @@ if (Test-Section "projects") {
         foreach ($Property in $Config.projects.PSObject.Properties) {
             $Definition = $Property.Value
             $Groups = @($Definition.groups)
-            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { $HostGroups -contains $_ }).Count -eq 0) { continue }
+            if ($Groups.Count -gt 0 -and @($Groups | Where-Object { Test-ExactMember $HostGroups $_ }).Count -eq 0) { continue }
             $Name = Limit-Text $Property.Name
             $Path = Join-Path $DevRoot ([string]$Definition.path)
             if (Test-Path -LiteralPath $Path -PathType Container) {

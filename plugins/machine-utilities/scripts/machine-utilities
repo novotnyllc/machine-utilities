@@ -197,8 +197,9 @@ validate_config_file() {
             (.key | IN("model","model_reasoning_effort","service_tier",
               "check_for_update_on_startup","cli_auth_credentials_store")))) and
           (. as $setting |
-            ($setting.value == null) or
-            (if $setting.key | IN("remoteControlAtStartup","switchModelsOnFlag",
+            ($setting.value | tojson | utf8bytelength <= 8192) and
+            (($setting.value == null) or
+             (if $setting.key | IN("remoteControlAtStartup","switchModelsOnFlag",
                 "agentPushNotifEnabled","check_for_update_on_startup") then
                ($setting.value | type == "boolean")
              elif $setting.key == "availableModels" then
@@ -208,7 +209,7 @@ validate_config_file() {
                ($setting.value | IN("latest","stable"))
              elif $setting.key == "cli_auth_credentials_store" then
                ($setting.value | IN("file","keyring","auto"))
-             else ($setting.value | type == "string" and length > 0) end))
+              else ($setting.value | type == "string" and length > 0) end)))
         ] | all)
       else ((.format // null) == null or (.format | IN("json","toml"))) end)
     ] | all) and
