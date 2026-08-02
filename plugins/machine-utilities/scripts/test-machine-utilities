@@ -898,6 +898,34 @@ fi
 if grep -q 'nested-observed-secret' "$tmp/invalid-observed-setting-posix.jsonl"; then
   fail "nested data under an allowlisted POSIX setting leaked into inventory"
 fi
+cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-single-document-posix.json"
+printf '%s\n' '{"model":"fixture-model"}' '{"model":"fixture-model"}' \
+  >"$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/multi-document-settings-posix.jsonl"
+multi_document_settings_posix_rc=$?
+set -e
+mv "$tmp/claude-settings-single-document-posix.json" "$tmp/home/.claude/settings.json"
+[ "$multi_document_settings_posix_rc" -eq 2 ] || fail "multi-document POSIX settings were not partial"
+"$cli" validate "$tmp/multi-document-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/multi-document-settings-posix.jsonl")" -eq 5 ] ||
+  fail "multi-document POSIX JSON dropped configured setting records"
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-posix.json"
+mkdir "$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/directory-settings-posix.jsonl"
+directory_settings_posix_rc=$?
+set -e
+rmdir "$tmp/home/.claude/settings.json"
+mv "$tmp/claude-settings-file-posix.json" "$tmp/home/.claude/settings.json"
+[ "$directory_settings_posix_rc" -eq 2 ] || fail "directory POSIX settings artifact was not partial"
+"$cli" validate "$tmp/directory-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "present" and .data.digest.scope == "directory-files")) | length' "$tmp/directory-settings-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX settings directory artifact type was not reported truthfully"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/directory-settings-posix.jsonl")" -eq 5 ] ||
+  fail "POSIX settings directory dropped configured setting records"
 oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
 cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-posix.json"
 jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
@@ -1334,6 +1362,28 @@ if [ -n "$pwsh_command" ]; then
   if grep -q 'nested-observed-secret' "$tmp/invalid-observed-setting-windows.jsonl"; then
     fail "nested data under an allowlisted Windows setting leaked into inventory"
   fi
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-single-document-windows.json"
+  printf '%s\n' '{"model":"fixture-model"}' '{"model":"fixture-model"}' \
+    >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/multi-document-settings-windows.jsonl"
+  mv "$tmp/claude-settings-single-document-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/multi-document-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/multi-document-settings-windows.jsonl")" -eq 5 ] ||
+    fail "multi-document Windows JSON dropped configured setting records"
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-windows.json"
+  mkdir "$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/directory-settings-windows.jsonl"
+  rmdir "$tmp/home/.claude/settings.json"
+  mv "$tmp/claude-settings-file-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/directory-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "present" and .data.digest.scope == "directory-files")) | length' "$tmp/directory-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows settings directory artifact type was not reported truthfully"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/directory-settings-windows.jsonl")" -eq 5 ] ||
+    fail "Windows settings directory dropped configured setting records"
   cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-windows.json"
   jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
     >"$tmp/home/.claude/settings.json"

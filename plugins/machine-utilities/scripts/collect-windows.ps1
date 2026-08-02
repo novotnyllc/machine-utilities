@@ -199,9 +199,10 @@ function Test-AgentSettingValue([string]$Key, [object]$Value) {
 
 function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$ArtifactPath) {
     $Format = [string]$Definition.format
-    $ArtifactExists = Test-Path -LiteralPath $ArtifactPath -PathType Leaf
+    $ArtifactExists = Test-Path -LiteralPath $ArtifactPath
+    $ArtifactIsFile = Test-Path -LiteralPath $ArtifactPath -PathType Leaf
     $Parsed = $null
-    if ($Format -eq "json" -and $ArtifactExists) {
+    if ($Format -eq "json" -and $ArtifactIsFile) {
         try { $Parsed = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate } catch { $Parsed = $null }
         if ($null -eq $Parsed -or $Parsed -isnot [Collections.IDictionary]) {
             $Parsed = $null
@@ -212,7 +213,7 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
         $Desired = $Setting.Value
         $Present = $false
         $Observed = $null
-        $ParseFailed = $false
+        $ParseFailed = $ArtifactExists -and -not $ArtifactIsFile
         if ($Format -eq "json") {
             if (-not $ArtifactExists) {
                 # An absent artifact means every configured setting is absent, not unparseable.
@@ -228,7 +229,7 @@ function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$Ar
             $Escaped = [Regex]::Escape($Key)
             $KeyPattern = '(?:{0}|"{0}"|''{0}'')' -f $Escaped
             $Line = $null
-            foreach ($ConfigLine in $(if ($ArtifactExists) { @(Get-Content -LiteralPath $ArtifactPath) } else { @() })) {
+            foreach ($ConfigLine in $(if ($ArtifactIsFile) { @(Get-Content -LiteralPath $ArtifactPath) } else { @() })) {
                 if ($ConfigLine -match '^\s*\[') { break }
                 if ($ConfigLine -cmatch "^\s*$KeyPattern\s*=") { $Line = $ConfigLine; break }
             }
@@ -1072,7 +1073,7 @@ if (Test-Section "agents") {
                         updated_at = $Item.LastWriteTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
                         digest = @{ algorithm = "sha256"; value = $Digest; scope = $(if ($Item.PSIsContainer) { "directory-files" } else { "raw-bytes" }) }
                     } -Evidence @(@{ source = "filesystem"; method = "configured-agent-artifact+sha256" })
-                    if (-not $Item.PSIsContainer -and $null -ne $Definition.settings -and
+                    if ($null -ne $Definition.settings -and
                         $Definition.settings.PSObject.Properties.Count -gt 0) {
                         Add-AgentSettings $Definition $ArtifactId $ArtifactPath
                     }

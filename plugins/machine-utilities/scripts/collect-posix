@@ -236,6 +236,15 @@ emit_agent_settings() {
   artifact_path=$3
   artifact_format=$4
   artifact_agents=$5
+  parsed_json=
+  parsed_json_valid=true
+  if [ "$artifact_format" = json ] && [ -e "$artifact_path" ]; then
+    if [ -d "$artifact_path" ] ||
+      ! parsed_json=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected one object") end' \
+        "$artifact_path" 2>/dev/null); then
+      parsed_json_valid=false
+    fi
+  fi
   printf '%s' "$artifact" | jq -c '.settings // {} | to_entries[]' | while IFS= read -r setting; do
     key=$(printf '%s' "$setting" | jq -r '.key' | clip)
     desired=$(printf '%s' "$setting" | jq -c '.value')
@@ -246,16 +255,18 @@ emit_agent_settings() {
       json)
         if [ ! -e "$artifact_path" ]; then
           :
-        elif ! jq -e 'type == "object"' "$artifact_path" >/dev/null 2>&1; then
+        elif [ "$parsed_json_valid" != true ]; then
           parsed=false
-        elif jq -e --arg key "$key" 'has($key)' "$artifact_path" >/dev/null; then
+        elif printf '%s' "$parsed_json" | jq -e --arg key "$key" 'has($key)' >/dev/null; then
           present=true
-          observed=$(jq -c --arg key "$key" '.[$key]' "$artifact_path")
+          observed=$(printf '%s' "$parsed_json" | jq -c --arg key "$key" '.[$key]')
         fi
         ;;
       toml)
         raw=
-        if [ -e "$artifact_path" ]; then
+        if [ -d "$artifact_path" ]; then
+          parsed=false
+        elif [ -e "$artifact_path" ]; then
           raw=$(awk -v key="$key" '
           BEGIN { key_pattern = "(\"" key "\"|\047" key "\047|" key ")" }
           /^[[:space:]]*\[/ { exit }
@@ -900,6 +911,10 @@ EOF
         '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,
           digest:{algorithm:"sha256",value:$digest,scope:"directory-files"}}')
       emit agent_artifact "$artifact_id" present medium "$data" '[{"source":"filesystem","method":"configured-directory+sha256"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
     else
       emit agent_artifact "$artifact_id" absent high \
         "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
