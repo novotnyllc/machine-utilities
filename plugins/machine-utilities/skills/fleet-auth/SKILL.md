@@ -11,6 +11,8 @@ is not the skill directory. Run the `auth` inventory section first. Show
 configured artifact name, path, strategy, owner, mode, size, mtime, SHA-256,
 link status, and native verification result. Do not read credential contents
 into the conversation, logs, JSONL, command arguments, or task prompts.
+Read `"$SKILL_DIR/../../references/agent-settings-and-auth.md"` for the distinct
+Claude CLI/Desktop and Codex credential boundaries.
 
 Honor each configured strategy:
 
@@ -41,6 +43,18 @@ postcondition when post-inventory remains available. SSH uses bounded
 connection/keepalive timeouts and verifies the configured native hostname/user.
 Native Windows auth mutation is not supported by this release; reauthenticate
 interactively on that host rather than copying credentials through a task.
+SSH reauthentication is also rejected because login needs a visible interactive
+terminal or browser. Complete the one-time login on the target, then re-run
+inventory; `apply-ssh-plan` remains available for noninteractive encrypted
+installs.
+
+Pathless `per-machine` or `native-store` artifacts are status-only sessions;
+inventory does not infer their credential backend. Their status comes only from
+the configured native verification command and an unhealthy login is marked
+as `reauth_required` with a manual host action. A full Claude login is required
+once per Remote Control host; do not substitute a setup token or copy Claude
+state. Codex file-backed `auth.json` is portable only when the user explicitly
+chooses `encrypted-install`; otherwise keep Codex authentication per-machine.
 
 Matching SHA-256 proves identical bytes, not valid authentication. Prefer
 per-machine least-privilege credentials for unattended work. For Windows,

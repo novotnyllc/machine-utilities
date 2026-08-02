@@ -85,8 +85,12 @@ fields are omitted. Standard output contains data only and diagnostics go to
 standard error. Records sort by host, kind, and stable entity ID.
 
 Initial record kinds are `snapshot`, `host`, `file`, `package`,
-`agent_runtime`, `plugin`, `skill`, `capability`, `auth_artifact`,
+`agent_runtime`, `agent_setting`, `plugin`, `skill`, `capability`, `auth_artifact`,
 `startup_task`, `project`, and `error`.
+
+Configured `agent_artifacts.settings` produces one allowlisted semantic record
+per JSON/TOML key. Per-host `paths` override the common artifact `path`; unlisted
+configuration fields are never serialized.
 
 Files and portable configuration include SHA-256 over raw bytes. Directory
 hashes must state their inclusion scope before hashes may be compared. Git
@@ -230,7 +234,7 @@ fleet's security boundary.
 
 For each tool, record:
 
-- tool and credential path or native-store type
+- tool and credential path or native CLI/session status
 - existence, owner, mode, size, content hash, and modification time
 - authentication health from the tool's own status command
 - portability class: `declarative`, `secret-reference`, `portable-session`,

@@ -184,6 +184,75 @@ function Get-AuthHealth([object]$Definition) {
     }
 }
 
+function Test-AgentSettingValue([string]$Key, [object]$Value) {
+    if ($null -eq $Value) { return $false }
+    if ($Key -in @("remoteControlAtStartup", "switchModelsOnFlag", "agentPushNotifEnabled",
+            "check_for_update_on_startup")) { return $Value -is [bool] }
+    if ($Key -eq "availableModels") {
+        return $Value -isnot [string] -and $Value -is [Collections.IEnumerable] -and
+            @($Value | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -eq 0
+    }
+    if ($Key -eq "autoUpdatesChannel") { return [string]$Value -in @("latest", "stable") }
+    if ($Key -eq "cli_auth_credentials_store") { return [string]$Value -in @("file", "keyring", "auto") }
+    return $Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$Value)
+}
+
+function Add-AgentSettings([object]$Definition, [string]$ArtifactId, [string]$ArtifactPath) {
+    $Format = [string]$Definition.format
+    $Parsed = $null
+    if ($Format -eq "json") {
+        try { $Parsed = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -NoEnumerate } catch { $Parsed = $null }
+        if ($null -eq $Parsed -or $Parsed.GetType() -ne [Management.Automation.PSCustomObject]) {
+            $Parsed = $null
+        }
+    }
+    foreach ($Setting in $Definition.settings.PSObject.Properties) {
+        $Key = [string]$Setting.Name
+        $Desired = $Setting.Value
+        $Present = $false
+        $Observed = $null
+        $ParseFailed = $false
+        if ($Format -eq "json") {
+            if ($null -eq $Parsed) {
+                $ParseFailed = $true
+            } else {
+                $Property = $Parsed.PSObject.Properties[$Key]
+                if ($null -ne $Property) { $Present = $true; $Observed = $Property.Value }
+            }
+        } elseif ($Format -eq "toml") {
+            $Escaped = [Regex]::Escape($Key)
+            $Line = $null
+            foreach ($ConfigLine in @(Get-Content -LiteralPath $ArtifactPath)) {
+                if ($ConfigLine -match '^\s*\[') { break }
+                if ($ConfigLine -match "^\s*$Escaped\s*=") { $Line = $ConfigLine; break }
+            }
+            if ($null -ne $Line) {
+                $Raw = ($Line -replace "^\s*$Escaped\s*=\s*", "") -replace '\s+#\s.*$', ''
+                try { $Observed = $Raw | ConvertFrom-Json; $Present = $true } catch { $ParseFailed = $true }
+            }
+        }
+        if ($Present -and -not (Test-AgentSettingValue $Key $Observed)) {
+            $ParseFailed = $true
+            $Observed = $null
+        }
+        if ($ParseFailed) {
+            Add-Record -Kind "agent_setting" -Id "$ArtifactId`:$Key" -Status "unavailable" -Confidence "medium" -Data @{
+                artifact = $ArtifactId; path = Limit-Text $ArtifactPath; format = $Format; key = $Key
+                desired = $Desired; agent_exposure = @($Definition.agents)
+            } -Errors @(@{ code = "setting_parse_failed"; severity = "warning"; retryable = $false; message = "allowlisted agent setting could not be parsed" })
+            continue
+        }
+        $ObservedJson = ConvertTo-Json $Observed -Compress -Depth 20
+        $DesiredJson = ConvertTo-Json $Desired -Compress -Depth 20
+        $InSync = if ($null -eq $Desired) { -not $Present } else { $Present -and $ObservedJson -ceq $DesiredJson }
+        Add-Record -Kind "agent_setting" -Id "$ArtifactId`:$Key" -Status "present" -Confidence "high" -Data @{
+            artifact = $ArtifactId; path = Limit-Text $ArtifactPath; format = $Format; key = $Key
+            observed_present = $Present; observed = $Observed; desired = $Desired; in_sync = $InSync
+            agent_exposure = @($Definition.agents)
+        } -Evidence @(@{ source = "filesystem"; method = "allowlisted-semantic-setting" })
+    }
+}
+
 function Test-BoundedStrings([object]$Value) {
     if ($null -eq $Value) { return $true }
     if ($Value -is [string]) {
@@ -299,10 +368,50 @@ function Assert-WorkerConfig([object]$Value) {
             throw "Duplicate agent artifact ID"
         }
         foreach ($Definition in @($Value.agent_artifacts)) {
+            $SettingKeys = if ($null -eq $Definition.settings) { @() } else {
+                @($Definition.settings.PSObject.Properties | ForEach-Object { $_.Name })
+            }
+            $AllowedJsonSettings = @("remoteControlAtStartup", "switchModelsOnFlag", "model", "effortLevel",
+                "availableModels", "fallbackModel", "autoUpdatesChannel", "agentPushNotifEnabled")
+            $AllowedTomlSettings = @("model", "model_reasoning_effort", "service_tier",
+                "check_for_update_on_startup", "cli_auth_credentials_store")
+            $InvalidSettingValue = $false
+            $SettingProperties = if ($null -eq $Definition.settings) { @() } else {
+                @($Definition.settings.PSObject.Properties)
+            }
+            foreach ($Setting in $SettingProperties) {
+                if ($null -eq $Setting.Value) { continue }
+                if ($Setting.Name -in @("remoteControlAtStartup", "switchModelsOnFlag",
+                        "agentPushNotifEnabled", "check_for_update_on_startup")) {
+                    $InvalidSettingValue = $Setting.Value -isnot [bool]
+                } elseif ($Setting.Name -eq "availableModels") {
+                    $InvalidSettingValue = $Setting.Value -is [string] -or
+                        $Setting.Value -isnot [Collections.IEnumerable] -or
+                        @($Setting.Value | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
+                } elseif ($Setting.Name -eq "autoUpdatesChannel") {
+                    $InvalidSettingValue = [string]$Setting.Value -notin @("latest", "stable")
+                } elseif ($Setting.Name -eq "cli_auth_credentials_store") {
+                    $InvalidSettingValue = [string]$Setting.Value -notin @("file", "keyring", "auto")
+                } else {
+                    $InvalidSettingValue = $Setting.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Setting.Value)
+                }
+                if ($InvalidSettingValue) { break }
+            }
             if ([string]$Definition.id -notmatch '^[A-Za-z0-9._-]+$' -or
-                [string]::IsNullOrWhiteSpace([string]$Definition.path) -or
                 @("agent-definition", "instruction", "config") -notcontains [string]$Definition.kind -or
-                @($Definition.agents | Where-Object { $_ -notin @("codex", "claude") }).Count -gt 0) {
+                @($Definition.agents | Where-Object { $_ -notin @("codex", "claude") }).Count -gt 0 -or
+                ($SettingKeys.Count -gt 0 -and ([string]$Definition.kind -ne "config" -or
+                    [string]$Definition.format -notin @("json", "toml"))) -or
+                ($SettingKeys.Count -gt 0 -and
+                    (([string]$Definition.format -eq "json" -and
+                      (@($Definition.agents).Count -ne 1 -or ([string](@($Definition.agents)[0])) -cne "claude")) -or
+                     ([string]$Definition.format -eq "toml" -and
+                      (@($Definition.agents).Count -ne 1 -or ([string](@($Definition.agents)[0])) -cne "codex")))) -or
+                ([string]$Definition.format -eq "json" -and
+                    @($SettingKeys | Where-Object { $_ -notin $AllowedJsonSettings }).Count -gt 0) -or
+                ([string]$Definition.format -eq "toml" -and
+                    @($SettingKeys | Where-Object { $_ -notin $AllowedTomlSettings }).Count -gt 0) -or
+                $InvalidSettingValue) {
                 throw "Invalid agent artifact configuration"
             }
         }
@@ -312,11 +421,18 @@ function Assert-WorkerConfig([object]$Value) {
             $Verify = @($Property.Value.verify)
             $Strategy = if ($null -eq $Property.Value.strategy) { "ignore" } else { [string]$Property.Value.strategy }
             $Portability = if ($null -eq $Property.Value.portability) { "per-machine" } else { [string]$Property.Value.portability }
+            $HasPath = -not [string]::IsNullOrWhiteSpace([string]$Property.Value.path) -or
+                ($null -ne $Property.Value.paths -and $Property.Value.paths.PSObject.Properties.Count -gt 0) -or
+                ($Portability -in @("native-store", "per-machine") -and $Verify.Count -gt 0)
+            $PathlessAuthStatus = $Portability -in @("native-store", "per-machine") -and
+                [string]::IsNullOrWhiteSpace([string]$Property.Value.path) -and
+                ($null -eq $Property.Value.paths -or $Property.Value.paths.PSObject.Properties.Count -eq 0)
             if ($Property.Name -notmatch '^[A-Za-z0-9._-]+$' -or
-                [string]::IsNullOrWhiteSpace([string]$Property.Value.path) -or
+                -not $HasPath -or
                 @("chezmoi", "encrypted-install", "reauth", "ignore") -notcontains $Strategy -or
                 @("declarative", "secret-reference", "portable-session", "native-store", "per-machine", "regenerable-cache") -notcontains $Portability -or
                 $Verify.Count -gt 32 -or
+                ($PathlessAuthStatus -and $Verify.Count -eq 0) -or
                 ($Verify.Count -gt 0 -and [string]$Verify[0] -notmatch '^[A-Za-z0-9._+-]+$')) {
                 throw "Invalid auth artifact configuration"
             }
@@ -746,7 +862,12 @@ if (Test-Section "agents") {
                         [string]$AuthDefinition.path
                     }
                     $DependencyPath = Resolve-UserPath $ConfiguredPath
-                    if (Test-Path -LiteralPath $DependencyPath) {
+                    $Portability = if ($null -eq $AuthDefinition.portability) { "per-machine" } else { [string]$AuthDefinition.portability }
+                    if ([string]::IsNullOrWhiteSpace($DependencyPath) -and $Portability -in @("native-store", "per-machine")) {
+                        $Health = Get-AuthHealth $AuthDefinition
+                        $DependencyStatus = [string]$Health.health
+                        $DependencyReady = $DependencyStatus -eq "healthy"
+                    } elseif (Test-Path -LiteralPath $DependencyPath) {
                         $Item = Get-Item -LiteralPath $DependencyPath -Force
                         if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Item.PSIsContainer) {
                             $DependencyStatus = "partial"
@@ -774,8 +895,14 @@ if (Test-Section "agents") {
                     (@($_.groups).Count -eq 0 -or @($_.groups | Where-Object { $HostGroups -contains $_ }).Count -gt 0)
                 } | Select-Object -First 1)
                 if ($ArtifactDefinition.Count -gt 0) {
-                    $ArtifactPath = Resolve-UserPath ([string]$ArtifactDefinition[0].path)
-                    if (Test-Path -LiteralPath $ArtifactPath) {
+                    $ConfiguredArtifactPath = if ($null -ne $ArtifactDefinition[0].paths -and
+                        $null -ne $ArtifactDefinition[0].paths.PSObject.Properties[$HostId]) {
+                        [string]$ArtifactDefinition[0].paths.PSObject.Properties[$HostId].Value
+                    } else { [string]$ArtifactDefinition[0].path }
+                    $ArtifactPath = Resolve-UserPath $ConfiguredArtifactPath
+                    if ([string]::IsNullOrWhiteSpace($ArtifactPath)) {
+                        $DependencyStatus = "unavailable"
+                    } elseif (Test-Path -LiteralPath $ArtifactPath) {
                         $Item = Get-Item -LiteralPath $ArtifactPath -Force
                         if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                             $DependencyStatus = "partial"
@@ -869,8 +996,16 @@ if (Test-Section "agents") {
             $Groups = @($Definition.groups)
             if ($Groups.Count -gt 0 -and @($Groups | Where-Object { $HostGroups -contains $_ }).Count -eq 0) { continue }
             $ArtifactId = Limit-Text $Definition.id
-            $ArtifactPath = Resolve-UserPath ([string]$Definition.path)
-            if (Test-Path -LiteralPath $ArtifactPath) {
+            $ConfiguredArtifactPath = if ($null -ne $Definition.paths -and $null -ne $Definition.paths.$HostId) {
+                [string]$Definition.paths.$HostId
+            } else { [string]$Definition.path }
+            $ArtifactPath = Resolve-UserPath $ConfiguredArtifactPath
+            if ([string]::IsNullOrWhiteSpace($ArtifactPath)) {
+                Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "unavailable" -Confidence "high" -Data @{
+                    id = $ArtifactId; path = $null; artifact_kind = Limit-Text $Definition.kind
+                    agent_exposure = @($Definition.agents)
+                } -Errors @(@{ code = "artifact_path_missing"; severity = "warning"; retryable = $false; message = "agent artifact has no path for this host" })
+            } elseif (Test-Path -LiteralPath $ArtifactPath) {
                 $Item = Get-Item -LiteralPath $ArtifactPath -Force
                 if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                     Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "partial" -Confidence "medium" -Data @{
@@ -891,6 +1026,10 @@ if (Test-Section "agents") {
                         updated_at = $Item.LastWriteTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
                         digest = @{ algorithm = "sha256"; value = $Digest; scope = $(if ($Item.PSIsContainer) { "directory-files" } else { "raw-bytes" }) }
                     } -Evidence @(@{ source = "filesystem"; method = "configured-agent-artifact+sha256" })
+                    if (-not $Item.PSIsContainer -and $null -ne $Definition.settings -and
+                        $Definition.settings.PSObject.Properties.Count -gt 0) {
+                        Add-AgentSettings $Definition $ArtifactId $ArtifactPath
+                    }
                 }
             } else {
                 Add-Record -Kind "agent_artifact" -Id $ArtifactId -Status "absent" -Confidence "high" -Data @{
@@ -995,7 +1134,16 @@ if (Test-Section "auth") {
                 [string]$Definition.path
             }
             $Path = Resolve-UserPath $ConfiguredPath
-            if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            if ([string]::IsNullOrWhiteSpace($Path) -and $Portability -in @("native-store", "per-machine")) {
+                $Health = Get-AuthHealth $Definition
+                $ReauthRequired = $Health.health -eq "unhealthy"
+                Add-Record -Kind "auth_artifact" -Id $Name -Status $(if ($Health.health -eq "healthy") { "present" } elseif ($ReauthRequired) { "absent" } else { "partial" }) -Confidence "high" -Data @{
+                    tool = $Name; path = $null; strategy = $Strategy; portability = $Portability
+                    type = "native-status"; health = $Health.health; verify_exit_code = $Health.verify_exit_code
+                    reauth_required = $ReauthRequired
+                    manual_action = $(if ($ReauthRequired) { "run the configured native login on this host" } else { $null })
+                } -Evidence @(@{ source = "native-cli"; method = "configured-auth-status" })
+            } elseif (Test-Path -LiteralPath $Path -PathType Leaf) {
                 $Item = Get-Item -LiteralPath $Path -Force
                 if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                     Add-Record -Kind "auth_artifact" -Id $Name -Status "partial" -Confidence "medium" -Data @{

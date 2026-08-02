@@ -2,8 +2,8 @@
 
 Configuration-driven fleet inventory and maintenance for Codex and Claude
 Code. It inventories packages, agent runtimes, plugins, standalone skills,
-projects, startup tasks, chezmoi state, and credential-file metadata across
-macOS, Linux/WSL, and Windows.
+allowlisted Claude/Codex settings, projects, startup tasks, chezmoi state, and
+credential-file or native CLI/session status across macOS, Linux/WSL, and Windows.
 
 Windows is reached directly through a visible task in Codex Desktop. The
 plugin never silently routes Windows work through WSL. The Windows checkout
@@ -45,6 +45,8 @@ The config defines:
   roots
 - agent definitions and credential artifacts, including their distribution
   policy
+- safe semantic settings to compare without exposing unrelated config or MCP
+  secrets; per-host paths are supported
 
 GitHub project sources may be full clone URLs or `owner/repository` shorthand.
 See
@@ -57,7 +59,8 @@ Ask Codex or Claude Code for one of the eight bundled skills:
 
 - `fleet-inventory` — collect and compare structured JSONL snapshots
 - `fleet-update` — plan, then explicitly apply Homebrew, APT, or winget updates
-- `fleet-agents` — reconcile Codex, Claude, plugins, skills-cli, and JSM state
+- `fleet-agents` — reconcile Codex/Claude runtimes, settings, plugins,
+  skills-cli, and JSM state
 - `fleet-auth` — audit credential metadata and perform deliberate secure copies
 - `fleet-chezmoi` — inspect drift and plan pull, add, or apply operations
 - `fleet-projects` — ensure repositories and Codex project readiness per host
@@ -89,6 +92,11 @@ plugins/machine-utilities/scripts/machine-utilities apply-ssh-plan plan.json PLA
 Collectors write data-only JSONL to stdout. Human rendering is a separate
 step, and snapshots written to disk are installed atomically with mode `0600`.
 Credential contents are never included in inventory output.
+Claude Code CLI and Desktop share supported Code settings but require separate
+login enrollment; a full interactive Claude login is required on every Remote
+Control host. The invoking agent must check Codex Desktop Remote enablement
+manually because Codex has no documented persistent setting for it. See
+[`plugins/machine-utilities/references/agent-settings-and-auth.md`](plugins/machine-utilities/references/agent-settings-and-auth.md).
 Sealed plans are inert data: verification checks their digest and freshly
 recaptured preconditions but neither grants consent nor executes plan text.
 Every sealed plan binds the exact plugin version, integrity-manifest SHA-256,

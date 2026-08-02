@@ -375,7 +375,7 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
         $Valid = switch ([string]$Plan.domain) {
             "updates" { $Operation.type -eq "package-upgrade" -and $Operation.kind -eq "package" }
             "agents" { $Operation.type -eq "agent-update" -and
-                [string]$Operation.kind -in @("plugin", "skill") }
+                [string]$Operation.kind -in @("agent_runtime", "plugin", "skill") }
             "chezmoi" {
                 ($Operation.type -eq "chezmoi-pull" -and $Operation.kind -eq "file" -and $Operation.id -eq "chezmoi:source") -or
                 ($Operation.type -eq "chezmoi-apply" -and $Operation.kind -eq "chezmoi_state" -and $Operation.id -eq "live")
@@ -548,6 +548,9 @@ function Get-ExactArgv([object]$Operation, [object]$Config, [object]$Machine) {
                 "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
         }
         "agent-update" {
+            if ($Id -in @("codex", "claude") -and [string]$Operation.kind -eq "agent_runtime") {
+                return @($Id, "update")
+            }
             if ($Id -match "^skills-cli:(?<name>[A-Za-z0-9@._/][A-Za-z0-9@._/-]*)$") {
                 return @("npx", "skills", "update", [string]$Matches.name, "-g", "-y")
             }
@@ -637,8 +640,8 @@ function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$
             }
         }
         "agent-update" {
-            if ($BeforeRecord.Count -ne 1 -or
-                (Test-SameMeaningfulData $BeforeRecord[0] $AfterRecord[0])) {
+            if ([string]$Operation.kind -eq "agent_runtime") { break }
+            if ($BeforeRecord.Count -ne 1 -or (Test-SameMeaningfulData $BeforeRecord[0] $AfterRecord[0])) {
                 throw "Agent update produced no authoritative state change"
             }
         }
@@ -836,6 +839,12 @@ if ($SelfTest) {
         if ((ConvertTo-CanonicalJson $Argv) -ne (ConvertTo-CanonicalJson $Expected)) {
             throw "Winget argv self-test failed"
         }
+        $RuntimeArgv = @(Get-ExactArgv ([pscustomobject]@{
+            type = "agent-update"; kind = "agent_runtime"; id = "codex"
+        }) $null $null)
+        if ((ConvertTo-CanonicalJson $RuntimeArgv) -ne '["codex","update"]') {
+            throw "Agent runtime argv self-test failed"
+        }
         foreach ($UnsafeId in @("skills-cli:--help", "jsm:-x")) {
             $Rejected = $false
             try {
@@ -931,6 +940,30 @@ if ($SelfTest) {
         )
         $FixtureExecutor = Get-InstalledExecutor $ExecutorRoot
         Assert-Executor $FixtureExecutor $FixtureExecutor $ExecutorRoot
+
+        $HostId = "fixture-host"
+        $ControllerConfigDigest = "a" * 64
+        $RuntimeWorkerDigest = "b" * 64
+        $RuntimePlan = [pscustomobject][ordered]@{
+            schema = "machine-utilities.plan"
+            schema_version = 2
+            target = $HostId
+            domain = "agents"
+            required_section = "agents"
+            controller_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $ControllerConfigDigest }
+            worker_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $RuntimeWorkerDigest }
+            precondition_digest = [ordered]@{ algorithm = "sha256"; value = "c" * 64 }
+            operations = @([ordered]@{
+                type = "agent-update"; kind = "agent_runtime"; id = "codex"; argv = @("codex", "update")
+            })
+        }
+        $RuntimeDigest = Get-TextSha256 ((ConvertTo-CanonicalJson $RuntimePlan) + "`n")
+        Add-Member -InputObject $RuntimePlan -NotePropertyName plan_id -NotePropertyValue "plan-$($RuntimeDigest.Substring(0, 16))"
+        Add-Member -InputObject $RuntimePlan -NotePropertyName plan_digest -NotePropertyValue ([ordered]@{
+            algorithm = "sha256"; value = $RuntimeDigest
+        })
+        $PlanId = $RuntimePlan.plan_id
+        Assert-Plan $RuntimePlan $RuntimeWorkerDigest
 
         $PartialPlan = [pscustomobject]@{
             domain = "agents"

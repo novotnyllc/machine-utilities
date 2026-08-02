@@ -1,16 +1,21 @@
 ---
 name: fleet-agents
-description: Inventory and reconcile Codex, Claude Code, plugins, standalone skills, skills-cli provenance, JSM-managed skills, and logical capabilities across machines. Use when agent tooling or skills are missing, duplicated, stale, or inconsistent.
+description: Inventory and reconcile Codex and Claude runtimes, safe settings, plugins, standalone skills, skills-cli provenance, JSM-managed skills, and logical capabilities across machines. Use when agent tooling, Remote Control defaults, models, updates, or skills are missing, duplicated, stale, or inconsistent.
 ---
 
 # Fleet Agents
 
 Set `SKILL_DIR` to the absolute directory containing this loaded `SKILL.md` and
 `CLI="$SKILL_DIR/../../scripts/machine-utilities"`; the shell working directory
-is not the skill directory. Collect the `agents` section with `"$CLI"`. Compare
+is not the skill directory. Collect `--section agents --section auth` when
+evaluating capability readiness; provider-only inventory may collect just
+`agents`. Windows tasks must pass `-AllowAuthVerify` for the combined readiness
+check. Compare
 runtime versions, plugin name/version/manager, standalone skill hashes and
 origins, skills-cli lock metadata, JSM provenance, and configured logical
-capabilities. Treat the same capability delivered as a plugin and a standalone
+capabilities. Read `"$SKILL_DIR/../../references/agent-settings-and-auth.md"`
+before auditing agent settings, runtime installation, model policy, or Remote
+Control. Treat the same capability delivered as a plugin and a standalone
 skill as equivalent only when the config says so; report duplicate providers.
 
 Use manager-native ownership:
@@ -35,10 +40,23 @@ convert a standalone skill into a plugin or vice versa. For a local target use
 contract in the remote-control reference. Apply recaptures trusted preflight
 itself. Preserve its authoritative partial output when an operation or
 postcondition fails.
-The executor supports exact updates for skills-cli, JSM, and Claude plugins.
+The executor supports exact `codex update` and `claude update` runtime updates,
+plus updates for skills-cli, JSM, and Claude plugins.
 Codex replacement uses the native idempotent `codex plugin add
-PLUGIN@MARKETPLACE --json` operation. Installs, removals, and provider
-conversion are unsupported and fail before plan sealing.
+PLUGIN@MARKETPLACE --json` operation. An already-current runtime is a successful
+no-op after it remains present in post-inventory. For a missing runtime, use the
+official installer interactively or delegate a manager-owned install to
+`fleet-update`; downloaded installer pipelines, removals, and provider
+conversion are unsupported by sealed plans.
+
+Configured `agent_artifacts` may declare an allowlisted `settings` object for a
+JSON or TOML config file. Inventory emits one `agent_setting` record per key,
+including observed value, desired value, presence, and `in_sync`; it never emits
+unlisted config fields. Reconcile the owning file through `fleet-chezmoi` where
+possible. Do not write Claude Desktop internal state or undocumented Codex
+Desktop preferences. Claude's supported Remote Control default lives in the
+shared Code settings file; the invoking agent must check Codex Desktop host
+enablement manually.
 
 Use local/SSH execution where configured. SSH uses bounded connection and
 keepalive timeouts and must match the configured native hostname/user before
