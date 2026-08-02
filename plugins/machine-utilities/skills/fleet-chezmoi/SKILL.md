@@ -13,6 +13,18 @@ read-only commands such as `chezmoi status`, `chezmoi diff`,
 whether source, live state, or both changed; do not assume the source always
 wins.
 
+Reconcile each requested target path on every requested host, including hosts
+that appear clean. Build a per-target evidence table containing the rendered
+content or digest, mapped source path, live and source mtimes, and per-file Git
+history. Timestamps are evidence, never automatic precedence: `add`, `apply`,
+copy, checkout, and pull can rewrite them. Infer intent from semantic content,
+Git history, templates and host conditions, and cross-host agreement.
+
+Preserve disjoint edits with a deliberate source merge. Stop for conflicts in
+the same semantic region or ambiguous intent. Never use newest-wins or blanket
+`chezmoi add`/`chezmoi apply` before path-level reconciliation. Preview the
+reconciled source on every requested host before any mutation.
+
 Default to a plan per host:
 
 - source should win: preview `chezmoi apply --dry-run --verbose`;

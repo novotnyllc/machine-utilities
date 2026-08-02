@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cli="$script_dir/machine-utilities"
+plugin_version=$(jq -r '.version' "$script_dir/../.codex-plugin/plugin.json")
 pwsh_command=$(command -v pwsh 2>/dev/null || true)
 real_git=$(command -v git)
 real_stat=$(command -v stat)
@@ -545,9 +546,10 @@ export SHELL="$tmp/bin/login-shell"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 export GIT_PULL_MARKER="$tmp/git-pull-executed"
-mkdir -p "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.2"
-cp -R "$script_dir/../." "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.2/"
-chmod -R go-w "$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/0.2.2"
+plugin_cache="$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/$plugin_version"
+mkdir -p "$plugin_cache"
+cp -R "$script_dir/../." "$plugin_cache/"
+chmod -R go-w "$plugin_cache"
 printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 printf '%s\n' 2.0.0 >"$CLAUDE_STATE_FILE"
@@ -555,7 +557,7 @@ printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 
 "$cli" validate-config
 "$cli" executor-status "$tmp/executor.json"
-[ "$(jq -r '.version' "$tmp/executor.json")" = 0.2.2 ] ||
+[ "$(jq -r '.version' "$tmp/executor.json")" = "$plugin_version" ] ||
   fail "executor status did not report release version"
 [ "$(jq -r '.verified' "$tmp/executor.json")" = true ] ||
   fail "executor status was not verified"
@@ -1218,7 +1220,7 @@ fi
 "$cli" seal-plan "$tmp/plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/plan.json"
 [ "$(jq -r '.schema_version' "$tmp/plan.json")" -eq 2 ] ||
   fail "sealed plan did not use executor-bound schema version"
-[ "$(jq -r '.required_executor.version' "$tmp/plan.json")" = 0.2.2 ] ||
+[ "$(jq -r '.required_executor.version' "$tmp/plan.json")" = "$plugin_version" ] ||
   fail "sealed plan did not bind the exact executor"
 "$cli" worker-config test-host updates "$tmp/local-worker-config.json"
 [ "$(jq -r '.worker_configuration_digest.value' "$tmp/plan.json")" = \
@@ -1432,7 +1434,7 @@ CLAUDE_MANAGER_STDOUT=1 "$cli" apply-ssh-plan "$tmp/ssh-agent-plan.json" \
   fail "SSH apply returned no authoritative completed operation"
 [ "$(jq -r --arg plan "$ssh_agent_plan_id" '
   select(.kind == "operation" and .id == ("apply:" + $plan)) |
-  .data.executor.version' "$tmp/ssh-agent-result.jsonl")" = 0.2.2 ] ||
+  .data.executor.version' "$tmp/ssh-agent-result.jsonl")" = "$plugin_version" ] ||
   fail "SSH apply did not report the exact sealed executor version"
 [ "$(jq -s 'map(select(.kind == "plugin" and .id == "claude:test-market:claude-example:3.0.0")) | length' \
   "$tmp/ssh-agent-result.jsonl")" -eq 1 ] ||
