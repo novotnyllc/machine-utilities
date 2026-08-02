@@ -1048,6 +1048,18 @@ seal_plan_command() {
     printf 'machine-utilities: plan target is not configured: %s\n' "$target" >&2
     exit 64
   }
+  jq -e --arg target "$target" --slurpfile draft "$draft" '
+    . as $config |
+    all($draft[0].operations[];
+      if .type == "auth-install" then
+        .id as $id |
+        (($config.auth_artifacts[$id].path // null) != null or
+         ($config.auth_artifacts[$id].paths[$target] // null) != null)
+      else true end)
+  ' "$config" >/dev/null || {
+    printf 'machine-utilities: auth install has no configured path for target %s\n' "$target" >&2
+    exit 65
+  }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   if [ "$platform" = windows ]; then
     jq -e --arg target "$target" '
@@ -1103,6 +1115,10 @@ seal_plan_command() {
         any($records[]; .kind == $operation.kind and .id == $operation.id and
           .status == "present" and .data.candidate_version == $operation.candidate_version and
           .data.update_available == true)
+      elif .type == "agent-update" and .kind == "agent_runtime" then
+        . as $operation |
+        any($records[]; .kind == $operation.kind and .id == $operation.id and
+          .status == "present")
       elif .type == "project-update" then
         . as $operation |
         any($records[]; .kind == $operation.kind and .id == $operation.id and

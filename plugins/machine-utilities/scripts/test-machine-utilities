@@ -1527,6 +1527,13 @@ cat >"$tmp/runtime-plan-draft.json" <<'JSON'
   }]
 }
 JSON
+jq -c 'if .kind == "agent_runtime" and .id == "codex" then
+  .status = "absent" | .data = {runtime:"codex"}
+else . end' "$tmp/snapshot.jsonl" >"$tmp/runtime-absent-snapshot.jsonl"
+if "$cli" seal-plan "$tmp/runtime-plan-draft.json" "$tmp/runtime-absent-snapshot.jsonl" \
+  "$tmp/runtime-absent-plan.json" >/dev/null 2>&1; then
+  fail "absent runtime sealed an update instead of requiring installer flow"
+fi
 "$cli" seal-plan "$tmp/runtime-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/runtime-plan.json"
 runtime_plan_id=$(jq -r '.plan_id' "$tmp/runtime-plan.json")
 rm -f "$RUNTIME_UPDATE_MARKER"
@@ -1890,6 +1897,15 @@ cat >"$tmp/auth-plan-draft.json" <<'JSON'
   ]
 }
 JSON
+jq 'del(.auth_artifacts["test-auth"].path) |
+  .auth_artifacts["test-auth"].paths = {"test-windows":"~/.test-auth"}' \
+  "$tmp/config.json" >"$tmp/auth-other-target-path-config.json"
+chmod 600 "$tmp/auth-other-target-path-config.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/auth-other-target-path-config.json" \
+  "$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-plan-snapshot.jsonl" \
+  "$tmp/auth-missing-target-path-plan.json" >/dev/null 2>&1; then
+  fail "auth install sealed without a path for its target"
+fi
 "$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-plan-snapshot.jsonl" "$tmp/auth-plan.json"
 auth_plan_id=$(jq -r '.plan_id' "$tmp/auth-plan.json")
 "$cli" apply-plan "$tmp/auth-plan.json" "$auth_plan_id" "$tmp/auth-applied.jsonl"
