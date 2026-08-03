@@ -485,11 +485,23 @@ cat >"$tmp/bin/chezmoi" <<'SH'
 case ${1:-} in
   source-path) printf '%s\n' "$HOME/.local/share/chezmoi" ;;
   status)
-    [ "${CHEZMOI_STATUS_DRIFT:-0}" != 1 ] || printf ' M .zshrc\n'
+    if [ "${2:-}" = -- ]; then
+      [ "$#" -gt 2 ] || exit 64
+      if [ "${CHEZMOI_TARGET_STATUS_DRIFT:-0}" = 1 ] &&
+        [ ! -e "${CHEZMOI_TARGET_APPLY_MARKER:-}" ]; then
+        printf ' M %s\n' "$3"
+      fi
+    else
+      [ "${CHEZMOI_STATUS_DRIFT:-0}" != 1 ] || printf ' M .zshrc\n'
+    fi
     ;;
   --no-tty)
     [ "${2:-}" = apply ] || exit 64
     : >"$CHEZMOI_APPLY_MARKER"
+    if [ "$#" -gt 2 ]; then
+      [ "${3:-}" = -- ] && [ "$#" -gt 3 ] || exit 64
+      : >"$CHEZMOI_TARGET_APPLY_MARKER"
+    fi
     ;;
   git)
     [ "$#" -eq 4 ] && [ "${2:-}" = -- ] && [ "${3:-}" = pull ] &&
@@ -669,6 +681,7 @@ export BREW_EXEC_MARKER="$tmp/brew-executed"
 export OP_SECRET_FILE="$tmp/op-secret"
 export CHEZMOI_APPLY_MARKER="$tmp/chezmoi-applied"
 export CHEZMOI_PULL_MARKER="$tmp/chezmoi-pulled"
+export CHEZMOI_TARGET_APPLY_MARKER="$tmp/chezmoi-target-applied"
 export SKILLS_UPDATE_MARKER="$tmp/skills-updated"
 export AGENT_EXEC_MARKER="$tmp/agent-executed"
 export RUNTIME_UPDATE_MARKER="$tmp/runtime-updated"
@@ -2509,6 +2522,103 @@ fi
   "$chezmoi_plan_id" "$tmp/chezmoi-applied.jsonl"
 [ -e "$CHEZMOI_PULL_MARKER" ] || fail "safe chezmoi fast-forward pull was not executed"
 [ -e "$CHEZMOI_APPLY_MARKER" ] || fail "safe chezmoi apply was not executed"
+
+targeted_chezmoi_path="$tmp/home/.profile.d/10-env.sh"
+mkdir -p "$(dirname -- "$targeted_chezmoi_path")"
+: >"$targeted_chezmoi_path"
+cat >"$tmp/targeted-chezmoi-plan-draft.json" <<JSON
+{
+  "domain": "chezmoi",
+  "target": "test-host",
+  "operations": [{
+    "type": "chezmoi-apply",
+    "kind": "chezmoi_state",
+    "id": "live",
+    "targets": ["$targeted_chezmoi_path"],
+    "argv": ["chezmoi", "--no-tty", "apply", "--", "$targeted_chezmoi_path"]
+  }]
+}
+JSON
+CHEZMOI_STATUS_DRIFT=1 "$cli" collect --target test-host --section chezmoi \
+  --output "$tmp/targeted-chezmoi-snapshot.jsonl"
+"$cli" seal-plan "$tmp/targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/targeted-chezmoi-plan.json"
+targeted_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/targeted-chezmoi-plan.json" \
+  "$targeted_chezmoi_plan_id" "$tmp/targeted-chezmoi-applied.jsonl"
+[ -e "$CHEZMOI_TARGET_APPLY_MARKER" ] || fail "targeted chezmoi apply was not executed"
+[ "$(jq -r --arg plan "$targeted_chezmoi_plan_id" '
+  select(.kind == "operation" and .id == ("apply:" + $plan)) | .data.operation_status
+' "$tmp/targeted-chezmoi-applied.jsonl")" = completed ] ||
+  fail "targeted chezmoi apply did not report completed verification"
+jq '.operations[0].argv += ["--force"]' "$tmp/targeted-chezmoi-plan-draft.json" \
+  >"$tmp/unsafe-targeted-chezmoi-plan-draft.json"
+"$cli" seal-plan "$tmp/unsafe-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/unsafe-targeted-chezmoi-plan.json"
+unsafe_targeted_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/unsafe-targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+if CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/unsafe-targeted-chezmoi-plan.json" \
+  "$unsafe_targeted_chezmoi_plan_id" "$tmp/unsafe-targeted-chezmoi-result.jsonl" >/dev/null 2>&1; then
+  fail "targeted chezmoi mutation accepted extra argv"
+fi
+[ ! -e "$CHEZMOI_TARGET_APPLY_MARKER" ] ||
+  fail "unsafe targeted chezmoi argv reached the native command"
+jq --arg target "$tmp/outside-home" \
+  '.operations[0].targets = [$target] | .operations[0].argv[4] = $target' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/outside-home-targeted-chezmoi-plan-draft.json"
+"$cli" seal-plan "$tmp/outside-home-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/outside-home-targeted-chezmoi-plan.json"
+outside_home_targeted_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/outside-home-targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+if CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/outside-home-targeted-chezmoi-plan.json" \
+  "$outside_home_targeted_chezmoi_plan_id" "$tmp/outside-home-targeted-chezmoi-result.jsonl" >/dev/null 2>&1; then
+  fail "targeted chezmoi mutation accepted a path outside the target home"
+fi
+[ ! -e "$CHEZMOI_TARGET_APPLY_MARKER" ] ||
+  fail "outside-home targeted chezmoi argv reached the native command"
+mkdir -p "$tmp/outside-home"
+ln -s "$tmp/outside-home" "$tmp/home/target-link"
+jq --arg target "$tmp/home/target-link/env.sh" \
+  '.operations[0].targets = [$target] | .operations[0].argv[4] = $target' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/symlink-targeted-chezmoi-plan-draft.json"
+"$cli" seal-plan "$tmp/symlink-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/symlink-targeted-chezmoi-plan.json"
+symlink_targeted_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/symlink-targeted-chezmoi-plan.json")
+rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+if CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/symlink-targeted-chezmoi-plan.json" \
+  "$symlink_targeted_chezmoi_plan_id" "$tmp/symlink-targeted-chezmoi-result.jsonl" >/dev/null 2>&1; then
+  fail "targeted chezmoi mutation accepted a symbolic-link escape"
+fi
+[ ! -e "$CHEZMOI_TARGET_APPLY_MARKER" ] ||
+  fail "symbolic-link targeted chezmoi argv reached the native command"
+jq '.operations[0].targets = ["relative-path"] | .operations[0].argv[4] = "relative-path"' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/malformed-targeted-chezmoi-plan-draft.json"
+if "$cli" seal-plan "$tmp/malformed-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/malformed-targeted-chezmoi-plan.json" >/dev/null 2>&1; then
+  fail "targeted chezmoi plan accepted a malformed target"
+fi
+jq '.operations[0].targets = ["C:\\\\Users\\\\Fixture\\\\.config\\\\example"] |
+  .operations[0].argv[4] = "C:\\\\Users\\\\Fixture\\\\.config\\\\example"' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/cross-platform-targeted-chezmoi-plan-draft.json"
+if "$cli" seal-plan "$tmp/cross-platform-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/cross-platform-targeted-chezmoi-plan.json" >/dev/null 2>&1; then
+  fail "POSIX targeted chezmoi plan accepted a Windows target path"
+fi
+jq '.operations[0].targets = ["C:relative\\\\example"] |
+  .operations[0].argv[4] = "C:relative\\\\example"' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/drive-relative-targeted-chezmoi-plan-draft.json"
+if "$cli" seal-plan "$tmp/drive-relative-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/drive-relative-targeted-chezmoi-plan.json" >/dev/null 2>&1; then
+  fail "targeted chezmoi plan accepted a drive-relative path"
+fi
+jq --arg target "$targeted_chezmoi_path" \
+  '.operations[0].targets = [$target, $target] | .operations[0].argv += [$target]' \
+  "$tmp/targeted-chezmoi-plan-draft.json" >"$tmp/duplicate-targeted-chezmoi-plan-draft.json"
+if "$cli" seal-plan "$tmp/duplicate-targeted-chezmoi-plan-draft.json" \
+  "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/duplicate-targeted-chezmoi-plan.json" >/dev/null 2>&1; then
+  fail "targeted chezmoi plan accepted duplicate targets"
+fi
 
 "$cli" collect --target test-host --section auth --output "$tmp/auth-plan-snapshot.jsonl"
 sleep 1
