@@ -28,7 +28,17 @@
       "expected_user": "configured-windows-user",
       "groups": ["development"],
       "package_managers": ["winget"],
-      "dev_root": "~/dev"
+      "dev_root": "~/dev",
+      "privilege_broker": {
+        "automation_transport": {
+          "mode": "windows-sftp",
+          "host": "windows.example.invalid",
+          "port": 22,
+          "request_user": "machine-utilities-request",
+          "pinned_host_key_fingerprint": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "management_networks": ["192.0.2.0/24"]
+        }
+      }
     }
   },
   "projects": {

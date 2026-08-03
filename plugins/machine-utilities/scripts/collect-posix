@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 config=${1:?config path required}
 host_id=${2:?host id required}
 snapshot_id=${3:?snapshot id required}
@@ -182,6 +183,239 @@ canonical_git_source() {
     */*) printf 'github.com/%s\n' "$canonical" ;;
     *) printf '%s\n' "$canonical" ;;
   esac
+}
+
+protected_file_ready() {
+  protected_path=$1
+  [ -f "$protected_path" ] && [ ! -L "$protected_path" ] &&
+    [ "$(file_owner "$protected_path")" = root ] || return 1
+  protected_mode=$(file_mode "$protected_path")
+  protected_permissions=$(printf '%s' "$protected_mode" | sed 's/.*\(...\)$/\1/')
+  protected_group=$(printf '%s' "$protected_permissions" | cut -c 2)
+  protected_world=$(printf '%s' "$protected_permissions" | cut -c 3)
+  case $protected_group$protected_world in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+emit_privilege_readiness() {
+  platform=$(jq -r --arg host "$host_id" '.machines[$host].platform' "$config")
+  route=$(jq -c --arg host "$host_id" '.machines[$host].privilege_broker.automation_transport // null' "$config")
+  transport=$(printf '%s' "$route" | jq -r '.mode // empty')
+  request_principal=$(printf '%s' "$route" | jq -r '.request_user // empty')
+  pinned_host_key=$(printf '%s' "$route" | jq -r '.pinned_host_key_fingerprint // empty')
+  if jq -e '.worker.policy_proposal_digest != null' "$config" >/dev/null 2>&1; then
+    proposal_digest=$(jq -r '.worker.policy_proposal_digest' "$config")
+  elif jq -e --arg host "$host_id" '.machines[$host].privilege_broker.policy_proposal != null' "$config" >/dev/null; then
+    proposal_digest=$(jq -r --arg host "$host_id" \
+      '.machines[$host].privilege_broker.policy_proposal[]' "$config" | sha256_stream)
+  else
+    proposal_digest=$(sha256_file "$script_dir/../references/privilege-policy.default")
+  fi
+
+  identity=${MACHINE_UTILITIES_IDENTITY:-${XDG_CONFIG_HOME:-"$HOME/.config"}/machine-utilities/identity.json}
+  node_identity_ready=false
+  receipt_ready=false
+  node_id=
+  fleet_domain=
+  node_key_fingerprint=
+  fleet_ca_fingerprint=
+  ca_generation=null
+  certificate_serial=
+  certificate_valid_after=
+  certificate_valid_before=
+  certificate_principals='[]'
+  certificate_source_addresses='[]'
+  originating_node_identity=null
+  enrollment_epoch=null
+  expected_broker_digest=
+  expected_policy_digest=
+  expected_context_digest=
+  if [ -f "$identity" ] && [ ! -L "$identity" ] &&
+    MACHINE_UTILITIES_CONFIG="$config" MACHINE_UTILITIES_IDENTITY="$identity" \
+      "$script_dir/machine-utilities" validate-config >/dev/null 2>&1; then
+    node_identity_ready=true
+    node_id=$(jq -r '.node_id' "$identity")
+    fleet_domain=$(jq -r '.fleet_domain' "$identity")
+    node_key_fingerprint=$(jq -r '.node_key_fingerprint' "$identity")
+    fleet_ca_fingerprint=$(jq -r '.fleet_ca_fingerprint' "$identity")
+    ca_generation=$(jq -r '.ca_generation' "$identity")
+    certificate_serial=$(jq -r '.certificate_serial' "$identity")
+    certificate_valid_after=$(jq -r '.certificate_valid_after' "$identity")
+    certificate_valid_before=$(jq -r '.certificate_valid_before' "$identity")
+    certificate_principals=$(jq -c '.certificate_principals' "$identity")
+    certificate_source_addresses=$(jq -c '.certificate_source_addresses' "$identity")
+    if jq -e --arg host "$host_id" '.enrollment_receipts[$host] != null' "$identity" >/dev/null; then
+      receipt_ready=true
+      enrollment_epoch=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].enrollment_epoch' "$identity")
+      expected_broker_digest=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].broker_digest' "$identity")
+      expected_policy_digest=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].policy_digest' "$identity")
+      expected_context_digest=$(jq -r --arg host "$host_id" '.enrollment_receipts[$host].context_canary_digest' "$identity")
+    fi
+  fi
+  if jq -e '.worker.originating_node_identity != null' "$config" >/dev/null 2>&1; then
+    originating_node_identity=$(jq -c '.worker.originating_node_identity' "$config")
+  elif [ "$node_identity_ready" = true ]; then
+    originating_node_identity=$(jq -c '{
+      schema:"machine-utilities.originating-node-identity",schema_version:1,
+      fleet_domain,node_id,node_key_fingerprint,fleet_ca_fingerprint,ca_generation,
+      certificate_serial,certificate_valid_after,certificate_valid_before,
+      certificate_principals,certificate_source_addresses
+    }' "$identity")
+  fi
+  transport_ready=false
+  [ -n "$transport" ] && [ "$node_identity_ready" = true ] && transport_ready=true
+
+  adapter=none
+  execution_principals='[]'
+  session_requirement=unsupported
+  case $platform in
+    linux)
+      adapter=posix-sudo-v1
+      execution_principals='["root"]'
+      session_requirement=no-console-session
+      ;;
+    windows)
+      adapter=windows-scheduled-task-v1
+      execution_principals='["LocalSystem","enrolled-s4u-user"]'
+      session_requirement=no-console-session
+      ;;
+  esac
+
+  broker_path=/usr/libexec/machine-utilities/posix-broker
+  broker_version_path=/etc/machine-utilities/active/broker.version
+  policy_path=/etc/machine-utilities/active/policy.actions
+  constraints_path=/etc/machine-utilities/active/policy.constraints
+  context_path=/etc/machine-utilities/active/context.canary
+  observed_broker_digest=
+  observed_policy_digest=
+  observed_context_digest=
+  observed_constraints_digest=
+  constraint_generation=null
+  broker_version=
+  observed_contexts='[]'
+  observed_protocol=null
+  protected_artifacts_ready=false
+  adapter_mechanism_ready=false
+  adapter_verifier_status=not-installed
+  constraints_inventory=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-constraints.XXXXXX")
+  if [ "$platform" = linux ] && protected_file_ready "$broker_path" &&
+    protected_file_ready "$broker_version_path" && protected_file_ready "$policy_path" &&
+    protected_file_ready "$constraints_path" && protected_file_ready "$context_path" &&
+    "$script_dir/machine-utilities" inspect-privilege-constraints \
+      "$policy_path" "$constraints_path" >"$constraints_inventory" 2>/dev/null; then
+    observed_broker_digest=$(sha256_file "$broker_path")
+    observed_policy_digest=$(sha256_file "$policy_path")
+    observed_constraints_digest=$(jq -r '.digest.value' "$constraints_inventory")
+    constraint_generation=$(jq -r '.generation' "$constraints_inventory")
+    observed_context_digest=$(sha256_file "$context_path")
+    broker_version=$(LC_ALL=C head -1 "$broker_version_path" | clip)
+    if printf '%s' "$broker_version" | LC_ALL=C grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+$'; then
+      protected_artifacts_ready=true
+      observed_contexts=$(awk -F '|' 'NR > 1 && $4 == "enabled" { print $2 "\t" $3 "\t" $5 "\t" $6 }' \
+        "$policy_path" | jq -Rsc --slurpfile constraints "$constraints_inventory" '
+          split("\n") | map(select(length > 0) | split("\t") |
+            {action_id:.[0],context_id:.[1],constraint_kind:.[2],constraint_digest:.[3],
+             manager_source_identity:(if .[2] == "none" then "not-applicable" else .[3] end)} |
+             . as $context |
+             ($constraints[0].actions[] | select(.action_id == $context.action_id)) as $membership |
+             . + {constraint_generation:$constraints[0].generation,policy_tokens:$membership.policy_tokens})')
+    fi
+  fi
+  rm -f "$constraints_inventory"
+
+  broker_ready=false
+  action_context_ready=false
+  lifecycle_status=needs_enrollment
+  if [ "$platform" = wsl ]; then
+    lifecycle_status=unsupported_security_boundary
+  elif [ "$platform" = macos ]; then
+    lifecycle_status=unsupported_context
+  elif [ "$platform" = windows ]; then
+    lifecycle_status=unsupported_context
+  elif [ "$receipt_ready" = true ] && [ "$protected_artifacts_ready" = true ]; then
+    if [ "$expected_broker_digest" = "$observed_broker_digest" ] &&
+      [ "$expected_policy_digest" = "$observed_policy_digest" ] &&
+      [ "$enrollment_epoch" = "$constraint_generation" ]; then
+      if [ "$expected_context_digest" = "$observed_context_digest" ]; then
+        lifecycle_status=needs_enrollment
+      else
+        lifecycle_status=drifted
+      fi
+    else
+      lifecycle_status=drifted
+    fi
+  elif [ "$receipt_ready" = true ] || [ "$protected_artifacts_ready" = true ]; then
+    lifecycle_status=drifted
+  fi
+
+  proposal_status=unobserved
+  if [ -n "$observed_policy_digest" ]; then
+    if [ "$proposal_digest" = "$observed_policy_digest" ]; then proposal_status='matches-observed'
+    else proposal_status='pending-human-enrollment'
+    fi
+  fi
+  case $lifecycle_status in ready) record_status=present ;; drifted) record_status=partial ;; *) record_status=unavailable ;; esac
+  data=$(jq -cn \
+    --arg adapter "$adapter" --arg boundary "$platform" --arg lifecycle "$lifecycle_status" \
+    --arg transport "$transport" --arg request_principal "$request_principal" \
+    --arg pinned_host_key "$pinned_host_key" --arg session_requirement "$session_requirement" \
+    --arg broker_version "$broker_version" --arg broker_digest "$observed_broker_digest" \
+    --arg proposal_digest "$proposal_digest" --arg proposal_status "$proposal_status" \
+    --arg policy_digest "$observed_policy_digest" --arg context_digest "$observed_context_digest" \
+    --arg constraints_digest "$observed_constraints_digest" --arg adapter_verifier_status "$adapter_verifier_status" \
+    --arg node_id "$node_id" --arg fleet_domain "$fleet_domain" \
+    --arg node_key_fingerprint "$node_key_fingerprint" \
+    --arg fleet_ca_fingerprint "$fleet_ca_fingerprint" --arg certificate_serial "$certificate_serial" \
+    --arg certificate_valid_after "$certificate_valid_after" --arg certificate_valid_before "$certificate_valid_before" \
+    --argjson certificate_principals "$certificate_principals" \
+    --argjson certificate_source_addresses "$certificate_source_addresses" \
+    --argjson originating_node_identity "$originating_node_identity" \
+    --argjson ca_generation "$ca_generation" --argjson enrollment_epoch "$enrollment_epoch" \
+    --argjson transport_ready "$transport_ready" --argjson node_identity_ready "$node_identity_ready" \
+    --argjson broker_ready "$broker_ready" --argjson action_context_ready "$action_context_ready" \
+    --argjson execution_principals "$execution_principals" --argjson observed_contexts "$observed_contexts" \
+    --argjson observed_protocol "$observed_protocol" --argjson constraint_generation "$constraint_generation" \
+    --argjson protected_artifacts_ready "$protected_artifacts_ready" \
+    --argjson adapter_mechanism_ready "$adapter_mechanism_ready" '
+    {
+      contract_version:1,platform_adapter:$adapter,platform_boundary:$boundary,
+      lifecycle_status:$lifecycle,
+      transport:(if $transport == "" then null else $transport end),
+      transport_ready:$transport_ready,node_identity_ready:$node_identity_ready,
+      broker_ready:$broker_ready,action_context_ready:$action_context_ready,
+      protected_artifacts_ready:$protected_artifacts_ready,
+      adapter_mechanism_ready:$adapter_mechanism_ready,adapter_verifier_status:$adapter_verifier_status,
+      request_principal:(if $request_principal == "" then null else $request_principal end),
+      execution_principals:$execution_principals,session_requirement:$session_requirement,
+      broker_protocol:{supported:[1,0],observed:$observed_protocol},
+      broker_version:(if $broker_version == "" then null else $broker_version end),
+      broker_digest:(if $broker_digest == "" then null else {algorithm:"sha256",value:$broker_digest} end),
+      policy:{catalog_version:1,version:1,action_manifest_version:1},
+      policy_proposal_digest:{algorithm:"sha256",value:$proposal_digest},
+      policy_proposal_status:$proposal_status,
+      observed_policy_digest:(if $policy_digest == "" then null else {algorithm:"sha256",value:$policy_digest} end),
+      observed_constraints_digest:(if $constraints_digest == "" then null else {algorithm:"sha256",value:$constraints_digest} end),
+      constraint_generation:$constraint_generation,
+      observed_action_contexts:$observed_contexts,
+      context_canary_digest:(if $context_digest == "" then null else {algorithm:"sha256",value:$context_digest} end),
+      node_identity:{
+        node_id:(if $node_id == "" then null else $node_id end),
+        fleet_domain:(if $fleet_domain == "" then null else $fleet_domain end),
+        node_key_fingerprint:(if $node_key_fingerprint == "" then null else $node_key_fingerprint end),
+        fleet_ca_fingerprint:(if $fleet_ca_fingerprint == "" then null else $fleet_ca_fingerprint end),
+        ca_generation:$ca_generation,
+        certificate_serial:(if $certificate_serial == "" then null else $certificate_serial end),
+        certificate_valid_after:(if $certificate_valid_after == "" then null else $certificate_valid_after end),
+        certificate_valid_before:(if $certificate_valid_before == "" then null else $certificate_valid_before end),
+        certificate_principals:$certificate_principals,
+        certificate_source_addresses:$certificate_source_addresses
+      },
+      originating_node_identity:$originating_node_identity,
+      pinned_host_key_fingerprint:(if $pinned_host_key == "" then null else $pinned_host_key end),
+      enrollment_epoch:$enrollment_epoch,active_request:null,last_terminal_result:null,
+      request_ttl:{minimum_seconds:0,maximum_seconds:3600}
+    }')
+  emit privilege_broker readiness "$record_status" high "$data" \
+    '[{"source":"protected-state","method":"read-only-contract-inventory"}]'
 }
 
 run_auth_health() {
@@ -424,6 +658,8 @@ capability_matches() {
 
 auth_verify_allowed=false
 has_section auth && auth_verify_allowed=true
+
+emit_privilege_readiness
 
 if has_section host; then
   hostname_value=$(hostname 2>/dev/null | clip || printf unknown)

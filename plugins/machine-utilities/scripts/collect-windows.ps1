@@ -50,7 +50,7 @@ function Add-Record {
         evidence       = $Evidence
         errors         = $Errors
     })
-    if ($Status -in @("partial", "unavailable", "error")) {
+    if ($Kind -ne "privilege_broker" -and $Status -in @("partial", "unavailable", "error")) {
         $script:HasProblems = $true
     }
 }
@@ -91,6 +91,486 @@ function Get-TextSha256([string]$Text) {
     } finally {
         $Hasher.Dispose()
     }
+}
+
+function Test-PrivilegePolicy([string[]]$Lines) {
+    if ($Lines.Count -ne 10 -or $Lines[0] -cne "policy|1|catalog=1") { return $false }
+    $Expected = [ordered]@{
+        "apt.autoremove.v1" = @("posix-root-v1", "none")
+        "apt.install-package-version.v1" = @("posix-root-v1", "package-source-version-closure-set-sha256")
+        "apt.update-metadata.v1" = @("posix-root-v1", "none")
+        "apt.upgrade-package.v1" = @("posix-root-v1", "package-source-channel-set-sha256")
+        "profile.apply-managed-bundle.v1" = @("windows-user-s4u-v1", "profile-bundle-set-sha256")
+        "profile.inventory-managed-state.v1" = @("windows-user-s4u-v1", "profile-bundle-set-sha256")
+        "winget.install-machine-package.v1" = @("windows-system-v1", "winget-package-version-set-sha256")
+        "winget.inventory-machine.v1" = @("windows-system-v1", "none")
+        "winget.upgrade-machine-package.v1" = @("windows-system-v1", "winget-package-channel-set-sha256")
+    }
+    $Previous = ""
+    $Seen = @{}
+    foreach ($Line in $Lines[1..9]) {
+        if ($Line -notmatch '^[\x20-\x7e]+$') { return $false }
+        $Fields = $Line.Split('|')
+        if ($Fields.Count -ne 6 -or $Fields[0] -cne "action" -or
+            -not $Expected.Contains($Fields[1]) -or $Seen.ContainsKey($Fields[1]) -or
+            ($Previous.Length -gt 0 -and [StringComparer]::Ordinal.Compare($Previous, $Fields[1]) -ge 0) -or
+            $Fields[2] -cne $Expected[$Fields[1]][0] -or
+            $Fields[4] -cne $Expected[$Fields[1]][1] -or
+            $Fields[3] -notin @("enabled", "disabled") -or
+            ($Fields[4] -eq "none" -and $Fields[5] -cne "-") -or
+            ($Fields[4] -ne "none" -and $Fields[5] -cne "-" -and $Fields[5] -notmatch '^[0-9a-f]{64}$')) {
+            return $false
+        }
+        $Seen[$Fields[1]] = $true
+        $Previous = $Fields[1]
+    }
+    return $Seen.Count -eq $Expected.Count
+}
+
+function Get-CanonicalAsciiLines([string]$Path, [int]$MaximumBytes) {
+    try {
+        [byte[]]$Bytes = [IO.File]::ReadAllBytes($Path)
+        if ($Bytes.Count -eq 0 -or $Bytes.Count -gt $MaximumBytes -or $Bytes[-1] -ne 10) { return $null }
+        foreach ($Byte in $Bytes) {
+            if ($Byte -ne 10 -and ($Byte -lt 32 -or $Byte -gt 126)) { return $null }
+        }
+        $Text = [Text.Encoding]::ASCII.GetString($Bytes)
+        return [string[]]@($Text.Substring(0, $Text.Length - 1).Split("`n"))
+    } catch { return $null }
+}
+
+function Test-PrivilegeConstraints([string[]]$PolicyLines, [string[]]$Lines, [string]$FileDigest) {
+    if ($null -eq $Lines -or $Lines.Count -lt 1 -or
+        $Lines[0] -notmatch '^constraints\|1\|generation=([1-9][0-9]{0,9})\|policy-sha256=([0-9a-f]{64})$') {
+        return $null
+    }
+    [int64]$Generation = $Matches[1]
+    if ($Generation -lt 1 -or $Generation -gt 2147483647 -or
+        $Matches[2] -cne (Get-TextSha256 (($PolicyLines -join "`n") + "`n"))) { return $null }
+    $Previous = ""
+    $SeenMembership = @{}
+    foreach ($Line in @($Lines | Select-Object -Skip 1)) {
+        if ($Line.Length -gt 2048 -or ($Previous.Length -gt 0 -and
+            [StringComparer]::Ordinal.Compare($Previous, $Line) -ge 0)) { return $null }
+        $Previous = $Line
+        $Fields = $Line.Split('|')
+        $MembershipAction = if ($Fields[0] -ceq "profile") { "profile" } else { $Fields[1] }
+        $MembershipToken = if ($Fields[0] -ceq "profile") { $Fields[1] } else { $Fields[2] }
+        $MembershipKey = $MembershipAction + "`0" + $MembershipToken
+        if ($SeenMembership.ContainsKey($MembershipKey)) { return $null }
+        $SeenMembership[$MembershipKey] = $true
+        $Token = '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        $Atom = '^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$'
+        $Version = '^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$'
+        $Digest = '^[0-9a-f]{64}$'
+        switch -CaseSensitive ($Fields[0]) {
+            "apt-install" {
+                if ($Fields.Count -ne 8 -or $Fields[1] -cne "apt.install-package-version.v1" -or
+                    $Fields[2] -notmatch $Token -or $Fields[3] -notmatch $Atom -or $Fields[4] -notmatch $Atom -or
+                    $Fields[5] -notmatch $Version -or $Fields[6] -notmatch $Digest -or $Fields[7] -notmatch $Digest) { return $null }
+            }
+            "apt-upgrade" {
+                [int64]$Major = 0
+                if ($Fields.Count -ne 9 -or $Fields[1] -cne "apt.upgrade-package.v1" -or
+                    $Fields[2] -notmatch $Token -or $Fields[3] -notmatch $Atom -or $Fields[4] -notmatch $Atom -or
+                    $Fields[5] -notmatch $Version -or $Fields[6] -notmatch $Version -or
+                    -not [int64]::TryParse($Fields[7], [ref]$Major) -or $Major -lt 0 -or $Major -gt 2147483647 -or
+                    $Fields[8] -notmatch $Digest) { return $null }
+            }
+            "profile" {
+                [int64]$Entries = 0; [int64]$Bytes = 0
+                if ($Fields.Count -ne 9 -or $Fields[1] -notmatch $Token -or
+                    $Fields[2] -notmatch '^S-[0-9]+(-[0-9]+){1,14}$' -or $Fields[3] -notmatch $Atom -or
+                    $Fields[4] -notmatch $Digest -or $Fields[5] -notmatch $Digest -or
+                    $Fields[6] -notin @("managed-only", "managed-and-prune") -or
+                    -not [int64]::TryParse($Fields[7], [ref]$Entries) -or $Entries -lt 1 -or $Entries -gt 100000 -or
+                    -not [int64]::TryParse($Fields[8], [ref]$Bytes) -or $Bytes -lt 1 -or $Bytes -gt 1073741824) { return $null }
+            }
+            "winget-install" {
+                if ($Fields.Count -ne 14 -or $Fields[1] -cne "winget.install-machine-package.v1" -or
+                    $Fields[2] -notmatch $Token -or @($Fields[3..5] | Where-Object { $_ -notmatch $Atom }).Count -gt 0 -or
+                    $Fields[6] -notmatch $Digest -or $Fields[7] -cne "machine" -or
+                    @($Fields[8..10] | Where-Object { $_ -notmatch $Atom }).Count -gt 0 -or
+                    $Fields[11] -notmatch $Version -or $Fields[12] -cne "provider-enforced-manifest-hash" -or
+                    $Fields[13] -cne "source-delegated-all") { return $null }
+            }
+            "winget-upgrade" {
+                [int64]$Major = 0
+                if ($Fields.Count -ne 16 -or $Fields[1] -cne "winget.upgrade-machine-package.v1" -or
+                    $Fields[2] -notmatch $Token -or @($Fields[3..5] | Where-Object { $_ -notmatch $Atom }).Count -gt 0 -or
+                    $Fields[6] -notmatch $Digest -or $Fields[7] -cne "machine" -or
+                    @($Fields[8..10] | Where-Object { $_ -notmatch $Atom }).Count -gt 0 -or
+                    $Fields[11] -notmatch $Version -or $Fields[12] -notmatch $Version -or
+                    -not [int64]::TryParse($Fields[13], [ref]$Major) -or $Major -lt 0 -or $Major -gt 2147483647 -or
+                    $Fields[14] -cne "provider-enforced-manifest-hash" -or $Fields[15] -cne "source-delegated-all") { return $null }
+            }
+            default { return $null }
+        }
+    }
+    $Tokens = @{}
+    foreach ($Action in @(
+        "apt.autoremove.v1", "apt.install-package-version.v1", "apt.update-metadata.v1",
+        "apt.upgrade-package.v1", "profile.apply-managed-bundle.v1", "profile.inventory-managed-state.v1",
+        "winget.install-machine-package.v1", "winget.inventory-machine.v1", "winget.upgrade-machine-package.v1")) {
+        [string[]]$Group = @($Lines | Select-Object -Skip 1 | Where-Object {
+            $Parts = $_.Split('|')
+            ($Parts[0] -ceq "profile" -and $Action.StartsWith("profile.")) -or
+                ($Parts[0] -cne "profile" -and $Parts[1] -ceq $Action)
+        })
+        $PolicyFields = @($PolicyLines | Where-Object { $_.Split('|')[1] -ceq $Action })[0].Split('|')
+        if ($PolicyFields[5] -cne "-" -and
+            ($Group.Count -eq 0 -or (Get-TextSha256 (($Group -join "`n") + "`n")) -cne $PolicyFields[5])) { return $null }
+        if ($PolicyFields[5] -ceq "-" -and $Group.Count -gt 0 -and -not $Action.StartsWith("profile.")) { return $null }
+        $Tokens[$Action] = @($Group | ForEach-Object {
+            $Parts = $_.Split('|'); if ($Parts[0] -ceq "profile") { $Parts[1] } else { $Parts[2] }
+        } | Sort-Object -Unique)
+    }
+    return [pscustomobject]@{ Generation = $Generation; Digest = $FileDigest; Tokens = $Tokens }
+}
+
+function Test-WindowsProtectedFile([string]$Path) {
+    try {
+        $Item = Get-Item -LiteralPath $Path -Force
+        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        if ($env:OS -ne "Windows_NT") { return $false }
+        $Acl = Get-Acl -LiteralPath $Path
+        if ([string]$Acl.Owner -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators)$') { return $false }
+        foreach ($Rule in $Acl.Access) {
+            if ($Rule.AccessControlType -eq "Allow" -and
+                ($Rule.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::Write -bor
+                    [Security.AccessControl.FileSystemRights]::Modify -bor
+                    [Security.AccessControl.FileSystemRights]::FullControl)) -ne 0 -and
+                [string]$Rule.IdentityReference -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Test-WindowsIdentityFileAcl([string]$Path, [bool]$OwnerOnly) {
+    if ($env:OS -ne "Windows_NT") { return $true }
+    try {
+        $Current = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $Acl = Get-Acl -LiteralPath $Path
+        if ([string]$Acl.Owner -notin @([string]$Current.Name, [string]$Current.User.Value)) { return $false }
+        foreach ($Rule in $Acl.Access) {
+            if ($Rule.AccessControlType -ne "Allow") { continue }
+            $Principal = [string]$Rule.IdentityReference
+            $IsOwner = $Principal -in @([string]$Current.Name, [string]$Current.User.Value)
+            $IsSystem = $Principal -match '(S-1-5-18|SYSTEM)$'
+            if ($OwnerOnly -and -not $IsOwner -and -not $IsSystem) { return $false }
+            if (-not $OwnerOnly -and -not $IsOwner -and -not $IsSystem -and
+                ($Rule.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::Write -bor
+                    [Security.AccessControl.FileSystemRights]::Modify -bor
+                    [Security.AccessControl.FileSystemRights]::FullControl)) -ne 0) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Test-NodeIdentity([object]$Identity, [string]$IdentityPath, [object]$Route) {
+    try {
+        $ExpectedFields = @("ca_generation", "certificate_path", "certificate_principals", "certificate_serial",
+            "certificate_source_addresses", "certificate_valid_after", "certificate_valid_before", "enrollment_receipts",
+            "fleet_ca_fingerprint", "fleet_domain", "known_hosts_path", "node_id", "node_key_fingerprint",
+            "private_key_path", "schema", "schema_version")
+        if ((@($Identity.PSObject.Properties.Name | Sort-Object) -join "`n") -cne
+            (@($ExpectedFields | Sort-Object) -join "`n") -or
+            $Identity.schema -cne "machine-utilities.node-identity" -or $Identity.schema_version -ne 1) { return $false }
+        $Paths = @($IdentityPath, [string]$Identity.private_key_path, [string]$Identity.certificate_path,
+            [string]$Identity.known_hosts_path)
+        $RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../.."))
+        foreach ($Path in $Paths) {
+            if (-not [IO.Path]::IsPathRooted($Path) -or $Path.StartsWith($RepositoryRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $Path -match '[\\/](\.codex|\.claude)[\\/]plugins[\\/]cache[\\/]' -or
+                $Path -match '[\\/](CloudStorage|Dropbox|OneDrive[^\\/]*)[\\/]') { return $false }
+            $Item = Get-Item -LiteralPath $Path -Force
+            if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        }
+        if (-not (Test-WindowsIdentityFileAcl ([string]$Identity.private_key_path) $true) -or
+            -not (Test-WindowsIdentityFileAcl ([string]$Identity.certificate_path) $false) -or
+            -not (Test-WindowsIdentityFileAcl ([string]$Identity.known_hosts_path) $false) -or
+            -not (Test-WindowsIdentityFileAcl $IdentityPath $false)) { return $false }
+        $SshKeygen = if ($env:OS -eq "Windows_NT") {
+            Join-Path $env:WINDIR "System32/OpenSSH/ssh-keygen.exe"
+        } else { "/usr/bin/ssh-keygen" }
+        if (-not (Test-Path -LiteralPath $SshKeygen -PathType Leaf)) { return $false }
+        $TemporaryPublic = [IO.Path]::GetTempFileName()
+        $TemporaryHostKeys = [IO.Path]::GetTempFileName()
+        try {
+            @(& $SshKeygen -y -f ([string]$Identity.private_key_path) 2>$null) | Set-Content -LiteralPath $TemporaryPublic -Encoding ascii
+            if ($LASTEXITCODE -ne 0) { return $false }
+            $PrivateFingerprintLine = @(& $SshKeygen -lf $TemporaryPublic -E sha256 2>$null)
+            $CertificateFingerprintLine = @(& $SshKeygen -lf ([string]$Identity.certificate_path) -E sha256 2>$null)
+            $CertificateDetails = @(& $SshKeygen -Lf ([string]$Identity.certificate_path) 2>$null)
+            if ($null -eq $Route) {
+                $KnownHosts = @(& $SshKeygen -lf ([string]$Identity.known_hosts_path) -E sha256 2>$null)
+                if ($LASTEXITCODE -ne 0 -or $KnownHosts.Count -eq 0) { return $false }
+            } else {
+                $Lookup = "[" + [string]$Route.host + "]:" + [string]$Route.port
+                $RouteKeys = @(& $SshKeygen -F $Lookup -f ([string]$Identity.known_hosts_path) 2>$null)
+                if ($LASTEXITCODE -ne 0 -or $RouteKeys.Count -eq 0) { return $false }
+                $RouteKeys | Set-Content -LiteralPath $TemporaryHostKeys -Encoding ascii
+                $RouteFingerprints = @(& $SshKeygen -lf $TemporaryHostKeys -E sha256 2>$null)
+                if ($LASTEXITCODE -ne 0) { return $false }
+                $UniqueFingerprints = @($RouteFingerprints | ForEach-Object {
+                    [regex]::Match($_, 'SHA256:[A-Za-z0-9+/]{43}=?').Value
+                } | Where-Object { $_.Length -gt 0 } | Sort-Object -Unique)
+                if ($UniqueFingerprints.Count -ne 1 -or
+                    $UniqueFingerprints[0] -cne [string]$Route.pinned_host_key_fingerprint) { return $false }
+            }
+        } finally {
+            Remove-Item -LiteralPath $TemporaryPublic -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $TemporaryHostKeys -Force -ErrorAction SilentlyContinue
+        }
+        $PrivateFingerprint = [regex]::Match(($PrivateFingerprintLine -join " "), 'SHA256:[A-Za-z0-9+/]{43}=?').Value
+        $CertificateFingerprint = [regex]::Match(($CertificateFingerprintLine -join " "), 'SHA256:[A-Za-z0-9+/]{43}=?').Value
+        $CaLine = @($CertificateDetails | Where-Object { $_ -match '^\s*Signing CA:' })[0]
+        $CaFingerprint = [regex]::Match($CaLine, 'SHA256:[A-Za-z0-9+/]{43}=?').Value
+        $KeyId = [regex]::Match((@($CertificateDetails | Where-Object { $_ -match '^\s*Key ID:' })[0]), '"([^"]+)"').Groups[1].Value
+        $Serial = [regex]::Match((@($CertificateDetails | Where-Object { $_ -match '^\s*Serial:' })[0]), '[0-9]+$').Value
+        $Valid = [regex]::Match((@($CertificateDetails | Where-Object { $_ -match '^\s*Valid: from ' })[0]),
+            'from ([0-9T:-]+) to ([0-9T:-]+)')
+        $Principals = New-Object Collections.Generic.List[string]
+        $Sources = New-Object Collections.Generic.List[string]
+        $Section = ""
+        $ExtensionsCleared = $false
+        foreach ($Line in $CertificateDetails) {
+            if ($Line -match '^\s*Principals:') { $Section = "principals"; continue }
+            if ($Line -match '^\s*Critical Options:') { $Section = "critical"; continue }
+            if ($Line -match '^\s*Extensions:\s+\(none\)\s*$') { $ExtensionsCleared = $true; $Section = ""; continue }
+            if ($Line -match '^\s*Extensions:') { return $false }
+            $Trimmed = $Line.Trim()
+            if ($Section -eq "principals" -and $Trimmed -ne "(none)") { [void]$Principals.Add($Trimmed) }
+            elseif ($Section -eq "critical" -and $Trimmed -ne "(none)") {
+                if ($Trimmed -notmatch '^source-address\s+(.+)$') { return $false }
+                foreach ($Address in $Matches[1].Split(',')) { [void]$Sources.Add($Address) }
+            }
+        }
+        $ExpectedPrincipals = @($Identity.certificate_principals | Sort-Object)
+        $ExpectedSources = @($Identity.certificate_source_addresses | Sort-Object)
+        $ExpectedAfterText = Limit-Text $Identity.certificate_valid_after
+        $ExpectedBeforeText = Limit-Text $Identity.certificate_valid_before
+        $ExpectedAfter = [DateTime]::ParseExact($ExpectedAfterText, "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+        $ExpectedBefore = [DateTime]::ParseExact($ExpectedBeforeText, "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).ToUniversalTime()
+        return $ExtensionsCleared -and $PrivateFingerprint -ceq [string]$Identity.node_key_fingerprint -and
+            $CertificateFingerprint -ceq [string]$Identity.node_key_fingerprint -and
+            $CaFingerprint -ceq [string]$Identity.fleet_ca_fingerprint -and
+            $KeyId -ceq (([string]$Identity.node_id) + "@" + ([string]$Identity.fleet_domain)) -and
+            $Serial -ceq [string]$Identity.certificate_serial -and
+            ($Valid.Groups[1].Value + "Z") -ceq $ExpectedAfterText -and
+            ($Valid.Groups[2].Value + "Z") -ceq $ExpectedBeforeText -and
+            $ExpectedAfter -le [DateTime]::UtcNow -and $ExpectedBefore -gt [DateTime]::UtcNow -and
+            (@($Principals | Sort-Object) -join "`n") -ceq ($ExpectedPrincipals -join "`n") -and
+            (@($Sources | Sort-Object) -join "`n") -ceq ($ExpectedSources -join "`n")
+    } catch { return $false }
+}
+
+function Test-OriginatingNodeIdentity([object]$Identity) {
+    if ($null -eq $Identity) { return $false }
+    $ExpectedFields = @("ca_generation", "certificate_principals", "certificate_serial",
+        "certificate_source_addresses", "certificate_valid_after", "certificate_valid_before",
+        "fleet_ca_fingerprint", "fleet_domain", "node_id", "node_key_fingerprint", "schema", "schema_version")
+    if ((@($Identity.PSObject.Properties.Name | Sort-Object) -join "`n") -cne
+        (@($ExpectedFields | Sort-Object) -join "`n") -or
+        $Identity.schema -cne "machine-utilities.originating-node-identity" -or $Identity.schema_version -ne 1 -or
+        [string]$Identity.node_id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
+        [string]$Identity.fleet_domain -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$' -or
+        [string]$Identity.node_key_fingerprint -notmatch '^SHA256:[A-Za-z0-9+/]{43}=?$' -or
+        [string]$Identity.fleet_ca_fingerprint -notmatch '^SHA256:[A-Za-z0-9+/]{43}=?$' -or
+        [int64]$Identity.ca_generation -lt 1 -or [string]$Identity.certificate_serial -notmatch '^(0|[1-9][0-9]{0,19})$' -or
+        @($Identity.certificate_principals).Count -lt 2 -or @($Identity.certificate_principals).Count -gt 16 -or
+        @($Identity.certificate_source_addresses).Count -gt 16 -or
+        @($Identity.certificate_principals) -notcontains (([string]$Identity.node_id) + "@" + ([string]$Identity.fleet_domain))) { return $false }
+    try {
+        $After = if ($Identity.certificate_valid_after -is [DateTime]) {
+            $Identity.certificate_valid_after.ToUniversalTime()
+        } else { [DateTime]::ParseExact([string]$Identity.certificate_valid_after, "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal) }
+        $Before = if ($Identity.certificate_valid_before -is [DateTime]) {
+            $Identity.certificate_valid_before.ToUniversalTime()
+        } else { [DateTime]::ParseExact([string]$Identity.certificate_valid_before, "yyyy-MM-ddTHH:mm:ssZ",
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal) }
+        return $After -lt $Before -and $Before.ToUniversalTime() -gt [DateTime]::UtcNow
+    } catch { return $false }
+}
+
+function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
+    $DefaultPolicyPath = Join-Path $PSScriptRoot "../references/privilege-policy.default"
+    $ProposalLines = if ($null -ne $ConfiguredMachine.privilege_broker.policy_proposal) {
+        [string[]]@($ConfiguredMachine.privilege_broker.policy_proposal)
+    } else {
+        [string[]]@(Get-Content -LiteralPath $DefaultPolicyPath)
+    }
+    if (-not (Test-PrivilegePolicy $ProposalLines)) { throw "Invalid privilege policy proposal" }
+    $ProposalDigest = if ($null -ne $Value.worker.policy_proposal_digest) {
+        [string]$Value.worker.policy_proposal_digest
+    } else {
+        Get-TextSha256 (($ProposalLines -join "`n") + "`n")
+    }
+    $Route = $ConfiguredMachine.privilege_broker.automation_transport
+    $Transport = if ($null -eq $Route) { $null } else { [string]$Route.mode }
+    $RequestPrincipal = if ($null -eq $Route) { $null } else { [string]$Route.request_user }
+    $PinnedHostKey = if ($null -eq $Route) { $null } else { [string]$Route.pinned_host_key_fingerprint }
+
+    $IdentityPath = if (-not [string]::IsNullOrWhiteSpace($env:MACHINE_UTILITIES_IDENTITY)) {
+        $env:MACHINE_UTILITIES_IDENTITY
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        Join-Path $env:LOCALAPPDATA "MachineUtilities/identity.json"
+    } else {
+        Join-Path $HOME ".config/machine-utilities/identity.json"
+    }
+    $NodeIdentityReady = $false
+    $ReceiptReady = $false
+    $Identity = $null
+    $Receipt = $null
+    if (Test-Path -LiteralPath $IdentityPath -PathType Leaf) {
+        try {
+            $Identity = Get-Content -LiteralPath $IdentityPath -Raw | ConvertFrom-Json
+            if (Test-NodeIdentity $Identity $IdentityPath $Route) {
+                $NodeIdentityReady = $true
+                $ReceiptProperty = $Identity.enrollment_receipts.PSObject.Properties[$HostId]
+                if ($null -ne $ReceiptProperty) {
+                    $Receipt = $ReceiptProperty.Value
+                    $ReceiptReady = $true
+                }
+            }
+        } catch { $Identity = $null }
+    }
+    $OriginatingIdentity = $Value.worker.originating_node_identity
+    if ($null -eq $OriginatingIdentity -and $NodeIdentityReady) {
+        $OriginatingIdentity = [ordered]@{
+            schema = "machine-utilities.originating-node-identity"; schema_version = 1
+            fleet_domain = [string]$Identity.fleet_domain; node_id = [string]$Identity.node_id
+            node_key_fingerprint = [string]$Identity.node_key_fingerprint
+            fleet_ca_fingerprint = [string]$Identity.fleet_ca_fingerprint
+            ca_generation = [int64]$Identity.ca_generation; certificate_serial = [string]$Identity.certificate_serial
+            certificate_valid_after = Limit-Text $Identity.certificate_valid_after
+            certificate_valid_before = Limit-Text $Identity.certificate_valid_before
+            certificate_principals = @($Identity.certificate_principals)
+            certificate_source_addresses = @($Identity.certificate_source_addresses)
+        }
+    }
+    $TransportReady = $NodeIdentityReady -and $null -ne $Route
+
+    $ProgramDataRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramData)) {
+        Join-Path $HOME ".machine-utilities-programdata"
+    } else { $env:ProgramData }
+    $ProtectedRoot = Join-Path $ProgramDataRoot "MachineUtilities/active"
+    $BrokerPath = Join-Path $ProtectedRoot "broker.ps1"
+    $BrokerVersionPath = Join-Path $ProtectedRoot "broker.version"
+    $PolicyPath = Join-Path $ProtectedRoot "policy.actions"
+    $ConstraintsPath = Join-Path $ProtectedRoot "policy.constraints"
+    $ContextPath = Join-Path $ProtectedRoot "context.canary"
+    $ProtectedArtifactsReady = $false
+    $AdapterMechanismReady = $false
+    $AdapterVerifierStatus = "not-installed"
+    $BrokerVersion = $null
+    $BrokerDigest = $null
+    $PolicyDigest = $null
+    $ConstraintsDigest = $null
+    $ConstraintGeneration = $null
+    $ContextDigest = $null
+    $ObservedContexts = @()
+    if ((Test-WindowsProtectedFile $BrokerPath) -and (Test-WindowsProtectedFile $BrokerVersionPath) -and
+        (Test-WindowsProtectedFile $PolicyPath) -and (Test-WindowsProtectedFile $ConstraintsPath) -and
+        (Test-WindowsProtectedFile $ContextPath)) {
+        $PolicyLines = Get-CanonicalAsciiLines $PolicyPath 4096
+        $ConstraintLines = Get-CanonicalAsciiLines $ConstraintsPath 32768
+        $BrokerVersion = [string](Get-Content -LiteralPath $BrokerVersionPath -TotalCount 1)
+        $ConstraintsDigest = (Get-FileHash -LiteralPath $ConstraintsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Constraints = if ($null -ne $PolicyLines -and (Test-PrivilegePolicy $PolicyLines)) {
+            Test-PrivilegeConstraints $PolicyLines $ConstraintLines $ConstraintsDigest
+        } else { $null }
+        if ($null -ne $Constraints -and $BrokerVersion -match '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            $ProtectedArtifactsReady = $true
+            $ConstraintGeneration = [int64]$Constraints.Generation
+            $BrokerDigest = (Get-FileHash -LiteralPath $BrokerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $PolicyDigest = (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $ContextDigest = (Get-FileHash -LiteralPath $ContextPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $ObservedContexts = @($PolicyLines | Select-Object -Skip 1 | ForEach-Object {
+                $Fields = $_.Split('|')
+                if ($Fields[3] -eq "enabled") {
+                    [ordered]@{
+                        action_id = $Fields[1]
+                        context_id = $Fields[2]
+                        constraint_kind = $Fields[4]
+                        constraint_digest = $Fields[5]
+                        manager_source_identity = $(if ($Fields[4] -eq "none") { "not-applicable" } else { $Fields[5] })
+                        constraint_generation = [int64]$Constraints.Generation
+                        policy_tokens = @($Constraints.Tokens[$Fields[1]])
+                    }
+                }
+            })
+        }
+    }
+
+    $BrokerReady = $false
+    $ActionContextReady = $false
+    $Lifecycle = "needs_enrollment"
+    if ($ReceiptReady -and $ProtectedArtifactsReady) {
+        if ([string]$Receipt.broker_digest -ceq $BrokerDigest -and [string]$Receipt.policy_digest -ceq $PolicyDigest -and
+            [int64]$Receipt.enrollment_epoch -eq [int64]$ConstraintGeneration) {
+            if ([string]$Receipt.context_canary_digest -ceq $ContextDigest) {
+                $Lifecycle = "needs_enrollment"
+            } else { $Lifecycle = "drifted" }
+        } else { $Lifecycle = "drifted" }
+    } elseif ($ReceiptReady -or $ProtectedArtifactsReady) {
+        $Lifecycle = "drifted"
+    }
+    $ProposalStatus = if ($null -eq $PolicyDigest) { "unobserved" } elseif ($ProposalDigest -ceq $PolicyDigest) {
+        "matches-observed"
+    } else { "pending-human-enrollment" }
+    $RecordStatus = if ($Lifecycle -eq "ready") { "present" } elseif ($Lifecycle -eq "drifted") { "partial" } else { "unavailable" }
+    Add-Record -Kind "privilege_broker" -Id "readiness" -Status $RecordStatus -Confidence "high" -Data ([ordered]@{
+        contract_version = 1
+        platform_adapter = "windows-scheduled-task-v1"
+        platform_boundary = "windows"
+        lifecycle_status = $Lifecycle
+        transport = $Transport
+        transport_ready = $TransportReady
+        node_identity_ready = $NodeIdentityReady
+        broker_ready = $BrokerReady
+        action_context_ready = $ActionContextReady
+        protected_artifacts_ready = $ProtectedArtifactsReady
+        adapter_mechanism_ready = $AdapterMechanismReady
+        adapter_verifier_status = $AdapterVerifierStatus
+        request_principal = $RequestPrincipal
+        execution_principals = @("LocalSystem", "enrolled-s4u-user")
+        session_requirement = "no-console-session"
+        broker_protocol = @{ supported = @(1, 0); observed = $null }
+        broker_version = $BrokerVersion
+        broker_digest = $(if ($null -eq $BrokerDigest) { $null } else { @{ algorithm = "sha256"; value = $BrokerDigest } })
+        policy = @{ catalog_version = 1; version = 1; action_manifest_version = 1 }
+        policy_proposal_digest = @{ algorithm = "sha256"; value = $ProposalDigest }
+        policy_proposal_status = $ProposalStatus
+        observed_policy_digest = $(if ($null -eq $PolicyDigest) { $null } else { @{ algorithm = "sha256"; value = $PolicyDigest } })
+        observed_constraints_digest = $(if ($null -eq $ConstraintsDigest) { $null } else { @{ algorithm = "sha256"; value = $ConstraintsDigest } })
+        constraint_generation = $ConstraintGeneration
+        observed_action_contexts = $ObservedContexts
+        context_canary_digest = $(if ($null -eq $ContextDigest) { $null } else { @{ algorithm = "sha256"; value = $ContextDigest } })
+        node_identity = @{
+            node_id = $(if ($NodeIdentityReady) { [string]$Identity.node_id } else { $null })
+            fleet_domain = $(if ($NodeIdentityReady) { [string]$Identity.fleet_domain } else { $null })
+            node_key_fingerprint = $(if ($NodeIdentityReady) { [string]$Identity.node_key_fingerprint } else { $null })
+            fleet_ca_fingerprint = $(if ($NodeIdentityReady) { [string]$Identity.fleet_ca_fingerprint } else { $null })
+            ca_generation = $(if ($NodeIdentityReady) { [int64]$Identity.ca_generation } else { $null })
+            certificate_serial = $(if ($NodeIdentityReady) { [string]$Identity.certificate_serial } else { $null })
+            certificate_valid_after = $(if ($NodeIdentityReady) { Limit-Text $Identity.certificate_valid_after } else { $null })
+            certificate_valid_before = $(if ($NodeIdentityReady) { Limit-Text $Identity.certificate_valid_before } else { $null })
+            certificate_principals = $(if ($NodeIdentityReady) { @($Identity.certificate_principals) } else { @() })
+            certificate_source_addresses = $(if ($NodeIdentityReady) { @($Identity.certificate_source_addresses) } else { @() })
+        }
+        originating_node_identity = $OriginatingIdentity
+        pinned_host_key_fingerprint = $PinnedHostKey
+        enrollment_epoch = $(if ($ReceiptReady) { [int64]$Receipt.enrollment_epoch } else { $null })
+        active_request = $null
+        last_terminal_result = $null
+        request_ttl = @{ minimum_seconds = 90; maximum_seconds = 3600 }
+    }) -Evidence @(@{ source = "protected-state"; method = "read-only-contract-inventory" })
 }
 
 function Get-NullableBoolean([object]$Value, [object]$Default = $null) {
@@ -357,6 +837,15 @@ function Assert-WorkerConfig([object]$Value) {
         [string]$Value.worker.controller_configuration_digest -ne $ControllerConfigDigest.ToLowerInvariant()) {
         throw "Worker configuration is not bound to this controller and target"
     }
+    if ($Value.worker.node_identity_projected -eq $true -or
+        ($null -ne $Value.worker.policy_proposal_digest -and
+         [string]$Value.worker.policy_proposal_digest -notmatch '^[0-9a-f]{64}$')) {
+        throw "Worker configuration projects invalid privilege metadata"
+    }
+    if ($null -ne $Value.worker.originating_node_identity -and
+        -not (Test-OriginatingNodeIdentity $Value.worker.originating_node_identity)) {
+        throw "Worker configuration contains invalid originating node metadata"
+    }
     if ($ConfiguredMachine.platform -ne "windows" -or
         $ConfiguredMachine.transport -ne "codex-remote-control" -or
         [string]::IsNullOrWhiteSpace([string]$ConfiguredMachine.codex_host)) {
@@ -375,6 +864,31 @@ function Assert-WorkerConfig([object]$Value) {
     }
     if (@($ConfiguredMachine.package_managers | Where-Object { $_ -ne "winget" }).Count -gt 0) {
         throw "Invalid Windows package manager"
+    }
+    if ($null -ne $ConfiguredMachine.privilege_broker) {
+        $UnknownBrokerFields = @($ConfiguredMachine.privilege_broker.PSObject.Properties.Name |
+            Where-Object { $_ -notin @("automation_transport", "policy_proposal") })
+        if ($UnknownBrokerFields.Count -gt 0) { throw "Invalid privilege broker configuration" }
+        if ($null -ne $ConfiguredMachine.privilege_broker.policy_proposal -and
+            -not (Test-PrivilegePolicy ([string[]]@($ConfiguredMachine.privilege_broker.policy_proposal)))) {
+            throw "Invalid privilege policy proposal"
+        }
+        $Route = $ConfiguredMachine.privilege_broker.automation_transport
+        if ($null -ne $Route) {
+            if (-not (Test-OriginatingNodeIdentity $Value.worker.originating_node_identity)) {
+                throw "Broker-routed worker requires originating node metadata"
+            }
+            $RouteFields = @($Route.PSObject.Properties.Name)
+            if (@($RouteFields | Where-Object { $_ -notin @("host", "management_networks", "mode", "pinned_host_key_fingerprint", "port", "request_user") }).Count -gt 0 -or
+                $RouteFields.Count -ne 6 -or [string]$Route.mode -ne "windows-sftp" -or
+                [string]$Route.host -notmatch '^[A-Za-z0-9][A-Za-z0-9.:-]{0,254}$' -or
+                [int64]$Route.port -lt 1 -or [int64]$Route.port -gt 65535 -or
+                [string]$Route.request_user -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+                [string]$Route.pinned_host_key_fingerprint -notmatch '^SHA256:[A-Za-z0-9+/]{43}=?$' -or
+                @($Route.management_networks).Count -lt 1 -or @($Route.management_networks).Count -gt 32) {
+                throw "Invalid Windows automation transport"
+            }
+        }
     }
     if ($null -ne $Value.projects) {
         foreach ($Property in $Value.projects.PSObject.Properties) {
@@ -541,6 +1055,8 @@ Add-Record -Kind "snapshot" -Id "snapshot" -Status "present" -Confidence "high" 
     worker_configuration_digest = @{ algorithm = "sha256"; value = $WorkerConfigHash; scope = "bounded-worker-raw-bytes" }
     sections = $Sections
 }
+
+Add-PrivilegeReadiness $Config $Machine
 
 if (Test-Section "host") {
     $Os = Get-CimInstance Win32_OperatingSystem

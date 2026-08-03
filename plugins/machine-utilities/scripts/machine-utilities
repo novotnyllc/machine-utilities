@@ -3,6 +3,7 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 plugin_root=$(CDPATH='' cd -- "$script_dir/.." && pwd)
+repository_root=$(CDPATH='' cd -- "$plugin_root/../.." && pwd)
 schema=machine-utilities.inventory
 schema_version=1
 
@@ -10,6 +11,8 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   machine-utilities validate-config
+  machine-utilities validate-privilege-policy POLICY
+  machine-utilities inspect-privilege-constraints POLICY CONSTRAINTS
   machine-utilities check-mutation-config
   machine-utilities worker-config HOST DOMAIN OUTPUT.json
   machine-utilities collect [--target HOST] [--native-target] [--section SECTION]... [--output FILE|-]
@@ -35,6 +38,393 @@ config_path() {
     printf '%s/machine-utilities/config.json\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
   fi
 }
+
+identity_path() {
+  if [ -n "${MACHINE_UTILITIES_IDENTITY:-}" ]; then
+    printf '%s\n' "$MACHINE_UTILITIES_IDENTITY"
+  else
+    printf '%s/machine-utilities/identity.json\n' "${XDG_CONFIG_HOME:-"$HOME/.config"}"
+  fi
+}
+
+validate_privilege_policy_file() {
+  policy=$1
+  label=${2:-privilege policy}
+  [ -f "$policy" ] && [ ! -L "$policy" ] || {
+    printf 'machine-utilities: %s must be a regular non-symlink file\n' "$label" >&2
+    return 64
+  }
+  [ "$(wc -c <"$policy" | tr -d ' ')" -le 4096 ] &&
+    [ "$(tail -c 1 "$policy" | wc -l | tr -d ' ')" -eq 1 ] &&
+    LC_ALL=C awk -F '|' '
+      BEGIN {
+        expected["apt.autoremove.v1"] = "posix-root-v1|none"
+        expected["apt.install-package-version.v1"] = "posix-root-v1|package-source-version-closure-set-sha256"
+        expected["apt.update-metadata.v1"] = "posix-root-v1|none"
+        expected["apt.upgrade-package.v1"] = "posix-root-v1|package-source-channel-set-sha256"
+        expected["profile.apply-managed-bundle.v1"] = "windows-user-s4u-v1|profile-bundle-set-sha256"
+        expected["profile.inventory-managed-state.v1"] = "windows-user-s4u-v1|profile-bundle-set-sha256"
+        expected["winget.install-machine-package.v1"] = "windows-system-v1|winget-package-version-set-sha256"
+        expected["winget.inventory-machine.v1"] = "windows-system-v1|none"
+        expected["winget.upgrade-machine-package.v1"] = "windows-system-v1|winget-package-channel-set-sha256"
+      }
+      $0 !~ /^[ -~]+$/ { exit 1 }
+      NR == 1 { if ($0 != "policy|1|catalog=1") exit 1; next }
+      {
+        if (NF != 6 || $1 != "action" || !($2 in expected) || seen[$2]++) exit 1
+        if (($3 "|" $5) != expected[$2] || ($4 != "enabled" && $4 != "disabled")) exit 1
+        if ($5 == "none") { if ($6 != "-") exit 1 }
+        else if ($6 != "-" && (length($6) != 64 || $6 !~ /^[0-9a-f]+$/)) exit 1
+        if (previous != "" && previous >= $2) exit 1
+        previous = $2
+      }
+      END { if (NR != 10) exit 1; for (id in expected) if (!seen[id]) exit 1 }
+    ' "$policy" || {
+      printf 'machine-utilities: invalid %s\n' "$label" >&2
+      return 64
+    }
+}
+
+validate_privilege_constraints_file() (
+  policy=$1
+  constraints=$2
+  label=${3:-privilege constraints}
+  validate_privilege_policy_file "$policy" "active privilege policy" || exit $?
+  [ -f "$constraints" ] && [ ! -L "$constraints" ] || {
+    printf 'machine-utilities: %s must be a regular non-symlink file\n' "$label" >&2
+    exit 64
+  }
+  if ! {
+    [ "$(wc -c <"$constraints" | tr -d ' ')" -le 32768 ] &&
+      [ "$(tail -c 1 "$constraints" | wc -l | tr -d ' ')" -eq 1 ] &&
+      LC_ALL=C awk -F '|' '
+      function token(value) { return value ~ /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/ }
+      function atom(value) { return value ~ /^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/ }
+      function digest(value) { return length(value) == 64 && value ~ /^[0-9a-f]+$/ }
+      function version(value) { return value ~ /^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/ }
+      function uint(value, maximum) {
+        return value ~ /^(0|[1-9][0-9]*)$/ && (value + 0) <= maximum
+      }
+      $0 !~ /^[ -~]+$/ || length($0) > 2048 { exit 1 }
+      NR == 1 {
+        if (NF != 4 || $1 != "constraints" || $2 != "1" ||
+            $3 !~ /^generation=[1-9][0-9]{0,9}$/ ||
+            $4 !~ /^policy-sha256=[0-9a-f]{64}$/) exit 1
+        generation = substr($3, 12) + 0
+        if (generation < 1 || generation > 2147483647) exit 1
+        next
+      }
+      {
+        if (previous != "" && previous >= $0) exit 1
+        previous = $0
+        membership_action = ($1 == "profile" ? "profile" : $2)
+        membership_token = ($1 == "profile" ? $2 : $3)
+        if (seen_membership[membership_action SUBSEP membership_token]++) exit 1
+      }
+      $1 == "apt-install" {
+        if (NF != 8 || $2 != "apt.install-package-version.v1" || !token($3) ||
+            !atom($4) || !atom($5) || !version($6) || !digest($7) || !digest($8)) exit 1
+        next
+      }
+      $1 == "apt-upgrade" {
+        if (NF != 9 || $2 != "apt.upgrade-package.v1" || !token($3) ||
+            !atom($4) || !atom($5) || !version($6) || !version($7) ||
+            !uint($8, 2147483647) || !digest($9)) exit 1
+        next
+      }
+      $1 == "profile" {
+        if (NF != 9 || !token($2) || $3 !~ /^S-[0-9]+(-[0-9]+){1,14}$/ || !atom($4) ||
+            !digest($5) || !digest($6) || ($7 != "managed-only" && $7 != "managed-and-prune") ||
+            !uint($8, 100000) || $8 == "0" || !uint($9, 1073741824) || $9 == "0") exit 1
+        next
+      }
+      $1 == "winget-install" {
+        if (NF != 14 || $2 != "winget.install-machine-package.v1" || !token($3) ||
+            !atom($4) || !atom($5) || !atom($6) || !digest($7) || $8 != "machine" ||
+            !atom($9) || !atom($10) || !atom($11) || !version($12) ||
+            $13 != "provider-enforced-manifest-hash" || $14 != "source-delegated-all") exit 1
+        next
+      }
+      $1 == "winget-upgrade" {
+        if (NF != 16 || $2 != "winget.upgrade-machine-package.v1" || !token($3) ||
+            !atom($4) || !atom($5) || !atom($6) || !digest($7) || $8 != "machine" ||
+            !atom($9) || !atom($10) || !atom($11) || !version($12) || !version($13) ||
+            !uint($14, 2147483647) || $15 != "provider-enforced-manifest-hash" ||
+            $16 != "source-delegated-all") exit 1
+        next
+      }
+      { exit 1 }
+      ' "$constraints"
+  }; then
+      printf 'machine-utilities: invalid %s\n' "$label" >&2
+      exit 64
+  fi
+
+  policy_digest=$(sha256_file "$policy")
+  [ "$(LC_ALL=C sed -n '1s/^constraints|1|generation=[^|]*|policy-sha256=//p' "$constraints")" = "$policy_digest" ] || {
+    printf 'machine-utilities: %s does not bind the active policy digest\n' "$label" >&2
+    exit 64
+  }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-constraints.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  for action in \
+    apt.install-package-version.v1 apt.upgrade-package.v1 \
+    profile.apply-managed-bundle.v1 profile.inventory-managed-state.v1 \
+    winget.install-machine-package.v1 winget.upgrade-machine-package.v1; do
+    LC_ALL=C awk -F '|' -v action="$action" '
+      NR == 1 { next }
+      ($1 == "profile" && action ~ /^profile[.]/) || ($1 != "profile" && $2 == action) { print }
+    ' "$constraints" >"$tmp/$action"
+    expected=$(LC_ALL=C awk -F '|' -v action="$action" '$1 == "action" && $2 == action { print $6 }' "$policy")
+    if [ "$expected" = - ]; then
+      case $action in
+        profile.*)
+          other_profile=$(LC_ALL=C awk -F '|' '$1 == "action" && $2 ~ /^profile[.]/ && $6 != "-" { print $6 }' "$policy" | head -1)
+          [ -n "$other_profile" ] || [ ! -s "$tmp/$action" ] || exit 1
+          ;;
+        *) [ ! -s "$tmp/$action" ] || exit 1 ;;
+      esac
+    else
+      [ -s "$tmp/$action" ] && [ "$(sha256_file "$tmp/$action")" = "$expected" ] || {
+        printf 'machine-utilities: %s has missing or digest-mismatched records for %s\n' "$label" "$action" >&2
+        exit 64
+      }
+    fi
+  done
+)
+
+inspect_privilege_constraints_file() (
+  policy=$1
+  constraints=$2
+  validate_privilege_constraints_file "$policy" "$constraints"
+  generation=$(LC_ALL=C sed -n '1s/^constraints|1|generation=\([^|]*\)|.*/\1/p' "$constraints")
+  constraints_digest=$(sha256_file "$constraints")
+  jq -Rsc --argjson generation "$generation" --arg constraints_digest "$constraints_digest" '
+    split("\n") | .[1:] | map(select(length > 0) | split("|")) as $records |
+    {
+      schema:"machine-utilities.privilege-constraints",schema_version:1,
+      generation:$generation,digest:{algorithm:"sha256",value:$constraints_digest},
+      actions:[
+        "apt.autoremove.v1","apt.install-package-version.v1","apt.update-metadata.v1",
+        "apt.upgrade-package.v1","profile.apply-managed-bundle.v1",
+        "profile.inventory-managed-state.v1","winget.install-machine-package.v1",
+        "winget.inventory-machine.v1","winget.upgrade-machine-package.v1"
+      ] | map(. as $action | {
+        action_id:$action,
+        policy_tokens:([$records[] |
+          if (.[0] == "profile" and ($action | startswith("profile."))) then .[1]
+          elif (.[0] != "profile" and .[1] == $action) then .[2]
+          else empty end] | sort | unique)
+      })
+    }
+  ' "$constraints"
+)
+
+materialize_policy_proposal() (
+  config=$1
+  target=$2
+  output=$3
+  if jq -e --arg target "$target" '.machines[$target].privilege_broker.policy_proposal != null' \
+    "$config" >/dev/null; then
+    jq -r --arg target "$target" '.machines[$target].privilege_broker.policy_proposal[]' \
+      "$config" >"$output"
+  else
+    cp "$plugin_root/references/privilege-policy.default" "$output"
+  fi
+  validate_privilege_policy_file "$output" "policy proposal for $target"
+)
+
+system_ssh_keygen_path() {
+  case $(uname -s) in
+    Darwin|Linux) ssh_keygen=/usr/bin/ssh-keygen ;;
+    *)
+      printf 'machine-utilities: node identity validation is unsupported on this platform\n' >&2
+      return 69
+      ;;
+  esac
+  [ -x "$ssh_keygen" ] || {
+    printf 'machine-utilities: absolute system ssh-keygen is unavailable: %s\n' "$ssh_keygen" >&2
+    return 69
+  }
+  printf '%s\n' "$ssh_keygen"
+}
+
+validate_node_identity_file() (
+  identity=$1
+  config=$2
+  check_private_owned_file "$identity" "node identity overlay"
+  jq -e --slurpfile config "$config" '
+    . as $identity |
+    type == "object" and
+    (keys | sort) == ([
+      "ca_generation","certificate_path","certificate_serial",
+      "certificate_principals","certificate_source_addresses",
+      "certificate_valid_after","certificate_valid_before","enrollment_receipts",
+      "fleet_ca_fingerprint","fleet_domain","known_hosts_path","node_id",
+      "node_key_fingerprint","private_key_path","schema","schema_version"
+    ] | sort) and
+    .schema == "machine-utilities.node-identity" and .schema_version == 1 and
+    (.fleet_domain | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$")) and
+    (.node_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
+    ([.private_key_path,.certificate_path,.known_hosts_path] |
+      all(type == "string" and startswith("/") and length <= 4096)) and
+    ([.private_key_path,.certificate_path,.known_hosts_path] | unique | length) == 3 and
+    (.node_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+    (.fleet_ca_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+    (.ca_generation | type == "number" and floor == . and . >= 1 and . <= 2147483647) and
+    (.certificate_serial | type == "string" and test("^(0|[1-9][0-9]{0,19})$")) and
+    (.certificate_principals | type == "array" and length >= 2 and length <= 16 and
+      unique == . and all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$"))) and
+    (.certificate_source_addresses | type == "array" and length <= 16 and unique == . and
+      all(.[]; type == "string" and test("^[0-9A-Fa-f:.]+/[0-9]{1,3}$"))) and
+    ((.node_id + "@" + .fleet_domain) as $signing | .certificate_principals | index($signing) != null) and
+    (.certificate_valid_after | type == "string" and fromdateiso8601 > 0 and fromdateiso8601 <= now) and
+    (.certificate_valid_before | type == "string" and fromdateiso8601 >
+      ($identity.certificate_valid_after | fromdateiso8601)) and
+    (.enrollment_receipts | type == "object") and
+    ([.enrollment_receipts | to_entries[] |
+      (.key | test("^[A-Za-z0-9._-]+$") and
+        (($config[0].worker // null) != null or $config[0].machines[.] != null)) and
+      (.value | type == "object") and
+      (.value | keys | sort) == (["broker_digest","context_canary_digest","enrollment_epoch","policy_digest"] | sort) and
+      (.value.enrollment_epoch | type == "number" and floor == . and . >= 1 and . <= 2147483647) and
+      ([.value.broker_digest,.value.context_canary_digest,.value.policy_digest] |
+        all(type == "string" and test("^[0-9a-f]{64}$")))
+    ] | all) and
+    ([.. | strings | length <= 8192 and (test("[[:cntrl:]]") | not)] | all)
+  ' "$identity" >/dev/null || {
+    printf 'machine-utilities: invalid node identity overlay: %s\n' "$identity" >&2
+    return 64
+  }
+  private_key=$(jq -r '.private_key_path' "$identity")
+  certificate=$(jq -r '.certificate_path' "$identity")
+  known_hosts=$(jq -r '.known_hosts_path' "$identity")
+  case $identity in
+    /*) ;;
+    *)
+      printf 'machine-utilities: node identity overlay path must be absolute\n' >&2
+      exit 64
+      ;;
+  esac
+  for local_path in "$identity" "$private_key" "$certificate" "$known_hosts"; do
+    case $local_path in
+      "$repository_root"/*|*/.codex/plugins/cache/*|*/.claude/plugins/cache/*|*/CloudStorage/*|*/Dropbox/*|*/OneDrive*/*)
+        printf 'machine-utilities: node identity path is inside a repository, plugin cache, or synced root\n' >&2
+        exit 64
+        ;;
+    esac
+  done
+  check_owner_only_file "$private_key" "node private key"
+  check_private_owned_file "$certificate" "node certificate"
+  check_private_owned_file "$known_hosts" "automation known-hosts file"
+  ssh_keygen=$(system_ssh_keygen_path)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-identity.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  if ! {
+    "$ssh_keygen" -y -f "$private_key" >"$tmp/private.pub" 2>/dev/null &&
+      "$ssh_keygen" -lf "$tmp/private.pub" -E sha256 >"$tmp/private.fingerprint" 2>/dev/null &&
+      TZ=UTC "$ssh_keygen" -Lf "$certificate" >"$tmp/certificate.details" 2>/dev/null &&
+      "$ssh_keygen" -lf "$certificate" -E sha256 >"$tmp/certificate.fingerprint" 2>/dev/null &&
+      "$ssh_keygen" -lf "$known_hosts" -E sha256 >"$tmp/known-hosts.fingerprints" 2>/dev/null
+  }; then
+      printf 'machine-utilities: node identity OpenSSH material is malformed\n' >&2
+      exit 64
+  fi
+  [ -s "$tmp/known-hosts.fingerprints" ] || {
+    printf 'machine-utilities: automation known-hosts file contains no valid host key\n' >&2
+    exit 64
+  }
+  private_fingerprint=$(awk 'NR == 1 { print $2 }' "$tmp/private.fingerprint")
+  certificate_fingerprint=$(awk 'NR == 1 { print $2 }' "$tmp/certificate.fingerprint")
+  signing_ca_fingerprint=$(awk '/^[[:space:]]*Signing CA:/ { for (i=1; i<=NF; i++) if ($i ~ /^SHA256:/) { print $i; exit } }' "$tmp/certificate.details")
+  certificate_key_id=$(awk -F '"' '/^[[:space:]]*Key ID:/ { print $2; exit }' "$tmp/certificate.details")
+  observed_serial=$(awk '/^[[:space:]]*Serial:/ { print $2; exit }' "$tmp/certificate.details")
+  observed_valid_after=$(awk '/^[[:space:]]*Valid: from / { print $3 "Z"; exit }' "$tmp/certificate.details")
+  observed_valid_before=$(awk '/^[[:space:]]*Valid: from / { print $5 "Z"; exit }' "$tmp/certificate.details")
+  awk '
+    /^[[:space:]]*Principals:/ { section=1; next }
+    /^[[:space:]]*Critical Options:/ { section=0 }
+    section {
+      sub(/^[[:space:]]+/, "")
+      if ($0 != "(none)") print
+    }
+  ' "$tmp/certificate.details" | LC_ALL=C sort >"$tmp/observed.principals"
+  jq -r '.certificate_principals[]' "$identity" | LC_ALL=C sort >"$tmp/expected.principals"
+  awk '
+    /^[[:space:]]*Critical Options:/ { section=1; next }
+    /^[[:space:]]*Extensions:/ { section=0 }
+    section {
+      sub(/^[[:space:]]+/, "")
+      if ($0 != "(none)" && $1 != "source-address") exit 1
+      if ($1 == "source-address") {
+        count=split($2, addresses, ",")
+        for (i=1; i<=count; i++) print addresses[i]
+      }
+    }
+  ' "$tmp/certificate.details" | LC_ALL=C sort >"$tmp/observed.sources" || {
+    printf 'machine-utilities: node certificate contains an unapproved critical option\n' >&2
+    exit 64
+  }
+  jq -r '.certificate_source_addresses[]' "$identity" | LC_ALL=C sort >"$tmp/expected.sources"
+  expected_node_fingerprint=$(jq -r '.node_key_fingerprint' "$identity")
+  expected_ca_fingerprint=$(jq -r '.fleet_ca_fingerprint' "$identity")
+  expected_key_id=$(jq -r '.node_id + "@" + .fleet_domain' "$identity")
+  expected_serial=$(jq -r '.certificate_serial' "$identity")
+  expected_valid_after=$(jq -r '.certificate_valid_after' "$identity")
+  expected_valid_before=$(jq -r '.certificate_valid_before' "$identity")
+  if ! {
+    [ "$private_fingerprint" = "$expected_node_fingerprint" ] &&
+      [ "$certificate_fingerprint" = "$expected_node_fingerprint" ] &&
+      [ "$signing_ca_fingerprint" = "$expected_ca_fingerprint" ] &&
+      [ "$certificate_key_id" = "$expected_key_id" ] &&
+      [ "$observed_serial" = "$expected_serial" ] &&
+      [ "$observed_valid_after" = "$expected_valid_after" ] &&
+      [ "$observed_valid_before" = "$expected_valid_before" ] &&
+      cmp -s "$tmp/observed.principals" "$tmp/expected.principals" &&
+      cmp -s "$tmp/observed.sources" "$tmp/expected.sources" &&
+      grep -Eq '^[[:space:]]*Extensions:[[:space:]]+\(none\)[[:space:]]*$' "$tmp/certificate.details"
+  }; then
+      printf 'machine-utilities: node key, certificate, CA, identity, validity, principal, source, or extension mismatch\n' >&2
+      exit 64
+  fi
+  jq -r '
+    .machines[] | .privilege_broker.automation_transport // empty |
+    [.host,(.port | tostring),.pinned_host_key_fingerprint] | @tsv
+  ' "$config" >"$tmp/automation-routes"
+  route_number=0
+  tab=$(printf '\t')
+  while IFS="$tab" read -r route_host route_port route_fingerprint; do
+    [ -n "$route_host" ] || continue
+    route_number=$((route_number + 1))
+    route_lookup="[$route_host]:$route_port"
+    if ! "$ssh_keygen" -F "$route_lookup" -f "$known_hosts" \
+        >"$tmp/route-$route_number.matches" 2>/dev/null ||
+      ! "$ssh_keygen" -lf "$tmp/route-$route_number.matches" -E sha256 \
+        >"$tmp/route-$route_number.fingerprints" 2>/dev/null; then
+      printf 'machine-utilities: automation known-hosts has no key for %s\n' "$route_lookup" >&2
+      exit 64
+    fi
+    awk '{ print $2 }' "$tmp/route-$route_number.fingerprints" | LC_ALL=C sort -u \
+      >"$tmp/route-$route_number.unique"
+    if [ "$(wc -l <"$tmp/route-$route_number.unique" | tr -d ' ')" -ne 1 ] ||
+      [ "$(sed -n '1p' "$tmp/route-$route_number.unique")" != "$route_fingerprint" ]; then
+      printf 'machine-utilities: automation known-hosts fingerprint does not match route %s\n' "$route_lookup" >&2
+      exit 64
+    fi
+  done <"$tmp/automation-routes"
+)
+
+public_node_identity() (
+  identity=$1
+  config=$2
+  validate_node_identity_file "$identity" "$config"
+  jq -S '{
+    schema:"machine-utilities.originating-node-identity",schema_version:1,
+    fleet_domain,node_id,node_key_fingerprint,fleet_ca_fingerprint,ca_generation,
+    certificate_serial,certificate_valid_after,certificate_valid_before,
+    certificate_principals,certificate_source_addresses
+  }' "$identity"
+)
 
 require_jq() {
   if ! command -v jq >/dev/null 2>&1; then
@@ -84,6 +474,33 @@ validate_config_file() {
       ((.worker | type == "object") and
        (.worker.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
        (.worker.controller_configuration_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+       ((.worker.policy_proposal_source // null) == null or
+         (.worker.policy_proposal_source | IN("packaged-default","user-configuration"))) and
+       ((.worker.policy_proposal_digest // null) == null or
+         (.worker.policy_proposal_digest | type == "string" and test("^[0-9a-f]{64}$"))) and
+       ((.worker.node_identity_projected // false) == false) and
+       ((.worker.originating_node_identity // null) as $origin |
+         ($origin == null or
+          (($origin | type == "object") and
+           ($origin | keys | sort) == (["ca_generation","certificate_principals",
+             "certificate_serial","certificate_source_addresses","certificate_valid_after",
+             "certificate_valid_before","fleet_ca_fingerprint","fleet_domain","node_id",
+             "node_key_fingerprint","schema","schema_version"] | sort) and
+           $origin.schema == "machine-utilities.originating-node-identity" and
+           $origin.schema_version == 1 and
+           ($origin.node_id | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
+           ($origin.fleet_domain | test("^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$")) and
+           ($origin.node_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+           ($origin.fleet_ca_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+           ($origin.ca_generation | type == "number" and floor == . and . >= 1) and
+           ($origin.certificate_serial | test("^(0|[1-9][0-9]{0,19})$")) and
+           ($origin.certificate_valid_after | fromdateiso8601 > 0 and fromdateiso8601 <= now) and
+           ($origin.certificate_valid_before | fromdateiso8601 > now) and
+           ($origin.certificate_principals | type == "array" and length >= 2 and length <= 16 and
+             unique == . and index($origin.node_id + "@" + $origin.fleet_domain) != null) and
+           ($origin.certificate_source_addresses | type == "array" and length <= 16 and unique == .))) and
+         (if ($config.machines[$config.worker.target].privilege_broker.automation_transport // null) != null
+          then $origin != null else true end)) and
        (.machines | keys == [$config.worker.target]))) and
     (.machines | type == "object") and
     (.machines | length > 0) and
@@ -111,7 +528,42 @@ validate_config_file() {
       ((.package_managers // []) | type == "array") and
       ([.package_managers[]? | IN("homebrew","linuxbrew","apt","winget")] | all) and
       (if any(.package_managers[]?; . == "winget") then .platform == "windows" else true end) and
-      (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end)
+      (if any(.package_managers[]?; . == "apt") then (.platform == "linux" or .platform == "wsl") else true end) and
+      ((.privilege_broker // null) == null or
+        ((.privilege_broker | type == "object") and
+         ([.privilege_broker | keys[] | select(IN("automation_transport","policy_proposal") | not)] | length == 0) and
+         ((.privilege_broker.policy_proposal // null) == null or
+           (.platform | IN("linux","windows")) and
+           (.privilege_broker.policy_proposal | type == "array" and length == 10) and
+           ([.privilege_broker.policy_proposal[] |
+             type == "string" and length > 0 and length <= 512 and test("^[ -~]+$")
+           ] | all)) and
+         ((.privilege_broker.automation_transport // null) == null or
+           (.platform != "wsl") and
+           (.privilege_broker.automation_transport | type == "object") and
+           (.privilege_broker.automation_transport | keys | sort) ==
+             (["host","management_networks","mode","pinned_host_key_fingerprint","port","request_user"] | sort) and
+           (.privilege_broker.automation_transport.host |
+             type == "string" and length <= 255 and test("^[A-Za-z0-9][A-Za-z0-9.:-]{0,254}$")) and
+           (.privilege_broker.automation_transport.port |
+             type == "number" and floor == . and . >= 1 and . <= 65535) and
+           (.privilege_broker.automation_transport.request_user |
+             type == "string" and test("^[A-Za-z0-9._-]{1,128}$")) and
+           (.privilege_broker.automation_transport.pinned_host_key_fingerprint |
+             type == "string" and test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+           (.privilege_broker.automation_transport.management_networks |
+             type == "array" and length > 0 and length <= 32 and unique == .) and
+           ([.privilege_broker.automation_transport.management_networks[] |
+             type == "string" and length <= 128 and
+             (if contains(":") then
+               test("^[0-9A-Fa-f:]+/[0-9]{1,3}$") and ((split("/")[-1] | tonumber) <= 128)
+              else
+               test("^[0-9.]+/[0-9]{1,2}$") and ((split("/")[-1] | tonumber) <= 32)
+              end)
+           ] | all) and
+           (if .platform == "windows" then
+              .privilege_broker.automation_transport.mode == "windows-sftp"
+            else .privilege_broker.automation_transport.mode == "posix-ssh" end))))
     ] | all) and
     ((.projects // {}) | type == "object") and
     ([.projects // {} | to_entries[] |
@@ -264,6 +716,21 @@ validate_config_file() {
     printf 'machine-utilities: invalid version 1 configuration: %s\n' "$path" >&2
     exit 64
   }
+  validate_privilege_policy_file "$plugin_root/references/privilege-policy.default" "packaged privilege policy"
+  proposal_tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-policy.XXXXXX")
+  trap 'rm -rf "$proposal_tmp"' EXIT HUP INT TERM
+  while IFS= read -r proposal_host; do
+    [ -n "$proposal_host" ] || continue
+    jq -r --arg host "$proposal_host" '.machines[$host].privilege_broker.policy_proposal[]' \
+      "$path" >"$proposal_tmp/$proposal_host"
+    validate_privilege_policy_file "$proposal_tmp/$proposal_host" "policy proposal for $proposal_host"
+  done <<EOF
+$(jq -r '.machines | to_entries[] | select(.value.privilege_broker.policy_proposal != null) | .key' "$path")
+EOF
+  rm -rf "$proposal_tmp"
+  trap - EXIT HUP INT TERM
+  identity=$(identity_path)
+  [ ! -e "$identity" ] || validate_node_identity_file "$identity" "$path"
 }
 
 file_mode() {
@@ -317,6 +784,16 @@ check_safe_owned_path() (
 
 check_private_owned_file() {
   check_safe_owned_path "$1" "$2" file
+}
+
+check_owner_only_file() {
+  check_private_owned_file "$1" "$2"
+  mode=$(file_mode "$1")
+  permissions=$(printf '%s' "$mode" | sed 's/.*\(...\)$/\1/')
+  [ "$(printf '%s' "$permissions" | cut -c 2-3)" = 00 ] || {
+    printf 'machine-utilities: %s must not be group/world readable or writable\n' "$2" >&2
+    return 64
+  }
 }
 
 check_mutation_config() {
@@ -517,13 +994,42 @@ worker_config_command() (
   controller_digest=$(sha256_file "$config")
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-worker-config.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  materialize_policy_proposal "$config" "$target" "$tmp/policy-proposal"
+  policy_proposal_digest=$(sha256_file "$tmp/policy-proposal")
+  identity=$(identity_path)
+  if [ -e "$identity" ]; then
+    public_node_identity "$identity" "$config" >"$tmp/originating-node.json"
+  else
+    printf 'null\n' >"$tmp/originating-node.json"
+  fi
+  if jq -e --arg target "$target" '.machines[$target].privilege_broker.automation_transport != null' \
+      "$config" >/dev/null && jq -e '. == null' "$tmp/originating-node.json" >/dev/null; then
+    printf 'machine-utilities: broker-routed worker configuration requires a validated originating node identity\n' >&2
+    exit 64
+  fi
+  if jq -e --arg target "$target" '.machines[$target].privilege_broker.policy_proposal != null' \
+    "$config" >/dev/null; then
+    policy_proposal_source=user-configuration
+  else
+    policy_proposal_source=packaged-default
+  fi
   jq -S \
     --arg target "$target" \
     --arg domain "$domain" \
-    --arg controller_digest "$controller_digest" '
+    --arg controller_digest "$controller_digest" \
+    --arg policy_proposal_source "$policy_proposal_source" \
+    --arg policy_proposal_digest "$policy_proposal_digest" \
+    --slurpfile origin "$tmp/originating-node.json" '
     {
       version,
-      worker:{target:$target,controller_configuration_digest:$controller_digest},
+      worker:{
+        target:$target,
+        controller_configuration_digest:$controller_digest,
+        policy_proposal_source:$policy_proposal_source,
+        policy_proposal_digest:$policy_proposal_digest,
+        node_identity_projected:false,
+        originating_node_identity:$origin[0]
+      },
       machines:{($target):.machines[$target]},
       projects:(
         if ($domain == "projects" or $domain == "inventory") then
@@ -735,7 +1241,8 @@ REMOTE_COLLECTOR
   esac
 
   if [ "$rc" -eq 0 ] &&
-    jq -e 'select(.status == "partial" or .status == "unavailable" or .status == "error")' "$records" >/dev/null; then
+    jq -e 'select(.kind != "privilege_broker" and
+      (.status == "partial" or .status == "unavailable" or .status == "error"))' "$records" >/dev/null; then
     rc=2
     operation_status=partial
     operation_envelope_status=partial
@@ -984,6 +1491,52 @@ precondition_digest() {
     ] | sort_by(.host_id,.kind,.id)[]' | sha256_stream
 }
 
+privilege_precondition_digest() {
+  snapshot=$1
+  jq -cS 'select(.kind == "privilege_broker" and .id == "readiness") |
+    del(.snapshot_id,.observed_at,.data.active_request,.data.last_terminal_result)' "$snapshot" |
+    sha256_stream
+}
+
+validate_privileged_draft() {
+  draft=$1
+  jq -e '
+    def action_contract:
+      {
+        "apt.autoremove.v1":{domain:"updates",context:"posix-root-v1",constraint:false},
+        "apt.install-package-version.v1":{domain:"updates",context:"posix-root-v1",constraint:true},
+        "apt.update-metadata.v1":{domain:"updates",context:"posix-root-v1",constraint:false},
+        "apt.upgrade-package.v1":{domain:"updates",context:"posix-root-v1",constraint:true},
+        "profile.apply-managed-bundle.v1":{domain:"agents",context:"windows-user-s4u-v1",constraint:true},
+        "profile.inventory-managed-state.v1":{domain:"agents",context:"windows-user-s4u-v1",constraint:true},
+        "winget.install-machine-package.v1":{domain:"updates",context:"windows-system-v1",constraint:true},
+        "winget.inventory-machine.v1":{domain:"updates",context:"windows-system-v1",constraint:false},
+        "winget.upgrade-machine-package.v1":{domain:"updates",context:"windows-system-v1",constraint:true}
+      };
+    type == "object" and (keys | sort) == (["domain","operations","privilege_request","target"] | sort) and
+    (.domain | IN("updates","agents")) and
+    (.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+    (.operations | type == "array" and length == 1) and
+    (.operations[0] | type == "object" and (keys | sort) == (["id","kind","type"] | sort)) and
+    .operations[0].type == "semantic-action" and .operations[0].kind == "privileged_action" and
+    (.operations[0].id | type == "string") and
+    (.privilege_request | type == "object" and
+      (keys | sort) == (["action_id","expires_at","policy_token","request_id"] | sort)) and
+    (.privilege_request.action_id == .operations[0].id) and
+    (.privilege_request.action_id as $action | action_contract[$action] != null and
+      .domain == action_contract[$action].domain and
+      (if action_contract[$action].constraint then
+         (.privilege_request.policy_token | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$"))
+       else .privilege_request.policy_token == null end)) and
+    (.privilege_request.request_id | type == "string" and test("^request-[0-9a-f]{32}$")) and
+    (.privilege_request.expires_at | type == "string" and fromdateiso8601 > 0) and
+    ([.. | strings | length <= 8192 and (test("[[:cntrl:]]") | not)] | all)
+  ' "$draft" >/dev/null || {
+    printf 'machine-utilities: invalid privileged plan draft\n' >&2
+    return 64
+  }
+}
+
 seal_plan_command() {
   draft=$1
   snapshot=$2
@@ -993,7 +1546,12 @@ seal_plan_command() {
     printf 'machine-utilities: plan draft must be a regular non-symlink file\n' >&2
     exit 64
   }
-  jq -e '
+  privileged=false
+  if jq -e 'has("privilege_request")' "$draft" >/dev/null; then
+    validate_privileged_draft "$draft"
+    privileged=true
+  else
+    jq -e '
     type == "object" and
     (.domain | IN("updates","agents","auth","chezmoi","projects")) and
     (.target | type == "string" and test("^[A-Za-z0-9._-]+$")) and
@@ -1036,6 +1594,7 @@ seal_plan_command() {
     printf 'machine-utilities: invalid plan draft\n' >&2
     exit 64
   }
+  fi
   validate_file "$snapshot"
   target=$(jq -r '.target' "$draft")
   domain=$(jq -r '.domain' "$draft")
@@ -1070,7 +1629,7 @@ seal_plan_command() {
     exit 65
   }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
-  if [ "$platform" = windows ]; then
+  if [ "$platform" = windows ] && [ "$privileged" = false ]; then
     jq -e --arg target "$target" '
       .machines[$target] as $machine |
       ($machine.expected_hostname | type == "string" and length > 0) and
@@ -1108,39 +1667,108 @@ seal_plan_command() {
     printf 'machine-utilities: snapshot does not contain a completed %s inventory\n' "$required_section" >&2
     exit 65
   }
-  jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
-    [$draft[0].operations[] | ([.kind,.id] | @json)] as $wanted |
-    [$records[] | select(.kind != "snapshot" and .kind != "operation" and
-      (.status == "present" or .status == "absent")) | ([.kind,.id] | @json)] as $observed |
-    ($wanted - $observed) | length == 0
-  ' >/dev/null || {
-    printf 'machine-utilities: plan operations are not covered by usable snapshot records\n' >&2
-    exit 65
-  }
-  jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
-    all($draft[0].operations[];
-      if .type == "package-upgrade" then
-        . as $operation |
-        any($records[]; .kind == $operation.kind and .id == $operation.id and
-          .status == "present" and .data.candidate_version == $operation.candidate_version and
-          .data.update_available == true)
-      elif .type == "agent-update" and .kind == "agent_runtime" then
-        . as $operation |
-        any($records[]; .kind == $operation.kind and .id == $operation.id and
-          .status == "present")
-      elif .type == "project-update" then
-        . as $operation |
-        any($records[]; .kind == $operation.kind and .id == $operation.id and
-          .status == "present" and .data.origin_matches == true and
-          .data.repository_readiness == "ready" and .data.dirty_count == 0 and
-          .data.sync_state == "local-tracking-behind")
-      else true end)
-  ' >/dev/null || {
-    printf 'machine-utilities: plan does not match an actionable observed state\n' >&2
-    exit 65
-  }
+  if [ "$privileged" = true ]; then
+    action_id=$(jq -r '.privilege_request.action_id' "$draft")
+    policy_token=$(jq -c '.privilege_request.policy_token' "$draft")
+    jq -e -s --arg action "$action_id" --arg platform "$platform" --argjson policy_token "$policy_token" '
+      def expected_context($action):
+        if ($action | startswith("apt.")) then "posix-root-v1"
+        elif ($action | startswith("winget.")) then "windows-system-v1"
+        else "windows-user-s4u-v1" end;
+      any(.[]; .data as $readiness | .kind == "privilege_broker" and .id == "readiness" and .status == "present" and
+        .data.lifecycle_status == "ready" and .data.transport_ready == true and
+        .data.node_identity_ready == true and .data.broker_ready == true and
+        .data.action_context_ready == true and .data.adapter_mechanism_ready == true and
+        (.data.broker_protocol.observed as $protocol |
+          ($protocol | type == "number") and (.data.broker_protocol.supported | index($protocol) != null)) and
+        (.data.broker_version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+        (.data.broker_digest.value | test("^[0-9a-f]{64}$")) and
+        (.data.observed_policy_digest.value | test("^[0-9a-f]{64}$")) and
+        (.data.observed_constraints_digest.value | test("^[0-9a-f]{64}$")) and
+        (.data.context_canary_digest.value | test("^[0-9a-f]{64}$")) and
+        (.data.enrollment_epoch | type == "number" and . >= 1) and
+        (.data.constraint_generation == .data.enrollment_epoch) and
+        (.data.node_identity.node_id | type == "string" and length > 0) and
+        (.data.node_identity.fleet_domain | type == "string" and length > 0) and
+        (.data.node_identity.node_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+        (.data.node_identity.fleet_ca_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+        (.data.node_identity.certificate_serial | test("^(0|[1-9][0-9]{0,19})$")) and
+        (.data.node_identity.certificate_valid_after | fromdateiso8601 > 0 and fromdateiso8601 <= now) and
+        (.data.node_identity.certificate_valid_before | fromdateiso8601 > now) and
+        (.data.originating_node_identity.node_id | type == "string" and length > 0) and
+        (.data.originating_node_identity.fleet_domain | type == "string" and length > 0) and
+        (.data.originating_node_identity.node_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+        (.data.originating_node_identity.fleet_ca_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+        (.data.originating_node_identity.certificate_serial | test("^(0|[1-9][0-9]{0,19})$")) and
+        (.data.originating_node_identity.certificate_valid_after | fromdateiso8601 > 0 and fromdateiso8601 <= now) and
+        (.data.originating_node_identity.certificate_valid_before | fromdateiso8601 > now) and
+        (.data.pinned_host_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+        (.data.request_principal | type == "string" and length > 0) and
+        (if $platform == "linux" then .data.platform_adapter == "posix-sudo-v1"
+         elif $platform == "windows" then .data.platform_adapter == "windows-scheduled-task-v1"
+         else false end) and
+        any(.data.observed_action_contexts[]; .action_id == $action and
+          .context_id == expected_context($action) and
+          .constraint_generation == $readiness.constraint_generation and
+          (.policy_tokens | type == "array" and unique == .) and
+          (if .constraint_kind == "none" then
+             .constraint_digest == "-" and $policy_token == null and (.policy_tokens | length) == 0
+           else (.constraint_digest | test("^[0-9a-f]{64}$")) and
+             ($policy_token | type == "string") and (.policy_tokens | index($policy_token) != null)
+           end)))
+    ' "$snapshot" >/dev/null || {
+      printf 'machine-utilities: privileged action is not ready in the observed broker context\n' >&2
+      exit 65
+    }
+    expires_at=$(jq -r '.privilege_request.expires_at' "$draft")
+    jq -e -s --arg expires_at "$expires_at" '
+      first(.[] | select(.kind == "privilege_broker" and .id == "readiness")) as $r |
+      ($expires_at | fromdateiso8601) as $expiry |
+      ($expiry - now) >= $r.data.request_ttl.minimum_seconds and
+      ($expiry - now) <= $r.data.request_ttl.maximum_seconds
+    ' "$snapshot" >/dev/null || {
+      printf 'machine-utilities: privileged request expiry is outside the observed broker bounds\n' >&2
+      exit 65
+    }
+  else
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      [$draft[0].operations[] | ([.kind,.id] | @json)] as $wanted |
+      [$records[] | select(.kind != "snapshot" and .kind != "operation" and
+        (.status == "present" or .status == "absent")) | ([.kind,.id] | @json)] as $observed |
+      ($wanted - $observed) | length == 0
+    ' >/dev/null || {
+      printf 'machine-utilities: plan operations are not covered by usable snapshot records\n' >&2
+      exit 65
+    }
+    jq -e -n --slurpfile draft "$draft" --slurpfile records "$snapshot" '
+      all($draft[0].operations[];
+        if .type == "package-upgrade" then
+          . as $operation |
+          any($records[]; .kind == $operation.kind and .id == $operation.id and
+            .status == "present" and .data.candidate_version == $operation.candidate_version and
+            .data.update_available == true)
+        elif .type == "agent-update" and .kind == "agent_runtime" then
+          . as $operation |
+          any($records[]; .kind == $operation.kind and .id == $operation.id and
+            .status == "present")
+        elif .type == "project-update" then
+          . as $operation |
+          any($records[]; .kind == $operation.kind and .id == $operation.id and
+            .status == "present" and .data.origin_matches == true and
+            .data.repository_readiness == "ready" and .data.dirty_count == 0 and
+            .data.sync_state == "local-tracking-behind")
+        else true end)
+    ' >/dev/null || {
+      printf 'machine-utilities: plan does not match an actionable observed state\n' >&2
+      exit 65
+    }
+  fi
 
-  precondition_digest=$(precondition_digest "$draft" "$snapshot")
+  if [ "$privileged" = true ]; then
+    precondition_digest=$(privilege_precondition_digest "$snapshot")
+  else
+    precondition_digest=$(precondition_digest "$draft" "$snapshot")
+  fi
   config_digest=$(sha256_file "$config")
   planning_snapshot_id=$(jq -r 'select(.kind == "snapshot") | .snapshot_id' "$snapshot")
   planning_observed_at=$(jq -r 'select(.kind == "snapshot") | .observed_at' "$snapshot")
@@ -1150,34 +1778,87 @@ seal_plan_command() {
   executor_status_command "$tmp/executor.json"
   worker_config_command "$target" "$domain" "$tmp/worker-config.json"
   worker_config_digest=$(sha256_file "$tmp/worker-config.json")
-  jq -S -n \
-    --slurpfile draft "$draft" \
-    --slurpfile executor "$tmp/executor.json" \
-    --arg created_at "$created_at" \
-    --arg config_digest "$config_digest" \
-    --arg worker_config_digest "$worker_config_digest" \
-    --arg precondition_digest "$precondition_digest" \
-    --arg required_section "$required_section" \
-    --arg planning_snapshot_id "$planning_snapshot_id" \
-    --arg planning_observed_at "$planning_observed_at" '
+  if [ "$privileged" = true ]; then
+    jq -s 'first(.[] | select(.kind == "privilege_broker" and .id == "readiness")) | .data' \
+      "$snapshot" >"$tmp/readiness.json"
+    jq -S -n \
+      --slurpfile draft "$draft" --slurpfile executor "$tmp/executor.json" \
+      --slurpfile readiness "$tmp/readiness.json" \
+      --arg created_at "$created_at" --arg config_digest "$config_digest" \
+      --arg worker_config_digest "$worker_config_digest" --arg precondition_digest "$precondition_digest" \
+      --arg required_section "$required_section" --arg planning_snapshot_id "$planning_snapshot_id" \
+      --arg planning_observed_at "$planning_observed_at" '
+      $readiness[0] as $r |
+      $draft[0].privilege_request.action_id as $action |
+      first($r.observed_action_contexts[] | select(.action_id == $action)) as $a |
       {
-        schema:"machine-utilities.plan",
-        schema_version:2,
-        created_at:$created_at,
-        domain:$draft[0].domain,
-        target:$draft[0].target,
-        operations:$draft[0].operations,
-        required_section:$required_section,
-        planning_snapshot_id:$planning_snapshot_id,
+        schema:"machine-utilities.plan",schema_version:3,created_at:$created_at,
+        domain:$draft[0].domain,target:$draft[0].target,operations:$draft[0].operations,
+        required_section:$required_section,planning_snapshot_id:$planning_snapshot_id,
         planning_observed_at:$planning_observed_at,
         configuration_digest:{algorithm:"sha256",value:$config_digest},
         worker_configuration_digest:{algorithm:"sha256",value:$worker_config_digest},
         precondition_digest:{algorithm:"sha256",value:$precondition_digest},
-        required_executor:(
-          $executor[0] |
-          {plugin,marketplace,version,integrity_manifest_sha256,files}
-        )
+        required_executor:($executor[0] | {plugin,marketplace,version,integrity_manifest_sha256,files}),
+        privilege:{
+          contract_version:1,
+          broker:{adapter:$r.platform_adapter,protocol_version:$r.broker_protocol.observed,
+            version:$r.broker_version,digest:$r.broker_digest},
+          policy:{catalog_version:$r.policy.catalog_version,version:$r.policy.version,
+            action_manifest_version:$r.policy.action_manifest_version,digest:$r.observed_policy_digest,
+            proposal_digest:$r.policy_proposal_digest,constraint_kind:$a.constraint_kind,
+            constraint_digest:$a.constraint_digest,constraint_generation:$a.constraint_generation,
+            constraints_digest:$r.observed_constraints_digest},
+          action:{id:$action,policy_token:$draft[0].privilege_request.policy_token},
+          context:{required:$a.context_id,
+            observed_execution_principal:(if $a.context_id == "posix-root-v1" then "root"
+              elif $a.context_id == "windows-system-v1" then "LocalSystem" else "enrolled-s4u-user" end),
+            session_requirement:$r.session_requirement,platform_boundary:$r.platform_boundary,
+            manager_source_identity:$a.manager_source_identity,canary_digest:$r.context_canary_digest},
+          request:{id:$draft[0].privilege_request.request_id,created_at:$created_at,
+            expires_at:$draft[0].privilege_request.expires_at,transport:$r.transport,
+            principal:$r.request_principal,originating_node_id:$r.originating_node_identity.node_id,
+            node_key_fingerprint:$r.originating_node_identity.node_key_fingerprint,
+            certificate_serial:$r.originating_node_identity.certificate_serial},
+          enrollment:{epoch:$r.enrollment_epoch,fleet_domain:$r.originating_node_identity.fleet_domain,
+            fleet_ca_fingerprint:$r.originating_node_identity.fleet_ca_fingerprint,
+            ca_generation:$r.originating_node_identity.ca_generation,
+            certificate_valid_after:$r.originating_node_identity.certificate_valid_after,
+            certificate_valid_before:$r.originating_node_identity.certificate_valid_before,
+            pinned_host_key_fingerprint:$r.pinned_host_key_fingerprint},
+          precondition:{digest:{algorithm:"sha256",value:$precondition_digest}}
+        }
       }' >"$tmp/base.json"
+  else
+    jq -S -n \
+      --slurpfile draft "$draft" \
+      --slurpfile executor "$tmp/executor.json" \
+      --arg created_at "$created_at" \
+      --arg config_digest "$config_digest" \
+      --arg worker_config_digest "$worker_config_digest" \
+      --arg precondition_digest "$precondition_digest" \
+      --arg required_section "$required_section" \
+      --arg planning_snapshot_id "$planning_snapshot_id" \
+      --arg planning_observed_at "$planning_observed_at" '
+        {
+          schema:"machine-utilities.plan",
+          schema_version:2,
+          created_at:$created_at,
+          domain:$draft[0].domain,
+          target:$draft[0].target,
+          operations:$draft[0].operations,
+          required_section:$required_section,
+          planning_snapshot_id:$planning_snapshot_id,
+          planning_observed_at:$planning_observed_at,
+          configuration_digest:{algorithm:"sha256",value:$config_digest},
+          worker_configuration_digest:{algorithm:"sha256",value:$worker_config_digest},
+          precondition_digest:{algorithm:"sha256",value:$precondition_digest},
+          required_executor:(
+            $executor[0] |
+            {plugin,marketplace,version,integrity_manifest_sha256,files}
+          )
+        }' >"$tmp/base.json"
+  fi
   plan_digest=$(jq -cS . "$tmp/base.json" | sha256_stream)
   plan_id="plan-$(printf '%s' "$plan_digest" | cut -c 1-16)"
   jq -S --arg plan_id "$plan_id" --arg plan_digest "$plan_digest" \
@@ -1188,12 +1869,238 @@ seal_plan_command() {
   rm -rf "$tmp"
 }
 
+validate_privileged_plan_file() {
+  plan=$1
+  jq -e '
+    def exact($keys): (keys | sort) == ($keys | sort);
+    . as $plan |
+    type == "object" and exact(["configuration_digest","created_at","domain","operations","plan_digest",
+      "plan_id","planning_observed_at","planning_snapshot_id","precondition_digest","privilege",
+      "required_executor","required_section","schema","schema_version","target","worker_configuration_digest"]) and
+    .schema == "machine-utilities.plan" and .schema_version == 3 and
+    (.plan_id | test("^plan-[0-9a-f]{16}$")) and (.domain | IN("updates","agents")) and
+    (.target | test("^[A-Za-z0-9._-]+$")) and (.required_section | IN("packages","agents")) and
+    (.created_at | fromdateiso8601 > 0) and (.planning_observed_at | fromdateiso8601 > 0) and
+    (.planning_snapshot_id | type == "string" and length > 0) and
+    (.operations | type == "array" and length == 1) and
+    (.operations[0] | exact(["id","kind","type"]) and .type == "semantic-action" and
+      .kind == "privileged_action") and
+    (.configuration_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+      (.value | test("^[0-9a-f]{64}$"))) and
+    (.worker_configuration_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+      (.value | test("^[0-9a-f]{64}$"))) and
+    (.precondition_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+      (.value | test("^[0-9a-f]{64}$"))) and
+    (.plan_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+      (.value | test("^[0-9a-f]{64}$"))) and
+    (.required_executor.plugin == "machine-utilities") and
+    (.required_executor.marketplace | test("^[A-Za-z0-9._-]+$")) and
+    (.required_executor.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.required_executor.integrity_manifest_sha256 | test("^[0-9a-f]{64}$")) and
+    (.required_executor.files | type == "array" and length > 0) and
+    ((.required_executor.files | map(.path) | unique | length) == (.required_executor.files | length)) and
+    ([.required_executor.files[] |
+      (.path | test("^[A-Za-z0-9._/-]+$") and (startswith("/") | not) and
+        (test("(^|/)\\.\\.(/|$)") | not)) and (.sha256 | test("^[0-9a-f]{64}$"))
+    ] | all) and
+    (.privilege | exact(["action","broker","context","contract_version","enrollment","policy","precondition","request"]) and
+      .contract_version == 1) and
+    (.privilege.broker | exact(["adapter","digest","protocol_version","version"]) and
+      (.adapter | IN("posix-sudo-v1","windows-scheduled-task-v1")) and
+      (.protocol_version | IN(0,1)) and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+      (.digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+        (.value | test("^[0-9a-f]{64}$")))) and
+    (.privilege.policy | exact(["action_manifest_version","catalog_version","constraint_digest","constraint_generation",
+      "constraint_kind","constraints_digest","digest","proposal_digest","version"]) and .catalog_version == 1 and .version == 1 and
+      .action_manifest_version == 1 and
+      (.digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+        (.value | test("^[0-9a-f]{64}$"))) and
+      (.proposal_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+        (.value | test("^[0-9a-f]{64}$"))) and
+      (.constraints_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+        (.value | test("^[0-9a-f]{64}$"))) and
+      (.constraint_generation | type == "number" and floor == . and . >= 1 and
+        . == $plan.privilege.enrollment.epoch) and
+      (.constraint_kind | IN("none","package-source-version-closure-set-sha256",
+        "package-source-channel-set-sha256","profile-bundle-set-sha256",
+        "winget-package-version-set-sha256","winget-package-channel-set-sha256")) and
+      (if .constraint_kind == "none" then .constraint_digest == "-"
+       else (.constraint_digest | test("^[0-9a-f]{64}$")) end)) and
+    (.privilege.action | exact(["id","policy_token"]) and .id == $plan.operations[0].id and
+      (.id | IN("apt.autoremove.v1","apt.install-package-version.v1","apt.update-metadata.v1",
+        "apt.upgrade-package.v1","profile.apply-managed-bundle.v1","profile.inventory-managed-state.v1",
+        "winget.install-machine-package.v1","winget.inventory-machine.v1","winget.upgrade-machine-package.v1")) and
+      (if $plan.privilege.policy.constraint_kind == "none" then .policy_token == null
+       else (.policy_token | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) end)) and
+    (.privilege.context | exact(["canary_digest","manager_source_identity","observed_execution_principal",
+      "platform_boundary","required","session_requirement"]) and
+      (.required | IN("posix-root-v1","windows-system-v1","windows-user-s4u-v1")) and
+      (.observed_execution_principal | IN("root","LocalSystem","enrolled-s4u-user")) and
+      .session_requirement == "no-console-session" and (.platform_boundary | IN("linux","windows")) and
+      (.manager_source_identity | type == "string" and length > 0) and
+      (.canary_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
+        (.value | test("^[0-9a-f]{64}$")))) and
+    (.privilege.request | . as $request | exact(["certificate_serial","created_at","expires_at","id","node_key_fingerprint",
+      "originating_node_id","principal","transport"]) and
+      (.id | test("^request-[0-9a-f]{32}$")) and .created_at == $plan.created_at and
+      (.created_at | fromdateiso8601 > 0) and
+      (.expires_at | fromdateiso8601 > ($request.created_at | fromdateiso8601)) and
+      (.transport | IN("posix-ssh","windows-sftp")) and
+      (.principal | test("^[A-Za-z0-9._-]{1,128}$")) and
+      (.originating_node_id | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
+      (.node_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+      (.certificate_serial | test("^(0|[1-9][0-9]{0,19})$"))) and
+    (.privilege.enrollment | . as $enrollment | exact(["ca_generation","certificate_valid_after","certificate_valid_before","epoch",
+      "fleet_ca_fingerprint","fleet_domain","pinned_host_key_fingerprint"]) and
+      (.epoch | type == "number" and floor == . and . >= 1) and
+      (.fleet_domain | test("^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$")) and
+      (.fleet_ca_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
+      (.ca_generation | type == "number" and floor == . and . >= 1) and
+      (.certificate_valid_after | fromdateiso8601 > 0 and
+        fromdateiso8601 <= ($plan.created_at | fromdateiso8601)) and
+      (.certificate_valid_before | fromdateiso8601 > ($enrollment.certificate_valid_after | fromdateiso8601)) and
+      (.pinned_host_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$"))) and
+    (.privilege.precondition | exact(["digest"]) and
+      .digest == $plan.precondition_digest) and
+    (if (.privilege.action.id | startswith("apt.")) then
+       .domain == "updates" and .required_section == "packages" and
+       .privilege.broker.adapter == "posix-sudo-v1" and .privilege.context.required == "posix-root-v1" and
+       .privilege.context.observed_execution_principal == "root" and .privilege.context.platform_boundary == "linux" and
+       .privilege.request.transport == "posix-ssh"
+     elif (.privilege.action.id | startswith("winget.")) then
+       .domain == "updates" and .required_section == "packages" and
+       .privilege.broker.adapter == "windows-scheduled-task-v1" and
+       .privilege.context.required == "windows-system-v1" and
+       .privilege.context.observed_execution_principal == "LocalSystem" and
+       .privilege.context.platform_boundary == "windows" and .privilege.request.transport == "windows-sftp"
+     else .domain == "agents" and .required_section == "agents" and
+       .privilege.broker.adapter == "windows-scheduled-task-v1" and
+       .privilege.context.required == "windows-user-s4u-v1" and
+       .privilege.context.observed_execution_principal == "enrolled-s4u-user" and
+       .privilege.context.platform_boundary == "windows" and .privilege.request.transport == "windows-sftp" end) and
+    ([.. | strings | length <= 8192 and (test("[[:cntrl:]]") | not)] | all)
+  ' "$plan" >/dev/null || {
+    printf 'machine-utilities: invalid privileged apply plan\n' >&2
+    return 64
+  }
+}
+
+verify_privileged_preconditions_command() {
+  plan=$1
+  snapshot=$2
+  validate_privileged_plan_file "$plan"
+  expected_plan_digest=$(jq -cS 'del(.plan_id,.plan_digest)' "$plan" | sha256_stream)
+  actual_plan_digest=$(jq -r '.plan_digest.value' "$plan")
+  [ "$expected_plan_digest" = "$actual_plan_digest" ] || {
+    printf 'machine-utilities: privileged plan integrity check failed\n' >&2
+    return 65
+  }
+  expected_plan_id="plan-$(printf '%s' "$actual_plan_digest" | cut -c 1-16)"
+  [ "$(jq -r '.plan_id' "$plan")" = "$expected_plan_id" ] || {
+    printf 'machine-utilities: privileged plan ID does not match its digest\n' >&2
+    return 65
+  }
+  config=$(config_path)
+  verify_executor_requirement "$plan" >/dev/null
+  target=$(jq -r '.target' "$plan")
+  if jq -e '.worker != null' "$config" >/dev/null; then
+    jq -e --arg target "$target" --arg controller_digest "$(jq -r '.configuration_digest.value' "$plan")" '
+      .worker.target == $target and .worker.controller_configuration_digest == $controller_digest
+    ' "$config" >/dev/null &&
+      [ "$(jq -r '.worker_configuration_digest.value' "$plan")" = "$(sha256_file "$config")" ] || {
+        printf 'machine-utilities: bounded worker configuration does not match the privileged plan\n' >&2
+        return 65
+      }
+  else
+    [ "$(jq -r '.configuration_digest.value' "$plan")" = "$(sha256_file "$config")" ] || {
+      printf 'machine-utilities: configuration changed after privileged planning\n' >&2
+      return 65
+    }
+  fi
+  validate_file "$snapshot"
+  jq -e -s --arg target "$target" 'map(.host_id) | unique == [$target]' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: current snapshot does not exclusively describe privileged target %s\n' "$target" >&2
+    return 64
+  }
+  planning_snapshot_id=$(jq -r '.planning_snapshot_id' "$plan")
+  jq -e -s --arg planning_snapshot_id "$planning_snapshot_id" '
+    any(.[]; .kind == "snapshot" and .snapshot_id != $planning_snapshot_id and
+      ((.observed_at | fromdateiso8601) as $observed | (now - $observed) >= 0 and (now - $observed) <= 900))
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: privileged apply requires a distinct recent inventory\n' >&2
+    return 65
+  }
+  required_section=$(jq -r '.required_section' "$plan")
+  jq -e -s --arg section "$required_section" '
+    any(.[]; .kind == "snapshot" and
+      ((.data.sections | index("all")) != null or (.data.sections | index($section)) != null)) and
+    any(.[]; .kind == "operation" and .status == "present" and .data.operation_status == "completed")
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: current snapshot lacks completed privileged preflight inventory\n' >&2
+    return 65
+  }
+  [ "$(jq -r '.precondition_digest.value' "$plan")" = "$(privilege_precondition_digest "$snapshot")" ] || {
+    printf 'machine-utilities: broker, policy, action context, or node identity changed after planning\n' >&2
+    return 65
+  }
+  jq -e -s --slurpfile plan "$plan" '
+    $plan[0].privilege as $p |
+    any(.[]; .kind == "privilege_broker" and .id == "readiness" and .status == "present" and
+      .data.lifecycle_status == "ready" and .data.transport_ready == true and
+      .data.node_identity_ready == true and .data.broker_ready == true and .data.action_context_ready == true and
+      .data.adapter_mechanism_ready == true and
+      .data.platform_adapter == $p.broker.adapter and .data.broker_protocol.observed == $p.broker.protocol_version and
+      .data.broker_version == $p.broker.version and .data.broker_digest == $p.broker.digest and
+      .data.observed_policy_digest == $p.policy.digest and .data.policy_proposal_digest == $p.policy.proposal_digest and
+      .data.observed_constraints_digest == $p.policy.constraints_digest and
+      .data.constraint_generation == $p.policy.constraint_generation and
+      .data.context_canary_digest == $p.context.canary_digest and .data.platform_boundary == $p.context.platform_boundary and
+      .data.session_requirement == $p.context.session_requirement and .data.transport == $p.request.transport and
+      .data.request_principal == $p.request.principal and
+      (.data.node_identity.certificate_valid_after | fromdateiso8601 <= now) and
+      (.data.node_identity.certificate_valid_before | fromdateiso8601 > now) and
+      .data.originating_node_identity.node_id == $p.request.originating_node_id and
+      .data.originating_node_identity.node_key_fingerprint == $p.request.node_key_fingerprint and
+      .data.originating_node_identity.certificate_serial == $p.request.certificate_serial and
+      .data.enrollment_epoch == $p.enrollment.epoch and
+      .data.originating_node_identity.fleet_domain == $p.enrollment.fleet_domain and
+      .data.originating_node_identity.fleet_ca_fingerprint == $p.enrollment.fleet_ca_fingerprint and
+      .data.originating_node_identity.ca_generation == $p.enrollment.ca_generation and
+      (.data.originating_node_identity.certificate_valid_after | fromdateiso8601 <= now) and
+      (.data.originating_node_identity.certificate_valid_before | fromdateiso8601 > now) and
+      .data.pinned_host_key_fingerprint == $p.enrollment.pinned_host_key_fingerprint and
+      any(.data.observed_action_contexts[]; .action_id == $p.action.id and .context_id == $p.context.required and
+        .constraint_generation == $p.policy.constraint_generation and
+        .constraint_kind == $p.policy.constraint_kind and .constraint_digest == $p.policy.constraint_digest and
+        .manager_source_identity == $p.context.manager_source_identity and
+        (if .constraint_kind == "none" then $p.action.policy_token == null and (.policy_tokens | length) == 0
+         else (.policy_tokens | index($p.action.policy_token) != null) end)))
+  ' "$snapshot" >/dev/null || {
+    printf 'machine-utilities: current broker readiness does not match the sealed privilege contract\n' >&2
+    return 65
+  }
+  jq -e '
+    (.privilege.enrollment.certificate_valid_after | fromdateiso8601) <= now and
+    (.privilege.request.expires_at | fromdateiso8601) > now and
+    (.privilege.request.expires_at | fromdateiso8601) <= (.privilege.enrollment.certificate_valid_before | fromdateiso8601)
+  ' "$plan" >/dev/null || {
+    printf 'machine-utilities: privileged request or node certificate expired\n' >&2
+    return 65
+  }
+  jq -cn --arg plan_id "$expected_plan_id" --arg target "$target" \
+    '{verified:true,privileged:true,plan_id:$plan_id,target:$target}'
+}
+
 verify_preconditions_command() {
   plan=$1
   snapshot=$2
   require_jq
   check_mutation_config
   check_private_owned_file "$plan" "apply plan"
+  if jq -e '.schema_version == 3 or has("privilege")' "$plan" >/dev/null 2>&1; then
+    verify_privileged_preconditions_command "$plan" "$snapshot"
+    return
+  fi
   jq -e '
     .schema == "machine-utilities.plan" and
     .schema_version == 2 and
@@ -1722,6 +2629,10 @@ apply_plan_command() {
     printf 'machine-utilities: apply confirmation must equal the sealed plan ID\n' >&2
     exit 64
   }
+  if jq -e '.schema_version == 3 or has("privilege")' "$plan" >/dev/null 2>&1; then
+    printf 'machine-utilities: privileged execution is not available in contract-only U1\n' >&2
+    exit 69
+  fi
   config=$(config_path)
   target=$(jq -r '.target' "$plan")
   transport=$(jq -r --arg target "$target" '.machines[$target].transport' "$config")
@@ -1972,6 +2883,11 @@ command=${1:-}
 shift
 case $command in
   validate-config) [ $# -eq 0 ] || usage; validate_config_file ;;
+  validate-privilege-policy) [ $# -eq 1 ] || usage; validate_privilege_policy_file "$1" ;;
+  inspect-privilege-constraints)
+    [ $# -eq 2 ] || usage
+    inspect_privilege_constraints_file "$1" "$2"
+    ;;
   check-mutation-config) [ $# -eq 0 ] || usage; check_mutation_config ;;
   worker-config) [ $# -eq 3 ] || usage; worker_config_command "$1" "$2" "$3" ;;
   collect) collect_command "$@" ;;
