@@ -125,6 +125,9 @@ validate_config_file() {
       (.value.path | test("^[A-Za-z]:") | not) and
       (.value.path | test("(^|/)\\.\\.(/|$)") | not)
     ] | all) and
+    ((.handoff_project // null) == null or
+      (.handoff_project | type == "string" and test("^[A-Za-z0-9._-]+$") and
+        $config.projects[.] != null)) and
     ((.capabilities // {}) | type == "object") and
     ([.capabilities // {} | to_entries[] |
       (.key | test("^[A-Za-z0-9._-]+$")) and
@@ -532,6 +535,11 @@ worker_config_command() (
           .machines[$target].codex_control_project as $control |
           {($control):.projects[$control]}
         else {} end
+      ),
+      handoff_project:(
+        if ($domain == "projects" or $domain == "inventory") then
+          (.handoff_project // null)
+        else null end
       ),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),

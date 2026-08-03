@@ -14,15 +14,15 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "6bc4925d1ac36a28faf84d4c4f91aed83e1725eb097603d36463ffe1052f5374"
+      "sha256": "59ae7edd2d630854e9f4330ae474d8b72da2388958139aa2b797091d053efefd"
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "1573ab2bf117a661d45e734b848f753f3f4bdac4bef715af3d37bfe363152fa0"
+      "sha256": "8ab94d4f9a4eb907119d4179348fe58a9b365fff3e0af48a7e9d97b4650231a4"
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "b4df67033b4a4ed88d162917410224cf041f57a274fa7d9f44f909be9aa12ac8"
+      "sha256": "3423a18a2e84778503a215b694d8894a3839e42747d8a1dd876c03a25f06623c"
     }
   ],
   "marketplace": "novotnyllc",

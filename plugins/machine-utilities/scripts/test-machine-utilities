@@ -89,6 +89,7 @@ cat >"$tmp/config.json" <<'JSON'
       "codex": false
     }
   },
+  "handoff_project": "example",
   "capabilities": {
     "example-research": {
       "groups": ["development"],
@@ -687,6 +688,8 @@ fi
   fail "bounded worker config did not retain its target"
 [ "$(jq '.machines | length' "$tmp/ssh-worker-config.json")" -eq 1 ] ||
   fail "bounded worker config leaked unrelated machines"
+[ "$(jq -r '.handoff_project' "$tmp/ssh-worker-config.json")" = example ] ||
+  fail "inventory worker config did not retain its configured handoff project"
 "$cli" worker-config test-windows updates "$tmp/windows-updates-worker-config.json"
 [ "$(jq -r '.machines["test-windows"].codex_control_project' \
   "$tmp/windows-updates-worker-config.json")" = example ] ||
@@ -699,6 +702,12 @@ jq '.capabilities."example-research".requires_auth = ["missing-auth"]' \
 if MACHINE_UTILITIES_CONFIG="$tmp/invalid-capability-reference.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "capability accepted an unknown auth dependency"
+fi
+jq '.handoff_project = "missing-project"' \
+  "$tmp/config.json" >"$tmp/invalid-handoff-project.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-handoff-project.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "handoff project accepted an unknown project reference"
 fi
 jq '.auth_artifacts."test-auth".mode = "0644"' \
   "$tmp/config.json" >"$tmp/invalid-auth-mode.json"
@@ -858,6 +867,23 @@ fi
 if printf '%s' "$json" | grep -q 'nested-fixture'; then
   fail "nested POSIX plugin fixture was classified as cache evidence"
 fi
+
+cp -p "$tmp/home/.codex/config.toml" "$tmp/codex-settings-before-triple-posix.toml"
+printf '%s\n' 'model = """fixture#model""" # triple-basic string' \
+  >"$tmp/home/.codex/config.toml"
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/triple-basic-setting-posix.jsonl"
+"$cli" validate "$tmp/triple-basic-setting-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:model" and .status == "present" and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/triple-basic-setting-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX collector rejected a basic triple-quoted TOML setting"
+printf '%s\n' "model = '''" "fixture#model''' # triple-literal string" \
+  >"$tmp/home/.codex/config.toml"
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/triple-literal-setting-posix.jsonl"
+mv "$tmp/codex-settings-before-triple-posix.toml" "$tmp/home/.codex/config.toml"
+"$cli" validate "$tmp/triple-literal-setting-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:model" and .status == "present" and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/triple-literal-setting-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX collector rejected a delimiter-newline literal triple-quoted TOML setting"
 
 set +e
 "$cli" collect --target test-host --section agents --output "$tmp/agents-without-auth-verify-posix.jsonl"
@@ -1406,6 +1432,24 @@ if [ -n "$pwsh_command" ]; then
   if grep -q 'must-not-leak' "$tmp/windows.jsonl"; then
     fail "Windows collector leaked an unlisted agent setting"
   fi
+  cp -p "$tmp/home/.codex/config.toml" "$tmp/codex-settings-before-triple-windows.toml"
+  printf '%s\n' 'model = """fixture#model""" # triple-basic string' \
+    >"$tmp/home/.codex/config.toml"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/triple-basic-setting-windows.jsonl"
+  "$cli" validate "$tmp/triple-basic-setting-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:model" and .status == "present" and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/triple-basic-setting-windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector rejected a basic triple-quoted TOML setting"
+  printf '%s\n' "model = '''" "fixture#model''' # triple-literal string" \
+    >"$tmp/home/.codex/config.toml"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/triple-literal-setting-windows.jsonl"
+  mv "$tmp/codex-settings-before-triple-windows.toml" "$tmp/home/.codex/config.toml"
+  "$cli" validate "$tmp/triple-literal-setting-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:model" and .status == "present" and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/triple-literal-setting-windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector rejected a delimiter-newline literal triple-quoted TOML setting"
   mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-absent-windows.json"
   HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \

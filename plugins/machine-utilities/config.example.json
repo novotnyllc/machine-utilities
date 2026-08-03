@@ -37,8 +37,15 @@
       "path": "example",
       "groups": ["development"],
       "codex": true
+    },
+    "handoffs": {
+      "source": "owner/private-handoffs",
+      "path": "coordination/handoffs",
+      "groups": ["development"],
+      "codex": true
     }
   },
+  "handoff_project": "handoffs",
   "capabilities": {
     "last30days": {
       "groups": ["development"],

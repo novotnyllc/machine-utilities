@@ -41,6 +41,8 @@ The config defines:
 - machines, groups, native package managers, and transport (`local`, `ssh`, or
   `codex-remote-control`)
 - project sources and host-relative checkout paths
+- an optional `handoff_project` identifying the ordinary configured project
+  used as the private cross-project coordination ledger
 - Codex/Claude capabilities, plugin or skill providers, and standalone skill
   roots
 - agent definitions and credential artifacts, including their distribution

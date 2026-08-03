@@ -239,13 +239,52 @@ function Add-AgentSettings(
             $Escaped = [Regex]::Escape($Key)
             $KeyPattern = '(?:{0}|"{0}"|''{0}'')' -f $Escaped
             $Line = $null
-            foreach ($ConfigLine in $(if ($ArtifactIsFile) { @(Get-Content -LiteralPath $ArtifactPath) } else { @() })) {
+            $LineIndex = -1
+            $ConfigLines = @(
+                if ($ArtifactIsFile) { [IO.File]::ReadAllLines($ArtifactPath) }
+            )
+            for ($Index = 0; $Index -lt $ConfigLines.Count; $Index++) {
+                $ConfigLine = $ConfigLines[$Index]
                 if ($ConfigLine -match '^\s*\[') { break }
-                if ($ConfigLine -cmatch "^\s*$KeyPattern\s*=") { $Line = $ConfigLine; break }
+                if ($ConfigLine -cmatch "^\s*$KeyPattern\s*=") {
+                    $Line = $ConfigLine
+                    $LineIndex = $Index
+                    break
+                }
             }
             if ($null -ne $Line) {
                 $Raw = $Line -creplace "^\s*$KeyPattern\s*=\s*", ""
-                if ($Raw -match "^\s*'([^']*)'\s*(?:#.*)?$") {
+                $TripleDelimiter = if ($Raw.StartsWith('"""', [StringComparison]::Ordinal)) {
+                    '"""'
+                } elseif ($Raw.StartsWith("'''", [StringComparison]::Ordinal)) {
+                    "'''"
+                } else {
+                    $null
+                }
+                if ($null -ne $TripleDelimiter) {
+                    $TripleValue = $Raw.Substring(3)
+                    if ($TripleValue.Length -eq 0 -and $LineIndex + 1 -lt $ConfigLines.Count) {
+                        $TripleValue = $ConfigLines[$LineIndex + 1]
+                    }
+                    $CloseIndex = $TripleValue.IndexOf($TripleDelimiter, [StringComparison]::Ordinal)
+                    if ($CloseIndex -lt 0 -or
+                        $TripleValue.Substring($CloseIndex + 3) -cnotmatch '^\s*(?:#.*)?$') {
+                        $ParseFailed = $true
+                    } else {
+                        $TripleValue = $TripleValue.Substring(0, $CloseIndex)
+                        if ($TripleDelimiter -ceq '"""') {
+                            try {
+                                $Observed = ConvertFrom-Json -InputObject ('"' + $TripleValue + '"')
+                                $Present = $true
+                            } catch {
+                                $ParseFailed = $true
+                            }
+                        } else {
+                            $Observed = $TripleValue
+                            $Present = $true
+                        }
+                    }
+                } elseif ($Raw -match "^\s*'([^']*)'\s*(?:#.*)?$") {
                     $Observed = $Matches[1]
                     $Present = $true
                 } elseif ($Raw -match '^\s*(?<value>"(?:[^"\\]|\\.)*")\s*(?:#.*)?$') {
