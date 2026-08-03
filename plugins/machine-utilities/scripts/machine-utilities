@@ -1000,8 +1000,9 @@ precondition_digest() {
       select(.type == "chezmoi-apply" and has("targets")) |
       ([.kind,.id] | @json)] as $targeted_chezmoi |
     [$records[] |
-      select(. as $record | any($wanted[]; .kind == $record.kind and .id == $record.id)) |
-      if any($targeted_chezmoi[]; . == ([.kind,.id] | @json)) then
+      . as $record |
+      select(any($wanted[]; .kind == $record.kind and .id == $record.id)) |
+      if any($targeted_chezmoi[]; . == ([$record.kind,$record.id] | @json)) then
         .data |= del(.drift_count,.status_digest)
       else . end |
       del(.snapshot_id,.observed_at,.data.codex_checked_at)
@@ -1586,23 +1587,23 @@ validate_chezmoi_targets() {
     return 64
   }
   for target_path in "$@"; do
-    case $target_path in
+    [ ! -L "$target_path" ] || {
+      printf 'machine-utilities: chezmoi target is a symbolic link\n' >&2
+      return 64
+    }
+    target_parent=$(dirname -- "$target_path")
+    target_parent=$(cd -P -- "$target_parent" && pwd) || {
+      printf 'machine-utilities: chezmoi target parent is unavailable\n' >&2
+      return 64
+    }
+    target_physical=$target_parent/$(basename -- "$target_path")
+    case $target_physical in
       "$target_home"/*) ;;
       *)
         printf 'machine-utilities: chezmoi target escapes the current home directory\n' >&2
         return 64
         ;;
     esac
-    relative_path=${target_path#"$target_home"/}
-    current_path=$target_home
-    IFS=/ read -r -a path_components <<<"$relative_path"
-    for path_component in "${path_components[@]}"; do
-      current_path=$current_path/$path_component
-      [ ! -L "$current_path" ] || {
-        printf 'machine-utilities: chezmoi target traverses a symbolic link\n' >&2
-        return 64
-      }
-    done
   done
 }
 
