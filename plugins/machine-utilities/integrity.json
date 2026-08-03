@@ -2,32 +2,32 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "7960d5ad4e1c7ca5d8ee4f7409e8bed81a4636c3fc73bebd47f40d03cbe571b0"
+      "sha256": "92cbf9707b36c0cc4d2dbe77c4c301467fa742600c9a819959a6bc426f02fa05"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "8c04ba3dc50499728149ad7b8216389c4bf7476d92d2b00917a304c6f7cefd01"
+      "sha256": "ec9d68081b96bab1341d5dd91bb5ce58e1ca57f8c86bc0c7f998acf32e30d77a"
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "c6e19db02a2602e7208c716fa404bc3abf630b8ac671d32418b0499986dbf7b4"
+      "sha256": "5969d6c04635a4ea1d10d4366e78c28ee7dab435a5c3cd7a1679b99b83b044b9"
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "b2cd95b509ef1497e7486db536dbc70eeb2aa06c83dae5596726d19911a80339"
+      "sha256": "6bc4925d1ac36a28faf84d4c4f91aed83e1725eb097603d36463ffe1052f5374"
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "a697df8252ab10032dc00ddc5ba3d0760402acad7b85f13718b3cd50b45285b3"
+      "sha256": "1573ab2bf117a661d45e734b848f753f3f4bdac4bef715af3d37bfe363152fa0"
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "b395f07322d38e8d49d9712e4451f92e10d18e11acb5ab95c1a7d8406ff425c2"
+      "sha256": "233573b92d8cfbc1c1bac5437075e3a6ae3e5b09054866ac33cdbbca0d10b1e7"
     }
   ],
   "marketplace": "novotnyllc",
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.3"
+  "version": "0.2.4"
 }

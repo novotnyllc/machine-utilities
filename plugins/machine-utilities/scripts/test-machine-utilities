@@ -92,8 +92,8 @@ cat >"$tmp/config.json" <<'JSON'
   "capabilities": {
     "example-research": {
       "groups": ["development"],
-      "requires_auth": ["test-auth"],
-      "requires_artifacts": ["shared-agent-definition"],
+      "requires_auth": ["test-auth", "native-test-auth"],
+      "requires_artifacts": ["shared-agent-definition", "paths-only-agent-definition"],
       "codex": {"provider": "plugin", "source": "example"},
       "claude": {"provider": "skills-cli", "source": "example-source", "skill": "capability-example"}
     },
@@ -124,6 +124,50 @@ cat >"$tmp/config.json" <<'JSON'
       "kind": "agent-definition",
       "agents": ["codex", "claude"],
       "groups": ["development"]
+    },
+    {
+      "id": "paths-only-agent-definition",
+      "paths": {
+        "test-host": "~/.agents/agents/example.md",
+        "test-apt": "~/.agents/agents/example.md",
+        "test-windows": "~/.agents/agents/example.md",
+        "test-ssh": "~/.agents/agents/example.md"
+      },
+      "kind": "agent-definition",
+      "agents": ["codex", "claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "claude-settings",
+      "path": "~/.claude/settings.json",
+      "kind": "config",
+      "format": "json",
+      "settings": {
+        "remoteControlAtStartup": true,
+        "switchModelsOnFlag": false,
+        "fallbackModel": null,
+        "model": "fixture-model",
+        "availableModels": ["fixture-model"]
+      },
+      "agents": ["claude"],
+      "groups": ["development"]
+    },
+    {
+      "id": "codex-settings",
+      "path": "~/.codex/config.toml",
+      "paths": {
+        "test-host": "~/.codex/config.toml",
+        "test-windows": "~/.codex/config.toml"
+      },
+      "kind": "config",
+      "format": "toml",
+      "settings": {
+        "model": "fixture#model",
+        "check_for_update_on_startup": true,
+        "service_tier": null
+      },
+      "agents": ["codex"],
+      "groups": ["development"]
     }
   ],
   "auth_artifacts": {
@@ -132,6 +176,12 @@ cat >"$tmp/config.json" <<'JSON'
       "strategy": "encrypted-install",
       "secret_ref": "op://test/item/value",
       "verify": ["auth-check", "login", "status"]
+    },
+    "native-test-auth": {
+      "strategy": "reauth",
+      "portability": "native-store",
+      "verify": ["auth-check", "login", "status"],
+      "reauth": ["auth-check", "login"]
     }
   }
 }
@@ -160,6 +210,13 @@ mkdir -p "$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin
   "$tmp/home/.claude/plugins/cache/test-market/claude-example/1.0.0/.claude-plugin" \
   "$tmp/home/.claude/plugins/cache/plugin-eval/fixture/ignored/1.0.0/.claude-plugin" \
   "$tmp/home/.agents/skills/manual-example" "$tmp/home/.agents/agents" "$tmp/home/.agents/empty-agents"
+printf '%s\n' \
+  '{"remoteControlAtStartup":false,"switchModelsOnFlag":false,"model":"fixture-model","unlistedSecret":"must-not-leak"}' \
+  >"$tmp/home/.claude/settings.json"
+printf '%s\n' "\"model\" = 'fixture#model' # quoted TOML key and literal string" \
+  "'check_for_update_on_startup' = true" '[profile.fixture]' \
+  'service_tier = "must-not-leak"' \
+  >"$tmp/home/.codex/config.toml"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.codex-plugin/plugin.json"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/.claude-plugin/plugin.json"
 printf '{}\n' >"$tmp/home/.codex/plugins/cache/test-market/example/1.2.3/nested-fixture/.codex-plugin/plugin.json"
@@ -263,6 +320,10 @@ if [ "${1:-}" = --version ]; then
   printf '%s\n' 'codex fixture'
   exit 0
 fi
+if [ "${1:-}" = update ] && [ "$#" -eq 1 ]; then
+  [ -z "${RUNTIME_UPDATE_MARKER:-}" ] || printf '%s\n' codex >"$RUNTIME_UPDATE_MARKER"
+  exit 0
+fi
 if [ "${1:-}" = plugin ] && [ "${2:-}" = list ] && [ "${3:-}" = --json ]; then
   [ "${CODEX_PLUGIN_LIST_INVALID:-0}" != 1 ] || { printf '{invalid\n'; exit 0; }
   [ "${CODEX_PLUGIN_LIST_INVALID_SHAPE:-0}" != 1 ] || {
@@ -289,6 +350,10 @@ version=2.0.0
   version=\$(cat "\$CLAUDE_STATE_FILE")
 if [ "\${1:-}" = --version ]; then
   printf '%s\n' 'claude fixture'
+  exit 0
+fi
+if [ "\${1:-}" = update ] && [ "\$#" -eq 1 ]; then
+  [ -z "\${RUNTIME_UPDATE_MARKER:-}" ] || printf '%s\n' claude >"\$RUNTIME_UPDATE_MARKER"
   exit 0
 fi
 if [ "\${1:-}" = plugin ] && [ "\${2:-}" = list ] && [ "\${3:-}" = --json ]; then
@@ -536,6 +601,7 @@ export OP_SECRET_FILE="$tmp/op-secret"
 export CHEZMOI_APPLY_MARKER="$tmp/chezmoi-applied"
 export SKILLS_UPDATE_MARKER="$tmp/skills-updated"
 export AGENT_EXEC_MARKER="$tmp/agent-executed"
+export RUNTIME_UPDATE_MARKER="$tmp/runtime-updated"
 export CODEX_STATE_FILE="$tmp/codex-state"
 export CLAUDE_STATE_FILE="$tmp/claude-state"
 export SSH_COMMAND_LOG="$tmp/ssh-commands"
@@ -634,6 +700,71 @@ if MACHINE_UTILITIES_CONFIG="$tmp/invalid-auth-mode.json" \
   "$cli" validate-config >/dev/null 2>&1; then
   fail "encrypted auth artifact accepted a non-private mode"
 fi
+jq '.agent_artifacts[] |= if .id == "claude-settings" then .settings.apiKey = "unsafe" else . end' \
+  "$tmp/config.json" >"$tmp/invalid-agent-setting.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-agent-setting.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "agent settings accepted a non-allowlisted key"
+fi
+jq '.agent_artifacts[] |= if .id == "claude-settings" then .settings.remoteControlAtStartup = "yes" else . end' \
+  "$tmp/config.json" >"$tmp/invalid-agent-setting-type.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-agent-setting-type.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "agent settings accepted an invalid desired value type"
+fi
+jq '.agent_artifacts[] |= if .id == "claude-settings" then .settings.availableModels = [range(0;3000) | "xx"] else . end' \
+  "$tmp/config.json" >"$tmp/invalid-agent-setting-aggregate-size.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-agent-setting-aggregate-size.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "agent settings accepted an oversized aggregate desired value"
+fi
+jq '.agent_artifacts[] |= if .id == "claude-settings" then .agents = ["codex"] else . end' \
+  "$tmp/config.json" >"$tmp/invalid-agent-setting-owner.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-agent-setting-owner.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "agent settings accepted the wrong owning agent"
+fi
+jq '.agent_artifacts[] |= if .id == "codex-settings" then .paths.typo = .paths["test-host"] else . end' \
+  "$tmp/config.json" >"$tmp/invalid-agent-path-host.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-agent-path-host.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "agent artifact accepted a path override for an unknown host"
+fi
+jq 'del(.auth_artifacts["native-test-auth"].verify)' "$tmp/config.json" \
+  >"$tmp/invalid-native-auth.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-native-auth.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "pathless native auth accepted no verification command"
+fi
+jq 'del(.auth_artifacts["native-test-auth"].reauth)' "$tmp/config.json" \
+  >"$tmp/invalid-reauth-command.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-reauth-command.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "reauth strategy accepted no reauthentication command"
+fi
+jq 'del(.auth_artifacts["test-auth"].path) | .auth_artifacts["test-auth"].portability = "per-machine"' \
+  "$tmp/config.json" >"$tmp/invalid-pathless-encrypted-auth.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/invalid-pathless-encrypted-auth.json" \
+  "$cli" validate-config >/dev/null 2>&1; then
+  fail "pathless encrypted auth install was accepted"
+fi
+jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
+  "$tmp/config.json" >"$tmp/ignore-native-auth.json"
+chmod 600 "$tmp/ignore-native-auth.json"
+MACHINE_UTILITIES_CONFIG="$tmp/ignore-native-auth.json" "$cli" validate-config
+jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-windows":"~/.missing"},kind:"config",format:"json",settings:{fallbackModel:null,model:"fixture-model"},agents:["claude"],groups:["development"]}]' \
+  "$tmp/config.json" >"$tmp/missing-agent-path.json"
+set +e
+MACHINE_UTILITIES_CONFIG="$tmp/missing-agent-path.json" "$cli" collect --target test-host \
+  --section agents --section auth --output "$tmp/missing-agent-path.jsonl"
+missing_agent_path_rc=$?
+set -e
+[ "$missing_agent_path_rc" -eq 2 ] || fail "missing per-host artifact path was not partial"
+"$cli" validate "$tmp/missing-agent-path.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "missing-host-path" and .status == "unavailable" and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path.jsonl")" -eq 1 ] ||
+  fail "missing per-host artifact path was not explicit"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "missing-host-path" and .status == "unavailable" and .data.path == null and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path.jsonl")" -eq 2 ] ||
+  fail "missing per-host artifact path dropped configured settings or treated them as observed absent"
 "$cli" collect --target test-host --section all --output "$tmp/snapshot.jsonl"
 [ "$(test_file_mode "$tmp/snapshot.jsonl")" = 600 ] ||
   fail "snapshot mode is not 600"
@@ -665,8 +796,12 @@ assert_contains "$json" '"consistent":true'
   fail "satisfied POSIX capability dependencies were not ready"
 [ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "healthy" and .ready == true)] | length')" -eq 1 ] ||
   fail "POSIX capability did not report healthy auth dependency state"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "native-test-auth" and .status == "healthy" and .ready == true)] | length')" -eq 1 ] ||
+  fail "POSIX capability did not use status-only authentication"
 [ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "shared-agent-definition" and .status == "present" and .ready == true)] | length')" -eq 1 ] ||
   fail "POSIX capability did not report present artifact dependency state"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "paths-only-agent-definition" and .status == "present" and .ready == true)] | length')" -eq 1 ] ||
+  fail "POSIX capability did not resolve a per-host artifact path"
 if printf '%s' "$json" | grep -q 'other-group'; then fail "capability group filter leaked another group"; fi
 assert_contains "$json" '"id":"standalone:manual:manual-example"'
 assert_contains "$json" '"id":"shared-agent-definition"'
@@ -675,6 +810,23 @@ assert_contains "$json" '"scope":"directory-files"'
 assert_contains "$json" '"manager":"manual"'
 assert_contains "$json" '"health":"healthy"'
 assert_contains "$json" '"portability":"per-machine"'
+assert_contains "$json" '"id":"claude-settings:remoteControlAtStartup"'
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "claude-settings:remoteControlAtStartup" and .data.observed == false and .data.desired == true and .data.in_sync == false)] | length')" -eq 1 ] ||
+  fail "Claude Remote Control setting drift was not reported"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .data.observed_present == false and .data.in_sync == true)] | length')" -eq 1 ] ||
+  fail "absent Claude fallback setting was not recognized as desired"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "codex-settings:check_for_update_on_startup" and .data.in_sync == true)] | length')" -eq 1 ] ||
+  fail "Codex TOML setting was not parsed"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "codex-settings:model" and .data.observed == "fixture#model" and .data.in_sync == true)] | length')" -eq 1 ] ||
+  fail "Codex literal TOML string was not parsed"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "agent_setting" and .id == "codex-settings:service_tier" and .data.observed_present == false and .data.in_sync == true)] | length')" -eq 1 ] ||
+  fail "nested TOML key was mistaken for a top-level Codex setting"
+[ "$(printf '%s' "$json" | jq '[.records[] | select(.kind == "auth_artifact" and .id == "native-test-auth" and .status == "present" and .data.type == "native-status" and .data.path == null and .data.health == "healthy")] | length')" -eq 1 ] ||
+  fail "pathless native auth health was not inventoried"
+if printf '%s' "$json" | grep -q 'must-not-leak'; then
+  fail "unlisted agent setting leaked into inventory"
+fi
+assert_contains "$human" 'false -> true (drift)'
 assert_contains "$json" '"id":"codex:test-market:example:1.2.3"'
 assert_contains "$json" '"id":"claude:test-market:claude-example:2.0.0"'
 assert_contains "$json" '"inferred_installed_at_evidence":"filesystem_birthtime"'
@@ -722,6 +874,135 @@ fi
 if grep -q 'lock-secret' "$tmp/snapshot.jsonl"; then
   fail "authenticated skills lock URL leaked into inventory"
 fi
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-absent-posix.json"
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/absent-settings-posix.jsonl"
+mv "$tmp/claude-settings-absent-posix.json" "$tmp/home/.claude/settings.json"
+"$cli" validate "$tmp/absent-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings")) | length' "$tmp/absent-settings-posix.jsonl")" -eq 5 ] ||
+  fail "absent POSIX settings artifact did not emit every configured setting"
+[ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == false and .data.in_sync == false)) | length' "$tmp/absent-settings-posix.jsonl")" -eq 1 ] ||
+  fail "absent POSIX non-null setting was not reported as drift"
+[ "$(jq -s 'map(select(.id == "claude-settings:fallbackModel" and .data.observed_present == false and .data.in_sync == true)) | length' "$tmp/absent-settings-posix.jsonl")" -eq 1 ] ||
+  fail "absent POSIX desired-null setting was not reported in sync"
+cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-null-posix.json"
+printf '%s\n' '{"fallbackModel":null}' >"$tmp/home/.claude/settings.json"
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/explicit-null-setting-posix.jsonl"
+mv "$tmp/claude-settings-null-posix.json" "$tmp/home/.claude/settings.json"
+"$cli" validate "$tmp/explicit-null-setting-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "present" and .data.observed_present == true and .data.observed == null and .data.desired == null and .data.in_sync == false)) | length' "$tmp/explicit-null-setting-posix.jsonl")" -eq 1 ] ||
+  fail "explicit POSIX null setting was not reported as observed drift"
+cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid.json"
+printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"},"fallbackModel":{"apiKey":"nested-null-desired-secret"}}' >"$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/invalid-observed-setting-posix.jsonl"
+invalid_observed_setting_rc=$?
+set -e
+mv "$tmp/claude-settings-valid.json" "$tmp/home/.claude/settings.json"
+[ "$invalid_observed_setting_rc" -eq 2 ] || fail "invalid observed POSIX setting was not partial"
+"$cli" validate "$tmp/invalid-observed-setting-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:model" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-posix.jsonl")" -eq 1 ] ||
+  fail "invalid observed POSIX setting value was not suppressed"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-posix.jsonl")" -eq 1 ] ||
+  fail "nested POSIX value for a null-desired setting was not suppressed"
+invalid_observed_setting_human=$("$cli" render --format human "$tmp/invalid-observed-setting-posix.jsonl")
+assert_contains "$invalid_observed_setting_human" 'setting_parse_failed'
+if printf '%s' "$invalid_observed_setting_human" |
+  awk -F '\t' '$3 == "claude-settings:model" && $5 ~ /null ->/ { found=1 } END { exit !found }'; then
+  fail "human renderer presented an unavailable setting as observed drift"
+fi
+if grep -q 'nested-observed-secret' "$tmp/invalid-observed-setting-posix.jsonl"; then
+  fail "nested data under an allowlisted POSIX setting leaked into inventory"
+fi
+if grep -q 'nested-null-desired-secret' "$tmp/invalid-observed-setting-posix.jsonl"; then
+  fail "nested data under a null-desired POSIX setting leaked into inventory"
+fi
+cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-single-document-posix.json"
+printf '%s\n' '{"model":"fixture-model"}' '{"model":"fixture-model"}' \
+  >"$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/multi-document-settings-posix.jsonl"
+multi_document_settings_posix_rc=$?
+set -e
+mv "$tmp/claude-settings-single-document-posix.json" "$tmp/home/.claude/settings.json"
+[ "$multi_document_settings_posix_rc" -eq 2 ] || fail "multi-document POSIX settings were not partial"
+"$cli" validate "$tmp/multi-document-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/multi-document-settings-posix.jsonl")" -eq 5 ] ||
+  fail "multi-document POSIX JSON dropped configured setting records"
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-posix.json"
+mkdir "$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/directory-settings-posix.jsonl"
+directory_settings_posix_rc=$?
+set -e
+rmdir "$tmp/home/.claude/settings.json"
+mv "$tmp/claude-settings-file-posix.json" "$tmp/home/.claude/settings.json"
+[ "$directory_settings_posix_rc" -eq 2 ] || fail "directory POSIX settings artifact was not partial"
+"$cli" validate "$tmp/directory-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "present" and .data.digest.scope == "directory-files")) | length' "$tmp/directory-settings-posix.jsonl")" -eq 1 ] ||
+  fail "POSIX settings directory artifact type was not reported truthfully"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/directory-settings-posix.jsonl")" -eq 5 ] ||
+  fail "POSIX settings directory dropped configured setting records"
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-link-posix.json"
+printf '%s\n' '{"model":"linked-settings-secret-posix"}' \
+  >"$tmp/linked-claude-settings-posix.json"
+ln -s "$tmp/linked-claude-settings-posix.json" "$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/linked-settings-posix.jsonl"
+linked_settings_posix_rc=$?
+set -e
+rm "$tmp/home/.claude/settings.json" "$tmp/linked-claude-settings-posix.json"
+mv "$tmp/claude-settings-file-before-link-posix.json" "$tmp/home/.claude/settings.json"
+[ "$linked_settings_posix_rc" -eq 2 ] || fail "linked POSIX settings artifact was not partial"
+"$cli" validate "$tmp/linked-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-posix.jsonl")" -eq 1 ] ||
+  fail "linked POSIX settings artifact was not reported without following it"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-posix.jsonl")" -eq 5 ] ||
+  fail "linked POSIX settings artifact dropped configured setting records"
+if grep -q 'linked-settings-secret-posix' "$tmp/linked-settings-posix.jsonl"; then
+  fail "POSIX settings inventory followed a linked artifact"
+fi
+mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-fifo-posix.json"
+mkfifo "$tmp/home/.claude/settings.json"
+(printf '%s\n' '{"model":"fifo-settings-secret-posix"}' >"$tmp/home/.claude/settings.json") &
+fifo_settings_writer=$!
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/fifo-settings-posix.jsonl"
+fifo_settings_posix_rc=$?
+set -e
+kill "$fifo_settings_writer" >/dev/null 2>&1 || true
+wait "$fifo_settings_writer" >/dev/null 2>&1 || true
+rm "$tmp/home/.claude/settings.json"
+mv "$tmp/claude-settings-file-before-fifo-posix.json" "$tmp/home/.claude/settings.json"
+[ "$fifo_settings_posix_rc" -eq 2 ] || fail "FIFO POSIX settings artifact was not partial"
+"$cli" validate "$tmp/fifo-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "non_regular_file")) | length' "$tmp/fifo-settings-posix.jsonl")" -eq 1 ] ||
+  fail "FIFO POSIX settings artifact was not reported as non-regular"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "non_regular_file")) | length' "$tmp/fifo-settings-posix.jsonl")" -eq 5 ] ||
+  fail "FIFO POSIX settings artifact dropped configured setting records"
+if grep -q 'fifo-settings-secret-posix' "$tmp/fifo-settings-posix.jsonl"; then
+  fail "POSIX settings inventory read a FIFO artifact"
+fi
+oversized_setting=$(awk 'BEGIN { for (i = 0; i < 8193; i++) printf "x" }')
+cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-posix.json"
+jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
+  >"$tmp/home/.claude/settings.json"
+set +e
+"$cli" collect --target test-host --section agents --section auth \
+  --output "$tmp/oversized-observed-settings-posix.jsonl"
+oversized_observed_settings_posix_rc=$?
+set -e
+mv "$tmp/claude-settings-bounded-posix.json" "$tmp/home/.claude/settings.json"
+[ "$oversized_observed_settings_posix_rc" -eq 2 ] || fail "oversized observed POSIX settings were not partial"
+"$cli" validate "$tmp/oversized-observed-settings-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "agent_setting" and (.id == "claude-settings:model" or .id == "claude-settings:availableModels") and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/oversized-observed-settings-posix.jsonl")" -eq 2 ] ||
+  fail "oversized scalar or array POSIX setting was not suppressed"
 assert_contains "$json" '"origin":"ssh://github.com/owner/example.git"'
 
 cat >"$tmp/codex-readiness.json" <<JSON
@@ -778,6 +1059,20 @@ set -e
   fail "unhealthy required auth did not make the POSIX capability unavailable"
 [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "unhealthy" and .ready == false)] | length' "$tmp/unhealthy-capability-auth-posix.jsonl")" -eq 1 ] ||
   fail "POSIX capability did not report unhealthy auth dependency state"
+
+set +e
+AUTH_CHECK_FAIL=1 MACHINE_UTILITIES_CONFIG="$tmp/ignore-native-auth.json" \
+  "$cli" collect --target test-host --section auth --output "$tmp/ignore-unhealthy-auth-posix.jsonl"
+ignore_unhealthy_auth_rc=$?
+set -e
+[ "$ignore_unhealthy_auth_rc" -eq 2 ] ||
+  fail "unhealthy ignored POSIX auth did not remain report-only"
+"$cli" validate "$tmp/ignore-unhealthy-auth-posix.jsonl"
+[ "$(jq -s 'map(select(.kind == "auth_artifact" and .id == "native-test-auth" and
+  .status == "partial" and .data.strategy == "ignore" and .data.health == "unhealthy" and
+  .data.reauth_required == false and .data.manual_action == null)) | length' \
+  "$tmp/ignore-unhealthy-auth-posix.jsonl")" -eq 1 ] ||
+  fail "unhealthy ignored POSIX auth emitted actionable reauthentication state"
 
 mv "$tmp/home/.agents/agents/example.md" "$tmp/missing-agent-definition"
 set +e
@@ -1033,6 +1328,44 @@ set -e
 cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
 if [ -n "$pwsh_command" ]; then
   "$cli" worker-config test-windows inventory "$tmp/windows-worker-config.json"
+  jq '.agent_artifacts += [{id:"missing-host-path",paths:{"test-host":"~/.missing"},kind:"config",format:"json",settings:{fallbackModel:null,model:"fixture-model"},agents:["claude"],groups:["development"]}]' \
+    "$tmp/windows-worker-config.json" >"$tmp/missing-agent-path-windows-config.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/missing-agent-path-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents -AllowAuthVerify \
+    >"$tmp/missing-agent-path-windows.jsonl"
+  "$cli" validate "$tmp/missing-agent-path-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "missing-host-path" and .status == "unavailable" and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path-windows.jsonl")" -eq 1 ] ||
+    fail "missing Windows per-host artifact path was not explicit"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "missing-host-path" and .status == "unavailable" and .data.path == null and .errors[0].code == "artifact_path_missing")) | length' "$tmp/missing-agent-path-windows.jsonl")" -eq 2 ] ||
+    fail "missing Windows per-host artifact path dropped configured settings or treated them as observed absent"
+  jq '.auth_artifacts["test-auth"].paths = {"TEST-WINDOWS":"~/.wrong-case-auth"}' \
+    "$tmp/windows-worker-config.json" >"$tmp/wrong-case-host-path-windows-config.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/wrong-case-host-path-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth -AllowAuthVerify \
+    >"$tmp/wrong-case-host-path-windows.jsonl"
+  "$cli" validate "$tmp/wrong-case-host-path-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "auth_artifact" and .id == "test-auth" and .data.health == "healthy" and (.data.path | endswith("/.test-auth")))) | length' "$tmp/wrong-case-host-path-windows.jsonl")" -eq 1 ] ||
+    fail "Windows auth path lookup accepted a differently cased host ID"
+  jq '.machines["test-windows"].groups = ["Development"]' \
+    "$tmp/windows-worker-config.json" >"$tmp/wrong-case-group-windows-config.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/wrong-case-group-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >"$tmp/wrong-case-group-windows.jsonl"
+  "$cli" validate "$tmp/wrong-case-group-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "capability" and .id == "example-research")) | length' "$tmp/wrong-case-group-windows.jsonl")" -eq 0 ] ||
+    fail "Windows group matching accepted a differently cased group ID"
+  jq '.capabilities["example-research"].requires_auth = ["TEST-AUTH"] |
+      .capabilities["example-research"].requires_artifacts = ["SHARED-AGENT-DEFINITION"]' \
+    "$tmp/windows-worker-config.json" >"$tmp/wrong-case-dependencies-windows-config.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/wrong-case-dependencies-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents -AllowAuthVerify \
+    >"$tmp/wrong-case-dependencies-windows.jsonl"
+  "$cli" validate "$tmp/wrong-case-dependencies-windows.jsonl"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[],.data.dependencies.artifacts[] | select(.status == "unconfigured" and .ready == false)] | length' "$tmp/wrong-case-dependencies-windows.jsonl")" -eq 2 ] ||
+    fail "Windows capability dependencies accepted differently cased identifiers"
   HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections packages >"$tmp/windows-packages.jsonl"
@@ -1058,6 +1391,168 @@ if [ -n "$pwsh_command" ]; then
     -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
     -Sections agents -AllowAuthVerify >"$tmp/windows.jsonl"
   "$cli" validate "$tmp/windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:remoteControlAtStartup" and .data.observed == false and .data.desired == true and .data.in_sync == false)) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector did not report Claude Remote Control setting drift"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:check_for_update_on_startup" and .data.in_sync == true)) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector did not parse the allowlisted Codex TOML setting"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "codex-settings:model" and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows collector did not parse the Codex literal TOML string"
+  if grep -q 'must-not-leak' "$tmp/windows.jsonl"; then
+    fail "Windows collector leaked an unlisted agent setting"
+  fi
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-absent-windows.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/absent-settings-windows.jsonl"
+  mv "$tmp/claude-settings-absent-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/absent-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings")) | length' "$tmp/absent-settings-windows.jsonl")" -eq 5 ] ||
+    fail "absent Windows settings artifact did not emit every configured setting"
+  [ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == false and .data.in_sync == false)) | length' "$tmp/absent-settings-windows.jsonl")" -eq 1 ] ||
+    fail "absent Windows non-null setting was not reported as drift"
+  [ "$(jq -s 'map(select(.id == "claude-settings:fallbackModel" and .data.observed_present == false and .data.in_sync == true)) | length' "$tmp/absent-settings-windows.jsonl")" -eq 1 ] ||
+    fail "absent Windows desired-null setting was not reported in sync"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-case-windows.json"
+  printf '%s\n' '{"RemoteControlAtStartup":true,"remoteControlAtStartup":false}' >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/case-sensitive-settings-windows.jsonl"
+  mv "$tmp/claude-settings-case-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/case-sensitive-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.id == "claude-settings:remoteControlAtStartup" and .data.observed_present == true and .data.observed == false and .data.in_sync == false)) | length' "$tmp/case-sensitive-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows JSON setting lookup did not select the exact-case key"
+  cp -p "$tmp/home/.codex/config.toml" "$tmp/codex-settings-case-windows.toml"
+  printf '%s\n' "Model = 'wrong-case'" "model = 'fixture#model'" \
+    'check_for_update_on_startup = True' >"$tmp/home/.codex/config.toml"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/case-sensitive-toml-settings-windows.jsonl"
+  mv "$tmp/codex-settings-case-windows.toml" "$tmp/home/.codex/config.toml"
+  "$cli" validate "$tmp/case-sensitive-toml-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.id == "codex-settings:model" and .data.observed_present == true and .data.observed == "fixture#model" and .data.in_sync == true)) | length' "$tmp/case-sensitive-toml-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows TOML setting lookup did not select the exact-case key"
+  [ "$(jq -s 'map(select(.id == "codex-settings:check_for_update_on_startup" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/case-sensitive-toml-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows TOML parser accepted a mixed-case boolean literal"
+  jq '(.agent_artifacts[] | select(.id == "claude-settings").settings.autoUpdatesChannel) = "latest" |
+      (.agent_artifacts[] | select(.id == "codex-settings").settings.cli_auth_credentials_store) = "auto"' \
+    "$tmp/windows-worker-config.json" >"$tmp/enum-settings-windows-config.json"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-enum-windows.json"
+  cp -p "$tmp/home/.codex/config.toml" "$tmp/codex-settings-enum-windows.toml"
+  printf '%s\n' '{"autoUpdatesChannel":"Latest"}' >"$tmp/home/.claude/settings.json"
+  printf '%s\n' "cli_auth_credentials_store = 'Auto'" >"$tmp/home/.codex/config.toml"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/enum-settings-windows-config.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents -AllowAuthVerify \
+    >"$tmp/mixed-case-enum-settings-windows.jsonl"
+  mv "$tmp/claude-settings-enum-windows.json" "$tmp/home/.claude/settings.json"
+  mv "$tmp/codex-settings-enum-windows.toml" "$tmp/home/.codex/config.toml"
+  "$cli" validate "$tmp/mixed-case-enum-settings-windows.jsonl"
+  [ "$(jq -s 'map(select((.id == "claude-settings:autoUpdatesChannel" or .id == "codex-settings:cli_auth_credentials_store") and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/mixed-case-enum-settings-windows.jsonl")" -eq 2 ] ||
+    fail "Windows observed settings accepted mixed-case enum values"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-null-windows.json"
+  printf '%s\n' '{"fallbackModel":null}' >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/explicit-null-setting-windows.jsonl"
+  mv "$tmp/claude-settings-null-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/explicit-null-setting-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "present" and .data.observed_present == true and .data.observed == null and .data.desired == null and .data.in_sync == false)) | length' "$tmp/explicit-null-setting-windows.jsonl")" -eq 1 ] ||
+    fail "explicit Windows null setting was not reported as observed drift"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-valid-windows.json"
+  printf '%s\n' '{"model":{"apiKey":"nested-observed-secret"},"fallbackModel":{"apiKey":"nested-null-desired-secret"}}' >"$tmp/home/.claude/settings.json"
+  set +e
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/invalid-observed-setting-windows.jsonl"
+  invalid_observed_setting_windows_rc=$?
+  set -e
+  mv "$tmp/claude-settings-valid-windows.json" "$tmp/home/.claude/settings.json"
+  [ "$invalid_observed_setting_windows_rc" -eq 0 ] || fail "Windows invalid-setting inventory did not return JSONL"
+  "$cli" validate "$tmp/invalid-observed-setting-windows.jsonl"
+  [ "$(jq -r 'select(.kind == "operation") | .data.operation_status' "$tmp/invalid-observed-setting-windows.jsonl")" = partial ] ||
+    fail "invalid observed Windows setting did not mark inventory partial"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:model" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-windows.jsonl")" -eq 1 ] ||
+    fail "invalid observed Windows setting value was not suppressed"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/invalid-observed-setting-windows.jsonl")" -eq 1 ] ||
+    fail "nested Windows value for a null-desired setting was not suppressed"
+  if grep -q 'nested-observed-secret' "$tmp/invalid-observed-setting-windows.jsonl"; then
+    fail "nested data under an allowlisted Windows setting leaked into inventory"
+  fi
+  if grep -q 'nested-null-desired-secret' "$tmp/invalid-observed-setting-windows.jsonl"; then
+    fail "nested data under a null-desired Windows setting leaked into inventory"
+  fi
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-single-document-windows.json"
+  printf '%s\n' '{"model":"fixture-model"}' '{"model":"fixture-model"}' \
+    >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/multi-document-settings-windows.jsonl"
+  mv "$tmp/claude-settings-single-document-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/multi-document-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/multi-document-settings-windows.jsonl")" -eq 5 ] ||
+    fail "multi-document Windows JSON dropped configured setting records"
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-windows.json"
+  mkdir "$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/directory-settings-windows.jsonl"
+  rmdir "$tmp/home/.claude/settings.json"
+  mv "$tmp/claude-settings-file-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/directory-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "present" and .data.digest.scope == "directory-files")) | length' "$tmp/directory-settings-windows.jsonl")" -eq 1 ] ||
+    fail "Windows settings directory artifact type was not reported truthfully"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "setting_parse_failed")) | length' "$tmp/directory-settings-windows.jsonl")" -eq 5 ] ||
+    fail "Windows settings directory dropped configured setting records"
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-link-windows.json"
+  printf '%s\n' '{"model":"linked-settings-secret-windows"}' \
+    >"$tmp/linked-claude-settings-windows.json"
+  ln -s "$tmp/linked-claude-settings-windows.json" "$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/linked-settings-windows.jsonl"
+  rm "$tmp/home/.claude/settings.json" "$tmp/linked-claude-settings-windows.json"
+  mv "$tmp/claude-settings-file-before-link-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/linked-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-windows.jsonl")" -eq 1 ] ||
+    fail "linked Windows settings artifact was not reported without following it"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/linked-settings-windows.jsonl")" -eq 5 ] ||
+    fail "linked Windows settings artifact dropped configured setting records"
+  if grep -q 'linked-settings-secret-windows' "$tmp/linked-settings-windows.jsonl"; then
+    fail "Windows settings inventory followed a linked artifact"
+  fi
+  mv "$tmp/home/.claude/settings.json" "$tmp/claude-settings-file-before-dangling-link-windows.json"
+  ln -s "$tmp/missing-claude-settings-windows.json" "$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/dangling-linked-settings-windows.jsonl"
+  rm "$tmp/home/.claude/settings.json"
+  mv "$tmp/claude-settings-file-before-dangling-link-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/dangling-linked-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_artifact" and .id == "claude-settings" and .status == "partial" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/dangling-linked-settings-windows.jsonl")" -eq 1 ] ||
+    fail "dangling Windows settings link was reported as an absent artifact"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .data.artifact == "claude-settings" and .status == "unavailable" and .errors[0].code == "symlink_not_followed")) | length' "$tmp/dangling-linked-settings-windows.jsonl")" -eq 5 ] ||
+    fail "dangling Windows settings link dropped configured setting records"
+  cp -p "$tmp/home/.claude/settings.json" "$tmp/claude-settings-bounded-windows.json"
+  jq -cn --arg value "$oversized_setting" '{model:$value,availableModels:[range(0;3000)|"xx"]}' \
+    >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/oversized-observed-settings-windows.jsonl"
+  mv "$tmp/claude-settings-bounded-windows.json" "$tmp/home/.claude/settings.json"
+  "$cli" validate "$tmp/oversized-observed-settings-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and (.id == "claude-settings:model" or .id == "claude-settings:availableModels") and .status == "unavailable" and (.data | has("observed") | not))) | length' "$tmp/oversized-observed-settings-windows.jsonl")" -eq 2 ] ||
+    fail "oversized scalar or array Windows setting was not suppressed"
+  printf '%s\n' '[{"fallbackModel":"nested-array-value"}]' >"$tmp/home/.claude/settings.json"
+  HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
+    -Sections agents -AllowAuthVerify >"$tmp/invalid-root-setting-windows.jsonl"
+  [ "$(jq -r 'select(.kind == "operation") | .data.operation_status' "$tmp/invalid-root-setting-windows.jsonl")" = partial ] ||
+    fail "Windows JSON array root did not mark setting inventory partial"
+  [ "$(jq -s 'map(select(.kind == "agent_setting" and .id == "claude-settings:fallbackModel" and .status == "unavailable")) | length' "$tmp/invalid-root-setting-windows.jsonl")" -eq 1 ] ||
+    fail "Windows JSON array root was treated as an object with absent settings"
+  printf '%s\n' \
+    '{"remoteControlAtStartup":false,"switchModelsOnFlag":false,"model":"fixture-model","unlistedSecret":"must-not-leak"}' \
+    >"$tmp/home/.claude/settings.json"
   [ "$(jq -s 'map(select(.kind == "operation")) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
     fail "Windows collector did not emit one operation record"
   [ "$(jq -s 'map(select(.kind == "plugin" and .id == "codex:test-market:example:1.2.3" and .confidence == "high" and .data.install_state == "installed" and .data.inferred_installed_at_confidence == "low")) | length' "$tmp/windows.jsonl")" -eq 1 ] ||
@@ -1075,8 +1570,12 @@ if [ -n "$pwsh_command" ]; then
     fail "satisfied Windows capability dependencies were not ready"
   [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "healthy" and .ready == true)] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
     fail "Windows capability did not report healthy auth dependency state"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "native-test-auth" and .status == "healthy" and .ready == true)] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability did not use status-only authentication"
   [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "shared-agent-definition" and .status == "present" and .ready == true)] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
     fail "Windows capability did not report present artifact dependency state"
+  [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.artifacts[] | select(.id == "paths-only-agent-definition" and .status == "present" and .ready == true)] | length' "$tmp/windows.jsonl")" -eq 1 ] ||
+    fail "Windows capability did not resolve a per-host artifact path"
   windows_plugin_eval=$(grep 'plugin-eval' "$tmp/windows.jsonl" || true)
   if [ -n "$windows_plugin_eval" ]; then
     fail "transient plugin-eval fixture was classified as Windows plugin evidence: $windows_plugin_eval"
@@ -1110,6 +1609,19 @@ if [ -n "$pwsh_command" ]; then
     fail "unhealthy required auth did not make the Windows capability unavailable"
   [ "$(jq -s '[.[] | select(.kind == "capability" and .id == "example-research") | .data.dependencies.auth[] | select(.id == "test-auth" and .status == "unhealthy" and .ready == false)] | length' "$tmp/unhealthy-capability-auth-windows.jsonl")" -eq 1 ] ||
     fail "Windows capability did not report unhealthy auth dependency state"
+
+  jq '.auth_artifacts["native-test-auth"].strategy = "ignore"' \
+    "$tmp/windows-worker-config.json" >"$tmp/ignore-native-auth-windows.json"
+  AUTH_CHECK_FAIL=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/ignore-native-auth-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth -AllowAuthVerify \
+    >"$tmp/ignore-unhealthy-auth-windows.jsonl"
+  "$cli" validate "$tmp/ignore-unhealthy-auth-windows.jsonl"
+  [ "$(jq -s 'map(select(.kind == "auth_artifact" and .id == "native-test-auth" and
+    .status == "partial" and .data.strategy == "ignore" and .data.health == "unhealthy" and
+    .data.reauth_required == false and .data.manual_action == null)) | length' \
+    "$tmp/ignore-unhealthy-auth-windows.jsonl")" -eq 1 ] ||
+    fail "unhealthy ignored Windows auth emitted actionable reauthentication state"
 
   mv "$tmp/home/.agents/agents/example.md" "$tmp/missing-agent-definition-windows"
   HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
@@ -1157,6 +1669,8 @@ if [ -n "$pwsh_command" ]; then
   "$cli" validate "$tmp/windows-auth.jsonl"
   [ "$(jq -r 'select(.id == "test-auth") | .data.health' "$tmp/windows-auth.jsonl")" = healthy ] ||
     fail "Windows native auth health check was not healthy"
+  [ "$(jq -s 'map(select(.kind == "auth_artifact" and .id == "native-test-auth" and .status == "present" and .data.type == "native-status" and .data.path == null and .data.health == "healthy")) | length' "$tmp/windows-auth.jsonl")" -eq 1 ] ||
+    fail "Windows pathless native auth health was not inventoried"
 
   JSM_INVALID_SHAPE=1 HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
     -ConfigPath "$tmp/windows-worker-config.json" -HostId test-windows -ControllerConfigDigest "$config_hash" \
@@ -1187,7 +1701,83 @@ if [ -n "$pwsh_command" ]; then
     -ControllerConfigDigest "$config_hash" -Sections projects >/dev/null 2>&1; then
     fail "Windows worker accepted a traversal project path"
   fi
+  jq '.agent_artifacts[] |= if .id == "claude-settings" then .settings.availableModels = [range(0;3000) | "xx"] else . end' \
+    "$tmp/windows-worker-config.json" >"$tmp/invalid-agent-setting-aggregate-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/invalid-agent-setting-aggregate-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
+    fail "Windows worker accepted an oversized aggregate desired setting"
+  fi
+  jq '(.agent_artifacts[] | select(.id == "claude-settings").settings.autoUpdatesChannel) = "Latest"' \
+    "$tmp/windows-worker-config.json" >"$tmp/mixed-case-desired-enum-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/mixed-case-desired-enum-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
+    fail "Windows worker accepted a mixed-case desired setting enum"
+  fi
+  jq '(.agent_artifacts[] | select(.id == "claude-settings").settings.AutoUpdatesChannel) = "latest"' \
+    "$tmp/windows-worker-config.json" >"$tmp/mixed-case-desired-key-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/mixed-case-desired-key-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
+    fail "Windows worker accepted a mixed-case desired setting key"
+  fi
+  jq '.capabilities["example-research"].Codex = .capabilities["example-research"].codex |
+      .capabilities["example-research"].Claude = .capabilities["example-research"].claude |
+      del(.capabilities["example-research"].codex,.capabilities["example-research"].claude)' \
+    "$tmp/windows-worker-config.json" >"$tmp/wrong-case-provider-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/wrong-case-provider-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections agents >/dev/null 2>&1; then
+    fail "Windows worker accepted a differently cased capability provider key"
+  fi
+  jq 'del(.auth_artifacts["test-auth"].path) | .auth_artifacts["test-auth"].portability = "per-machine"' \
+    "$tmp/windows-worker-config.json" >"$tmp/invalid-pathless-encrypted-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/invalid-pathless-encrypted-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth >/dev/null 2>&1; then
+    fail "Windows worker accepted a pathless encrypted auth install"
+  fi
+  jq 'del(.auth_artifacts["native-test-auth"].reauth)' \
+    "$tmp/windows-worker-config.json" >"$tmp/invalid-reauth-command-windows.json"
+  if HOME="$tmp/home" "$pwsh_command" -NoLogo -NoProfile -File "$script_dir/collect-windows.ps1" \
+    -ConfigPath "$tmp/invalid-reauth-command-windows.json" -HostId test-windows \
+    -ControllerConfigDigest "$config_hash" -Sections auth >/dev/null 2>&1; then
+    fail "Windows worker accepted a reauth strategy without a command"
+  fi
 fi
+
+AUTH_CHECK_FAIL=1 "$cli" collect --target test-host --section auth \
+  --output "$tmp/reauth-required-auth-posix.jsonl"
+"$cli" validate "$tmp/reauth-required-auth-posix.jsonl"
+cat >"$tmp/reauth-plan-draft.json" <<'JSON'
+{
+  "domain": "auth",
+  "target": "test-host",
+  "operations": [{
+    "type": "auth-reauth",
+    "kind": "auth_artifact",
+    "id": "native-test-auth",
+    "argv": ["auth-check", "login"]
+  }]
+}
+JSON
+if MACHINE_UTILITIES_CONFIG="$tmp/ignore-native-auth.json" \
+  "$cli" seal-plan "$tmp/reauth-plan-draft.json" "$tmp/reauth-required-auth-posix.jsonl" \
+  "$tmp/ignored-reauth-plan.json" >/dev/null 2>&1; then
+  fail "seal-plan accepted reauthentication for an ignored auth artifact"
+fi
+jq '.operations[0].argv += ["--unexpected"]' "$tmp/reauth-plan-draft.json" \
+  >"$tmp/mismatched-reauth-plan-draft.json"
+if "$cli" seal-plan "$tmp/mismatched-reauth-plan-draft.json" \
+  "$tmp/reauth-required-auth-posix.jsonl" "$tmp/mismatched-reauth-plan.json" \
+  >/dev/null 2>&1; then
+  fail "seal-plan accepted a reauthentication command that did not match configuration"
+fi
+"$cli" seal-plan "$tmp/reauth-plan-draft.json" "$tmp/reauth-required-auth-posix.jsonl" \
+  "$tmp/reauth-plan.json"
+[ "$(jq -r '.operations[0].type' "$tmp/reauth-plan.json")" = auth-reauth ] ||
+  fail "seal-plan rejected a configured reauthentication operation"
 
 cat >"$tmp/plan-draft.json" <<JSON
 {
@@ -1313,6 +1903,42 @@ printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
   fail "package apply emitted no completed verification operation"
 
 cp "$tmp/skill-lock-fixture.json" "$tmp/home/.agents/.skill-lock.json"
+cat >"$tmp/runtime-plan-draft.json" <<'JSON'
+{
+  "domain": "agents",
+  "target": "test-host",
+  "operations": [{
+    "type": "agent-update",
+    "kind": "agent_runtime",
+    "id": "codex",
+    "argv": ["codex", "update"]
+  }]
+}
+JSON
+jq -c 'if .kind == "agent_runtime" and .id == "codex" then
+  .status = "absent" | .data = {runtime:"codex"}
+else . end' "$tmp/snapshot.jsonl" >"$tmp/runtime-absent-snapshot.jsonl"
+if "$cli" seal-plan "$tmp/runtime-plan-draft.json" "$tmp/runtime-absent-snapshot.jsonl" \
+  "$tmp/runtime-absent-plan.json" >/dev/null 2>&1; then
+  fail "absent runtime sealed an update instead of requiring installer flow"
+fi
+"$cli" seal-plan "$tmp/runtime-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/runtime-plan.json"
+runtime_plan_id=$(jq -r '.plan_id' "$tmp/runtime-plan.json")
+rm -f "$RUNTIME_UPDATE_MARKER"
+"$cli" apply-plan "$tmp/runtime-plan.json" "$runtime_plan_id" "$tmp/runtime-result.jsonl"
+[ "$(cat "$RUNTIME_UPDATE_MARKER")" = codex ] || fail "exact Codex runtime updater was not executed"
+[ "$(jq -r --arg plan "$runtime_plan_id" 'select(.kind == "operation" and .id == ("apply:" + $plan)) | .data.operation_status' "$tmp/runtime-result.jsonl")" = completed ] ||
+  fail "already-current runtime update was not accepted after post-inventory"
+jq '.operations[0].argv += ["--force"]' "$tmp/runtime-plan-draft.json" >"$tmp/unsafe-runtime-plan-draft.json"
+"$cli" seal-plan "$tmp/unsafe-runtime-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/unsafe-runtime-plan.json"
+unsafe_runtime_plan_id=$(jq -r '.plan_id' "$tmp/unsafe-runtime-plan.json")
+rm -f "$RUNTIME_UPDATE_MARKER"
+if "$cli" apply-plan "$tmp/unsafe-runtime-plan.json" "$unsafe_runtime_plan_id" \
+  "$tmp/unsafe-runtime-result.jsonl" >/dev/null 2>&1; then
+  fail "runtime update accepted extra argv"
+fi
+[ ! -e "$RUNTIME_UPDATE_MARKER" ] || fail "unsafe runtime argv reached the native command"
+
 cat >"$tmp/agent-plan-draft.json" <<'JSON'
 {
   "domain": "agents",
@@ -1420,6 +2046,29 @@ jq '.target = "test-ssh"' "$tmp/plugin-agent-plan-draft.json" \
 "$cli" seal-plan "$tmp/ssh-agent-plan-draft.json" \
   "$tmp/ssh-agent-plan-snapshot.jsonl" "$tmp/ssh-agent-plan.json"
 ssh_agent_plan_id=$(jq -r '.plan_id' "$tmp/ssh-agent-plan.json")
+cat >"$tmp/ssh-reauth-plan-draft.json" <<'JSON'
+{
+  "domain": "auth",
+  "target": "test-ssh",
+  "operations": [{
+    "type": "auth-reauth",
+    "kind": "auth_artifact",
+    "id": "native-test-auth",
+    "argv": ["auth-check", "login"]
+  }]
+}
+JSON
+"$cli" seal-plan "$tmp/ssh-reauth-plan-draft.json" \
+  "$tmp/ssh-agent-plan-snapshot.jsonl" "$tmp/ssh-reauth-plan.json"
+ssh_reauth_plan_id=$(jq -r '.plan_id' "$tmp/ssh-reauth-plan.json")
+: >"$SSH_COMMAND_LOG"
+: >"$SCP_COMMAND_LOG"
+if "$cli" apply-ssh-plan "$tmp/ssh-reauth-plan.json" "$ssh_reauth_plan_id" \
+  "$tmp/ssh-reauth-result.jsonl" >/dev/null 2>&1; then
+  fail "SSH apply accepted interactive reauthentication"
+fi
+[ ! -s "$SSH_COMMAND_LOG" ] && [ ! -s "$SCP_COMMAND_LOG" ] ||
+  fail "SSH reauthentication rejection contacted the target"
 : >"$SSH_COMMAND_LOG"
 : >"$SCP_COMMAND_LOG"
 : >"$SSH_LOGIN_SHELL_LOG"
@@ -1636,6 +2285,15 @@ cat >"$tmp/auth-plan-draft.json" <<'JSON'
   ]
 }
 JSON
+jq 'del(.auth_artifacts["test-auth"].path) |
+  .auth_artifacts["test-auth"].paths = {"test-windows":"~/.test-auth"}' \
+  "$tmp/config.json" >"$tmp/auth-other-target-path-config.json"
+chmod 600 "$tmp/auth-other-target-path-config.json"
+if MACHINE_UTILITIES_CONFIG="$tmp/auth-other-target-path-config.json" \
+  "$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-plan-snapshot.jsonl" \
+  "$tmp/auth-missing-target-path-plan.json" >/dev/null 2>&1; then
+  fail "auth install sealed without a path for its target"
+fi
 "$cli" seal-plan "$tmp/auth-plan-draft.json" "$tmp/auth-plan-snapshot.jsonl" "$tmp/auth-plan.json"
 auth_plan_id=$(jq -r '.plan_id' "$tmp/auth-plan.json")
 "$cli" apply-plan "$tmp/auth-plan.json" "$auth_plan_id" "$tmp/auth-applied.jsonl"

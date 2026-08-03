@@ -170,17 +170,56 @@ validate_config_file() {
     ((.agent_artifacts // [] | map(.id) | unique | length) == (.agent_artifacts // [] | length)) and
     ([.agent_artifacts[]? |
       (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-      (.path | type == "string" and length > 0) and
+      (((.path // null) | type == "string" and length > 0) or
+       ((.paths // {}) | type == "object" and length > 0) or
+       (($config.worker // null) != null)) and
+      ((.paths // {}) | type == "object") and
+      ([.paths // {} | to_entries[] |
+        (.key | test("^[A-Za-z0-9._-]+$")) and ($config.machines[.key] != null) and
+        (.value | type == "string" and length > 0)
+      ] | all) and
       (.kind | IN("agent-definition","instruction","config")) and
       ((.agents // []) | type == "array") and
       ([.agents[]? | IN("codex","claude")] | all) and
       ((.groups // []) | type == "array") and
-      ([.groups[]? | type == "string" and test("^[A-Za-z0-9._-]+$")] | all)
+      ([.groups[]? | type == "string" and test("^[A-Za-z0-9._-]+$")] | all) and
+      ((.settings // {}) | type == "object") and
+      (if ((.settings // {}) | length) > 0 then
+        (.kind == "config") and
+        (.format | IN("json","toml")) and
+        ((.format == "json" and .agents == ["claude"]) or
+         (.format == "toml" and .agents == ["codex"])) and
+        (. as $artifact | [.settings | to_entries[] |
+          (($artifact.format == "json" and
+            (.key | IN("remoteControlAtStartup","switchModelsOnFlag","model","effortLevel",
+              "availableModels","fallbackModel","autoUpdatesChannel","agentPushNotifEnabled"))) or
+           ($artifact.format == "toml" and
+            (.key | IN("model","model_reasoning_effort","service_tier",
+              "check_for_update_on_startup","cli_auth_credentials_store")))) and
+          (. as $setting |
+            ($setting.value | tojson | utf8bytelength <= 8192) and
+            (($setting.value == null) or
+             (if $setting.key | IN("remoteControlAtStartup","switchModelsOnFlag",
+                "agentPushNotifEnabled","check_for_update_on_startup") then
+               ($setting.value | type == "boolean")
+             elif $setting.key == "availableModels" then
+               ($setting.value | type == "array") and
+               ([$setting.value[] | type == "string" and length > 0] | all)
+             elif $setting.key == "autoUpdatesChannel" then
+               ($setting.value | IN("latest","stable"))
+             elif $setting.key == "cli_auth_credentials_store" then
+               ($setting.value | IN("file","keyring","auto"))
+              else ($setting.value | type == "string" and length > 0) end)))
+        ] | all)
+      else ((.format // null) == null or (.format | IN("json","toml"))) end)
     ] | all) and
     ((.auth_artifacts // {}) | type == "object") and
     ([.auth_artifacts // {} | to_entries[] |
       (.key | test("^[A-Za-z0-9._-]+$")) and
-      (.value.path | type == "string" and length > 0) and
+      (((.value.path // null) | type == "string" and length > 0) or
+       ((.value.paths // {}) | type == "object" and length > 0) or
+       (((.value.portability // "per-machine") | IN("native-store","per-machine")) and
+        ((.value.verify // []) | length) > 0)) and
       ((.value.paths // {}) | type == "object") and
       ([.value.paths // {} | to_entries[] |
         (.key | test("^[A-Za-z0-9._-]+$")) and (.value | type == "string" and length > 0)
@@ -198,6 +237,11 @@ validate_config_file() {
       ((.value.max_bytes // 10485760) | type == "number" and . > 0 and . <= 104857600) and
       ((.value.verify // []) | type == "array") and
       ((.value.verify // []) | length <= 32) and
+      (if (((.value.portability // "per-machine") | IN("native-store","per-machine")) and
+           ((.value.path // null) == null) and ((.value.paths // {}) | length) == 0) then
+        (((.value.strategy // "ignore") | IN("reauth","ignore")) and
+         ((.value.verify // []) | length) > 0)
+      else true end) and
       (if ((.value.verify // []) | length) > 0 then
         (.value.verify[0] | type == "string" and test("^[A-Za-z0-9._+-]+$")) and
         ([.value.verify[] | type == "string"] | all)
@@ -205,6 +249,9 @@ validate_config_file() {
       and
       ((.value.reauth // []) | type == "array") and
       ((.value.reauth // []) | length <= 32) and
+      (if ((.value.strategy // "ignore") == "reauth") then
+        ((.value.reauth // []) | length) > 0
+      else true end) and
       (if ((.value.reauth // []) | length) > 0 then
         (.value.reauth[0] | type == "string" and test("^[A-Za-z0-9._+-]+$")) and
         ([.value.reauth[] | type == "string" and length > 0] | all)
@@ -488,7 +535,11 @@ worker_config_command() (
       ),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),
-      agent_artifacts:(if ($domain == "agents" or $domain == "inventory") then (.agent_artifacts // []) else [] end),
+      agent_artifacts:(if ($domain == "agents" or $domain == "inventory") then
+        (.agent_artifacts // [] | map(. as $artifact |
+          $artifact + {paths:(if ($artifact.paths[$target] // null) != null then
+            {($target):$artifact.paths[$target]} else {} end)}))
+      else [] end),
       auth_artifacts:(if ($domain == "auth" or $domain == "agents") then
         (.auth_artifacts // {})
       elif $domain == "inventory" then
@@ -795,7 +846,16 @@ render_command() {
           .kind,
           .id,
           .status,
-          (.data.installed_version // .data.version // .data.path // .data.hostname // .data.manager // "")
+          (if .kind == "agent_setting" and .status != "present" then
+             (.errors[0].code // .status)
+           elif .kind == "agent_setting" then
+             ((.data.observed | tojson) + " -> " + (.data.desired | tojson) +
+              (if .data.in_sync then "" else " (drift)" end))
+           elif .kind == "auth_artifact" then
+             (.data.health // .data.path // "")
+           else
+             (.data.installed_version // .data.version // .data.path // .data.hostname // .data.manager // "")
+           end)
         ] | @tsv)
       ' "$resolved_input"
       ;;
@@ -992,6 +1052,23 @@ seal_plan_command() {
     printf 'machine-utilities: plan target is not configured: %s\n' "$target" >&2
     exit 64
   }
+  jq -e --arg target "$target" --slurpfile draft "$draft" '
+    . as $config |
+    all($draft[0].operations[];
+      if .type == "auth-install" then
+        .id as $id |
+        (($config.auth_artifacts[$id].path // null) != null or
+         ($config.auth_artifacts[$id].paths[$target] // null) != null)
+      elif .type == "auth-reauth" then
+        . as $operation |
+        .id as $id |
+        ($config.auth_artifacts[$id].strategy == "reauth") and
+        ($config.auth_artifacts[$id].reauth == $operation.argv)
+      else true end)
+  ' "$config" >/dev/null || {
+    printf 'machine-utilities: auth operation is not configured for target %s\n' "$target" >&2
+    exit 65
+  }
   platform=$(jq -r --arg target "$target" '.machines[$target].platform' "$config")
   if [ "$platform" = windows ]; then
     jq -e --arg target "$target" '
@@ -1047,6 +1124,10 @@ seal_plan_command() {
         any($records[]; .kind == $operation.kind and .id == $operation.id and
           .status == "present" and .data.candidate_version == $operation.candidate_version and
           .data.update_available == true)
+      elif .type == "agent-update" and .kind == "agent_runtime" then
+        . as $operation |
+        any($records[]; .kind == $operation.kind and .id == $operation.id and
+          .status == "present")
       elif .type == "project-update" then
         . as $operation |
         any($records[]; .kind == $operation.kind and .id == $operation.id and
@@ -1419,6 +1500,7 @@ execute_plan_operation() {
   config=$2
   target=$3
   type=$(jq -r '.type' "$operation")
+  kind=$(jq -r '.kind' "$operation")
   id=$(jq -r '.id' "$operation")
   set --
   while IFS= read -r argument; do
@@ -1487,6 +1569,13 @@ EOF
       ;;
     agent-update)
       case $id in
+        codex|claude)
+          { [ "$kind" = agent_runtime ] && [ $# -eq 2 ] &&
+            [ "$1" = "$id" ] && [ "$2" = update ]; } || {
+            printf 'machine-utilities: unsafe agent runtime update argv\n' >&2
+            return 64
+          }
+          ;;
         skills-cli:*)
           agent_name=${id#skills-cli:}
           case $agent_name in
@@ -1641,6 +1730,10 @@ apply_plan_command() {
       printf 'machine-utilities: native POSIX apply requires an SSH-configured target\n' >&2
       exit 69
     }
+    if jq -e 'any(.operations[]; .type == "auth-reauth")' "$plan" >/dev/null; then
+      printf 'machine-utilities: interactive reauthentication requires a visible target terminal\n' >&2
+      exit 69
+    fi
   else
     [ "$transport" = local ] || {
       printf 'machine-utilities: %s apply must execute through its target-native task transport\n' "$transport" >&2
@@ -1712,14 +1805,18 @@ apply_plan_command() {
           .status == "present" and .data.drift_count == 0)
       elif .type == "agent-update" then
         . as $operation |
-        any($records[]; . as $after |
-          same_agent(.; $operation) and
-          .status == "present" and
-          any($before[]; same_agent(.; $operation) and
-            (.data | del(.installed_at,.updated_at,.inferred_installed_at,
-              .inferred_installed_at_evidence,.inferred_installed_at_confidence)) !=
-            ($after.data | del(.installed_at,.updated_at,.inferred_installed_at,
-              .inferred_installed_at_evidence,.inferred_installed_at_confidence))))
+        if $operation.kind == "agent_runtime" then
+          any($records[]; same_agent(.; $operation) and .status == "present")
+        else
+          any($records[]; . as $after |
+            same_agent(.; $operation) and
+            .status == "present" and
+            any($before[]; same_agent(.; $operation) and
+              (.data | del(.installed_at,.updated_at,.inferred_installed_at,
+                .inferred_installed_at_evidence,.inferred_installed_at_confidence)) !=
+              ($after.data | del(.installed_at,.updated_at,.inferred_installed_at,
+                .inferred_installed_at_evidence,.inferred_installed_at_confidence))))
+        end
       elif .type == "project-update" then
         . as $operation |
         any($records[]; . as $after |
@@ -1785,6 +1882,10 @@ apply_ssh_plan_command() (
     printf 'machine-utilities: apply-ssh-plan requires a configured SSH target\n' >&2
     exit 64
   }
+  if jq -e 'any(.operations[]; .type == "auth-reauth")' "$plan" >/dev/null; then
+    printf 'machine-utilities: interactive reauthentication requires a visible target terminal\n' >&2
+    exit 69
+  fi
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-ssh-apply.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   worker_config_command "$target" "$domain" "$tmp/config.json"

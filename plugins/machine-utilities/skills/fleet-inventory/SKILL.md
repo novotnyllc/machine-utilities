@@ -1,6 +1,6 @@
 ---
 name: fleet-inventory
-description: Inventory and compare a configured fleet of macOS, Linux, WSL, and Windows machines. Use for packages, agent runtimes, plugins, standalone skills and provenance, auth-file metadata, projects, startup tasks, chezmoi state, SHA-256 comparisons, install-time inference, or human and JSONL status reports.
+description: Inventory and compare a configured fleet of macOS, Linux, WSL, and Windows machines. Use for packages, agent runtimes, allowlisted Claude/Codex settings, plugins, standalone skills and provenance, auth-file or native session status, projects, startup tasks, chezmoi state, SHA-256 comparisons, install-time inference, or human and JSONL status reports.
 ---
 
 # Fleet Inventory
@@ -27,6 +27,12 @@ or authenticated Git URL credentials. Credential records may include path,
 owner, mode, size, mtime, SHA-256, strategy, and native health. A Codex plugin
 cache directory birth time is only `inferred_installed_at`, never an
 authoritative install date.
+
+For configured JSON/TOML agent settings, show the allowlisted observed and
+desired values plus `in_sync`; never dump the surrounding config file. Treat
+Claude CLI and Desktop Code as sharing supported settings but separate login
+state. The invoking agent must check and report Codex Desktop Remote enablement
+manually because it has no documented persistent config key or inventory record.
 
 For `codex-remote-control`, Codex must read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`. Claude must report that

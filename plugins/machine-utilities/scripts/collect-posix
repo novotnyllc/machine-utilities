@@ -230,6 +230,147 @@ run_auth_health() {
   rm -f "$args_file"
 }
 
+emit_agent_settings() {
+  artifact=$1
+  artifact_id=$2
+  artifact_path=$3
+  artifact_format=$4
+  artifact_agents=$5
+  artifact_path_state=${6:-resolved}
+  parsed_json=
+  parsed_json_valid=true
+  if [ "$artifact_path_state" = resolved ] && [ "$artifact_format" = json ] &&
+    [ -e "$artifact_path" ]; then
+    if [ -L "$artifact_path" ] || [ ! -f "$artifact_path" ] ||
+      ! parsed_json=$(jq -cse 'if length == 1 and (.[0] | type == "object") then .[0] else error("expected one object") end' \
+        "$artifact_path" 2>/dev/null); then
+      parsed_json_valid=false
+    fi
+  fi
+  printf '%s' "$artifact" | jq -c '.settings // {} | to_entries[]' | while IFS= read -r setting; do
+    key=$(printf '%s' "$setting" | jq -r '.key' | clip)
+    desired=$(printf '%s' "$setting" | jq -c '.value')
+    present=false
+    observed=null
+    if [ "$artifact_path_state" = resolved ]; then parsed=true; else parsed=false; fi
+    case $artifact_format in
+      json)
+        if [ "$artifact_path_state" != resolved ]; then
+          :
+        elif [ ! -e "$artifact_path" ]; then
+          :
+        elif [ "$parsed_json_valid" != true ]; then
+          parsed=false
+        elif printf '%s' "$parsed_json" | jq -e --arg key "$key" 'has($key)' >/dev/null; then
+          present=true
+          observed=$(printf '%s' "$parsed_json" | jq -c --arg key "$key" '.[$key]')
+        fi
+        ;;
+      toml)
+        raw=
+        if [ "$artifact_path_state" != resolved ]; then
+          :
+        elif [ -L "$artifact_path" ] || { [ -e "$artifact_path" ] && [ ! -f "$artifact_path" ]; }; then
+          parsed=false
+        elif [ -f "$artifact_path" ]; then
+          raw=$(awk -v key="$key" '
+          BEGIN { key_pattern = "(\"" key "\"|\047" key "\047|" key ")" }
+          /^[[:space:]]*\[/ { exit }
+          $0 ~ "^[[:space:]]*" key_pattern "[[:space:]]*=" {
+            sub("^[[:space:]]*" key_pattern "[[:space:]]*=[[:space:]]*", "")
+            quote = ""
+            escaped = 0
+            for (i = 1; i <= length($0); i++) {
+              c = substr($0, i, 1)
+              if (quote == "") {
+                if (c == "#") { $0 = substr($0, 1, i - 1); break }
+                if (c == "\"" || c == "\047") quote = c
+              } else if (quote == "\"" && escaped) {
+                escaped = 0
+              } else if (quote == "\"" && c == "\\") {
+                escaped = 1
+              } else if (c == quote) {
+                quote = ""
+              }
+            }
+            print
+            exit
+          }' "$artifact_path")
+        fi
+        if [ -n "$raw" ]; then
+          if observed=$(printf '%s' "$raw" | jq -Rce 'fromjson' 2>/dev/null); then
+            present=true
+          elif literal=$(printf '%s' "$raw" | sed -n "s/^[[:space:]]*'\([^']*\)'[[:space:]]*$/\1/p") &&
+            [ -n "$literal" ]; then
+            observed=$(printf '%s' "$literal" | jq -Rsc '.')
+            present=true
+          else
+            parsed=false
+            observed=null
+          fi
+        fi
+        ;;
+    esac
+    if [ "$parsed" = true ] && [ "$present" = true ] &&
+      ! printf '%s' "$observed" | jq -e --arg key "$key" --argjson desired "$desired" '
+        ([.. | strings |
+          length <= 8192 and (test("[[:cntrl:]]") | not)
+        ] | all) and (tojson | utf8bytelength <= 8192) and
+        (if . == null then $desired == null
+        elif $key | IN("remoteControlAtStartup","switchModelsOnFlag","agentPushNotifEnabled",
+            "check_for_update_on_startup") then type == "boolean"
+        elif $key == "availableModels" then
+          type == "array" and ([.[] | type == "string" and length > 0] | all)
+        elif $key == "autoUpdatesChannel" then IN("latest","stable")
+        elif $key == "cli_auth_credentials_store" then IN("file","keyring","auto")
+        else type == "string" and length > 0 end)
+      ' >/dev/null; then
+      parsed=false
+      observed=null
+    fi
+    if [ "$parsed" != true ]; then
+      case $artifact_path_state in
+        unknown)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:null,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent setting artifact has no path for this host"}]'
+          ;;
+        symlink)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent setting artifact path is a symlink"}]'
+          ;;
+        non-regular)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"non_regular_file","severity":"warning","retryable":false,"message":"agent setting artifact path is not a regular file"}]'
+          ;;
+        *)
+          setting_data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+            --arg key "$key" --argjson desired "$desired" --argjson agents "$artifact_agents" \
+            '{artifact:$artifact,path:$path,format:$format,key:$key,desired:$desired,agent_exposure:$agents}')
+          setting_errors='[{"code":"setting_parse_failed","severity":"warning","retryable":false,"message":"allowlisted agent setting could not be parsed"}]'
+          ;;
+      esac
+      emit agent_setting "$artifact_id:$key" unavailable medium \
+        "$setting_data" '[]' "$setting_errors"
+      continue
+    fi
+    in_sync=$(jq -cn --argjson present "$present" --argjson observed "$observed" --argjson desired "$desired" \
+      'if $desired == null then ($present | not) else ($present and $observed == $desired) end')
+    data=$(jq -cn --arg artifact "$artifact_id" --arg path "$artifact_path" --arg format "$artifact_format" \
+      --arg key "$key" --argjson present "$present" --argjson observed "$observed" \
+      --argjson desired "$desired" --argjson in_sync "$in_sync" --argjson agents "$artifact_agents" \
+      '{artifact:$artifact,path:$path,format:$format,key:$key,observed_present:$present,
+        observed:$observed,desired:$desired,in_sync:$in_sync,agent_exposure:$agents}')
+    emit agent_setting "$artifact_id:$key" present high "$data" \
+      '[{"source":"filesystem","method":"allowlisted-semantic-setting"}]'
+  done
+}
+
 capability_matches() {
   match_agent=$1
   match_provider=$2
@@ -638,8 +779,14 @@ if has_section agents; then
       auth_definition=$(jq -c --arg id "$required_auth" '.auth_artifacts[$id] // empty' "$config")
       if [ -n "$auth_definition" ]; then
         configured_path=$(printf '%s' "$auth_definition" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')
+        auth_portability=$(printf '%s' "$auth_definition" | jq -r '.portability // "per-machine"')
         dependency_path=$(expand_home "$configured_path")
-        if [ -L "$dependency_path" ]; then
+        if [ -z "$dependency_path" ] && { [ "$auth_portability" = native-store ] || [ "$auth_portability" = per-machine ]; }; then
+          auth_entry=$(jq -cn --arg key "$required_auth" --argjson value "$auth_definition" '{key:$key,value:$value}')
+          run_auth_health "$auth_entry"
+          dependency_status=$auth_health_status
+          [ "$auth_health_status" = healthy ] && dependency_ready=true
+        elif [ -L "$dependency_path" ]; then
           dependency_status=partial
         elif [ -f "$dependency_path" ]; then
           auth_entry=$(jq -cn --arg key "$required_auth" --argjson value "$auth_definition" '{key:$key,value:$value}')
@@ -673,8 +820,10 @@ EOF
           )
         ) // empty' "$config")
       if [ -n "$artifact_definition" ]; then
-        artifact_path=$(expand_home "$(printf '%s' "$artifact_definition" | jq -r '.path')")
-        if [ -L "$artifact_path" ]; then
+        artifact_path=$(expand_home "$(printf '%s' "$artifact_definition" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')")
+        if [ -z "$artifact_path" ]; then
+          dependency_status=unavailable
+        elif [ -L "$artifact_path" ]; then
           dependency_status=partial
         elif [ -f "$artifact_path" ] || [ -d "$artifact_path" ]; then
           dependency_status=present
@@ -761,14 +910,28 @@ EOF
       any($groups[]; . as $group | $host_groups | index($group) != null)
     )' "$config" | while IFS= read -r artifact; do
     artifact_id=$(printf '%s' "$artifact" | jq -r '.id' | clip)
-    artifact_path=$(expand_home "$(printf '%s' "$artifact" | jq -r '.path')")
+    configured_artifact_path=$(printf '%s' "$artifact" | jq -r --arg host "$host_id" '.paths[$host] // .path // empty')
+    artifact_path=$(expand_home "$configured_artifact_path")
     artifact_kind=$(printf '%s' "$artifact" | jq -r '.kind' | clip)
     artifact_agents=$(printf '%s' "$artifact" | jq -c '.agents // []')
-    if [ -L "$artifact_path" ]; then
+    if [ -z "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" unavailable high \
+        "$(jq -cn --arg id "$artifact_id" --arg kind "$artifact_kind" --argjson agents "$artifact_agents" \
+          '{id:$id,path:null,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"artifact_path_missing","severity":"warning","retryable":false,"message":"agent artifact has no path for this host"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" unknown
+      fi
+    elif [ -L "$artifact_path" ]; then
       emit agent_artifact "$artifact_id" partial medium \
         "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
           --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
         '[]' '[{"code":"symlink_not_followed","severity":"warning","retryable":false,"message":"agent artifact path is a symlink"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" symlink
+      fi
     elif [ -f "$artifact_path" ]; then
       data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
         --arg digest "$(sha256_file "$artifact_path")" --arg mtime "$(file_mtime "$artifact_path")" \
@@ -776,16 +939,37 @@ EOF
         '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,updated_at:$mtime,
           digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"}}')
       emit agent_artifact "$artifact_id" present high "$data" '[{"source":"filesystem","method":"configured-file+sha256"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
     elif [ -d "$artifact_path" ]; then
       data=$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
         --arg digest "$(directory_digest "$artifact_path")" --argjson agents "$artifact_agents" \
         '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents,
           digest:{algorithm:"sha256",value:$digest,scope:"directory-files"}}')
       emit agent_artifact "$artifact_id" present medium "$data" '[{"source":"filesystem","method":"configured-directory+sha256"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
+    elif [ -e "$artifact_path" ]; then
+      emit agent_artifact "$artifact_id" partial medium \
+        "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
+          --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')" \
+        '[]' '[{"code":"non_regular_file","severity":"warning","retryable":false,"message":"agent artifact path is not a regular file or directory"}]'
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents" non-regular
+      fi
     else
       emit agent_artifact "$artifact_id" absent high \
         "$(jq -cn --arg id "$artifact_id" --arg path "$artifact_path" --arg kind "$artifact_kind" \
           --argjson agents "$artifact_agents" '{id:$id,path:$path,artifact_kind:$kind,agent_exposure:$agents}')"
+      if [ "$(printf '%s' "$artifact" | jq '.settings // {} | length')" -gt 0 ]; then
+        emit_agent_settings "$artifact" "$artifact_id" "$artifact_path" \
+          "$(printf '%s' "$artifact" | jq -r '.format')" "$artifact_agents"
+      fi
     fi
   done
 
@@ -869,7 +1053,30 @@ if has_section auth; then
     path=$(expand_home "$configured_path")
     auth_health_status=not-run
     auth_health_exit=null
-    if [ -L "$path" ]; then
+    if [ -z "$path" ] && { [ "$portability" = native-store ] || [ "$portability" = per-machine ]; }; then
+      run_auth_health "$entry"
+      case $auth_health_status in
+        healthy) auth_status=present; reauth_required=false ;;
+        unhealthy)
+          if [ "$strategy" = reauth ]; then
+            auth_status=absent
+            reauth_required=true
+          else
+            auth_status=partial
+            reauth_required=false
+          fi
+          ;;
+        *) auth_status=partial; reauth_required=false ;;
+      esac
+      data=$(jq -cn --arg tool "$name" --arg strategy "$strategy" --arg portability "$portability" \
+        --arg health "$auth_health_status" --argjson verify_exit_code "$auth_health_exit" \
+        --argjson reauth_required "$reauth_required" \
+        '{tool:$tool,path:null,strategy:$strategy,portability:$portability,type:"native-status",health:$health,
+          verify_exit_code:$verify_exit_code,reauth_required:$reauth_required,
+          manual_action:(if $reauth_required then "run the configured native login on this host" else null end)}')
+      emit auth_artifact "$name" "$auth_status" high "$data" \
+        '[{"source":"native-cli","method":"configured-auth-status"}]'
+    elif [ -L "$path" ]; then
       data=$(jq -cn --arg tool "$name" --arg path "$path" --arg strategy "$strategy" --arg portability "$portability" \
         --arg health "$auth_health_status" \
         '{tool:$tool,path:$path,strategy:$strategy,portability:$portability,type:"symlink",health:$health,verify_exit_code:null}')
