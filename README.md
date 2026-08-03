@@ -41,8 +41,11 @@ The config defines:
 - machines, groups, native package managers, and transport (`local`, `ssh`, or
   `codex-remote-control`)
 - project sources and host-relative checkout paths
+- an optional `handoff_project` identifying the ordinary configured project
+  used as the private cross-project coordination ledger
 - Codex/Claude capabilities, plugin or skill providers, and standalone skill
-  roots
+  roots; shared providers use one `agents`/`provider`/`source` declaration,
+  while agent-specific providers use separate `codex` and `claude` entries
 - agent definitions and credential artifacts, including their distribution
   policy
 - safe semantic settings to compare without exposing unrelated config or MCP
@@ -55,8 +58,10 @@ for the complete schema-by-example.
 
 ## Use
 
-Ask Codex or Claude Code for one of the eight bundled skills:
+Ask Codex or Claude Code for one of the nine bundled skills:
 
+- `fleet-readiness` — assess project, agent, authentication, and host readiness
+  across configured machines and route reconciliation to the owning skill
 - `fleet-inventory` — collect and compare structured JSONL snapshots
 - `fleet-update` — plan, then explicitly apply Homebrew, APT, or winget updates
 - `fleet-agents` — reconcile Codex/Claude runtimes, settings, plugins,
@@ -143,8 +148,10 @@ sends only the bounded worker config and sealed plan to the exact installed
 release, then enforces the same executor, configured hostname/user, fresh
 precondition, argv, and semantic post-state checks on the SSH host. SSH
 connection establishment is bounded to 10 seconds, with 15-second keepalives
-and two missed keepalives allowed. Native Windows mutations use
-`apply-windows.ps1` inside a visible Codex Desktop task.
+and two missed keepalives allowed. Ordinary schema-2 native Windows mutations
+use `apply-windows.ps1` inside a visible Codex Desktop task. Protected or
+logged-off Windows operations use only the enrolled `windows-sftp` broker
+route.
 The task—not the controller—owns its normal permission prompts. Claude Code
 cannot control a Codex Desktop host; direct native Windows transport therefore
 requires Codex.

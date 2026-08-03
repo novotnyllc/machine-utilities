@@ -128,7 +128,7 @@ standard error. Records sort by host, kind, and stable entity ID.
 
 Initial record kinds are `snapshot`, `host`, `file`, `package`,
 `agent_runtime`, `agent_setting`, `plugin`, `skill`, `capability`, `auth_artifact`,
-`startup_task`, `project`, and `error`.
+`startup_task`, `project`, `privilege_broker`, and `error`.
 
 Configured `agent_artifacts.settings` produces one allowlisted semantic record
 per JSON/TOML key. Per-host `paths` override the common artifact `path`; unlisted
@@ -368,8 +368,12 @@ The project repository and exact commit are authoritative for project handoff.
 A single private coordination repository may record pointers, ownership,
 status, and evidence across the fleet and across projects, but it does not copy
 project source or replace those repositories. Configure it as an ordinary
-project on hosts that run coordination tasks; never substitute an unrelated
-utility checkout as a control project.
+project and reference its project ID with optional `handoff_project` on hosts
+that run coordination tasks; never substitute an unrelated utility checkout as
+a control project. Agents may detect or propose this repository, but GitHub
+creation, remote changes, and pushes require explicit user approval. The
+configured project source/path or an exact user-supplied path locates an
+existing checkout; no repository name or local directory is assumed.
 
 Do not edit Codex Desktop's internal SQLite, LevelDB, or path-keyed trust config
 to simulate registration. Audit registration and use a supported Desktop/API
@@ -454,6 +458,12 @@ values.
     }
   },
   "capabilities": {
+    "shared-plugin": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "example-plugin"
+    },
     "example-capability": {
       "groups": ["development"],
       "codex": {"provider": "plugin", "source": "example-plugin"},

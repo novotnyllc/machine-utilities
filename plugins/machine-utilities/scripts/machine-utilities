@@ -666,6 +666,16 @@ validate_config_file() {
     exit 64
   }
   jq -e '
+    def valid_capability_provider:
+      (.provider | IN("plugin","skills-cli","jsm","manual","plugin-source")) and
+      (.source | type == "string" and length > 0) and
+      (.source | contains("?") | not) and
+      (.source | test("^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@") | not) and
+      (if .provider == "plugin" then
+        (.source | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and (.source != ".") and (.source != "..")
+      else true end) and
+      ((.skill // null) == null or (.skill | type == "string" and test("^[A-Za-z0-9._-]+$"))) and
+      ((.name // null) == null or (.name | type == "string" and test("^[A-Za-z0-9._-]+$")));
     . as $config |
     .version == 1 and
     ((.worker // null) == null or
@@ -787,6 +797,9 @@ validate_config_file() {
       (.value.path | test("^[A-Za-z]:") | not) and
       (.value.path | test("(^|/)\\.\\.(/|$)") | not)
     ] | all) and
+    ((.handoff_project // null) == null or
+      (.handoff_project | type == "string" and test("^[A-Za-z0-9._-]+$") and
+        $config.projects[.] != null)) and
     ((.capabilities // {}) | type == "object") and
     ([.capabilities // {} | to_entries[] |
       (.key | test("^[A-Za-z0-9._-]+$")) and
@@ -804,19 +817,19 @@ validate_config_file() {
         type == "string" and test("^[A-Za-z0-9._-]+$") and
         (. as $id | any($config.agent_artifacts[]?; .id == $id))
       ] | all) and
-      ([.value | to_entries[] | select(.key == "codex" or .key == "claude") |
-        (.value | type == "object") and
-        (.value.provider | IN("plugin","skills-cli","jsm","manual","plugin-source")) and
-        (.value.source | type == "string" and length > 0) and
-        (.value.source | contains("?") | not) and
-        (.value.source | test("^[A-Za-z][A-Za-z0-9+.-]*://(?!git@)[^/@]+@") | not) and
-        (if .value.provider == "plugin" then
-          (.value.source | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and (.value.source != ".") and (.value.source != "..")
-        else true end) and
-        ((.value.skill // null) == null or (.value.skill | type == "string" and test("^[A-Za-z0-9._-]+$"))) and
-        ((.value.name // null) == null or (.value.name | type == "string" and test("^[A-Za-z0-9._-]+$")))
-      ] | all) and
-      ([.value | keys[] | select(. == "codex" or . == "claude")] | length > 0)
+      (if (.value.agents // null) != null then
+        ((.value.agents | type == "array") and
+          (.value.agents | length > 0) and
+          ((.value.agents | unique | length) == (.value.agents | length)) and
+          ([.value.agents[] | IN("codex","claude")] | all) and
+          ([.value | keys[] | select(. == "codex" or . == "claude")] | length == 0) and
+          (.value | valid_capability_provider))
+      else
+        ([.value | to_entries[] | select(.key == "codex" or .key == "claude") |
+          (.value | type == "object") and (.value | valid_capability_provider)
+        ] | all) and
+        ([.value | keys[] | select(. == "codex" or . == "claude")] | length > 0)
+      end)
     ] | all) and
     ((.skill_roots // []) | type == "array") and
     ((.skill_roots // [] | map(.id) | unique | length) == (.skill_roots // [] | length)) and
@@ -1249,6 +1262,11 @@ worker_config_command() (
           .machines[$target].codex_control_project as $control |
           {($control):.projects[$control]}
         else {} end
+      ),
+      handoff_project:(
+        if ($domain == "projects" or $domain == "inventory") then
+          (.handoff_project // null)
+        else null end
       ),
       capabilities:(if ($domain == "agents" or $domain == "inventory") then (.capabilities // {}) else {} end),
       skill_roots:(if ($domain == "agents" or $domain == "inventory") then (.skill_roots // []) else [] end),
@@ -2537,6 +2555,9 @@ seal_plan_command() {
             .status == "present" and .data.origin_matches == true and
             .data.repository_readiness == "ready" and .data.dirty_count == 0 and
             .data.sync_state == "local-tracking-behind")
+        elif .type == "chezmoi-pull" then
+          any($records[]; .kind == "file" and .id == "chezmoi:source" and
+            .status == "present" and .data.dirty_count == 0)
         else true end)
     ' >/dev/null || {
       printf 'machine-utilities: plan does not match an actionable observed state\n' >&2

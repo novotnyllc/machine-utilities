@@ -74,4 +74,20 @@ evidence for machine-wide or cross-repository handoffs. One coordination
 repository can cover the fleet; it must not copy project source, replace the
 project repository, or depend on an unrelated utility checkout. Treat it like
 any other configured project: clone it into each host's `dev_root` and register
-it as a saved Codex project only where coordination tasks will run.
+it as a saved Codex project only where coordination tasks will run. When
+`handoff_project` is configured, resolve that project through its configured
+source and path; never assume a repository name or maintainer-local checkout.
+
+If a handoff needs a coordination repository and none is configured, first
+look for an existing configured project or user-supplied checkout and verify
+its Git remote. If it is elsewhere, ask for its project ID or exact path and
+offer to persist the corresponding user-owned configuration; do not relocate,
+clone, or replace it implicitly. If no repository exists, explain that it will
+hold only handoff pointers, ownership, status, and evidence, then propose an
+owner, repository name, local path, and private visibility. Require explicit
+user approval before `gh repo create`, adding a remote, or any push. Default the
+proposal to a private repository in the authenticated user's GitHub account,
+but never create or push it merely because a handoff was requested. After
+approval, verify the resulting remote is private and record it as an ordinary
+project plus `handoff_project`; otherwise report the exact one-time setup still
+needed and continue using project repositories where possible.

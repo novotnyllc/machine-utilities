@@ -28,6 +28,52 @@ Use manager-native ownership:
 - local source skills: update their owning repository; do not overwrite them
   with a package manager.
 
+## Routine named-plugin refresh
+
+An explicit request to update or refresh one named marketplace plugin is
+mutation authorization for exactly that plugin, marketplace, requested hosts,
+and applicable harnesses. Do not require a fleet-wide inventory/readiness
+matrix or a sealed-plan round trip for this routine path. Resolve every target
+from `MACHINE_UTILITIES_CONFIG`, falling back to
+`${XDG_CONFIG_HOME:-$HOME/.config}/machine-utilities/config.json`, and use each
+target's configured `local`, `ssh`, or `codex-remote-control` transport. Never
+guess an SSH alias or substitute WSL for native Windows.
+
+Before changing a target, capture a bounded `agents` inventory and retain only
+the exact plugin's Codex and Claude records as the before-state. Treat the two
+harnesses independently and refresh each available, applicable runtime.
+For local execution run the manager directly. For SSH, use the configured
+alias and execute through the target login shell (`$SHELL -lc`). Run only these
+manager-native command sequences, in order, substituting the authorized names:
+
+```text
+codex plugin marketplace upgrade MARKETPLACE --json
+codex plugin add PLUGIN@MARKETPLACE --json
+
+claude plugin marketplace update MARKETPLACE
+claude plugin update PLUGIN@MARKETPLACE --scope user
+```
+
+The Codex add is idempotent. For Claude, use `plugin update` when the exact
+plugin is installed; if it is absent, replace only that second Claude command
+with `claude plugin install PLUGIN@MARKETPLACE --scope user`. Do not update any
+other plugin or synchronize unrelated runtimes, settings, skills, provenance,
+or configuration. Manager output is progress evidence, not post-state.
+Recapture the bounded `agents` inventory after each harness attempt. Require the
+exact `PLUGIN@MARKETPLACE` record to be installed and enabled. Post-state must
+report the requested version. A failure in one harness does not erase the other
+harness's evidence or success.
+
+For a configured `codex-remote-control` target, follow the routine-refresh
+path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible
+native task and native PowerShell. Lazy-discover the task-control app tools
+before declaring them unavailable.
+
+Use the sealed-plan reconciliation path below instead when the request includes
+broad drift, runtime or settings changes, provenance repair, provider
+conversion, ambiguous plugin/marketplace/host scope, or any mutation beyond
+the explicit named-plugin refresh.
+
 Default to a plan listing exact host, harness, manager, source, current version
 or hash, and desired action. Seal it with
 `"$CLI" seal-plan DRAFT SNAPSHOT PLAN`. Before apply, require exact scope,
