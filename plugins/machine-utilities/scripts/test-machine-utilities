@@ -682,6 +682,63 @@ export SHELL="$tmp/bin/login-shell"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 export GIT_PULL_MARKER="$tmp/git-pull-executed"
+
+fake_darwin_bin="$tmp/fake-darwin-bin"
+fake_darwin_home="$tmp/fake-darwin-home"
+fake_darwin_jsonl="$tmp/fake-darwin.jsonl"
+mkdir -p "$fake_darwin_bin" "$fake_darwin_home/Library/LaunchAgents"
+: >"$fake_darwin_home/Library/LaunchAgents/01-broken.plist"
+: >"$fake_darwin_home/Library/LaunchAgents/02-good.plist"
+cat >"$fake_darwin_bin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Darwin\n'
+SH
+cat >"$fake_darwin_bin/plutil" <<'SH'
+#!/usr/bin/env bash
+case "${5:-}" in
+  *01-broken.plist) exit 1 ;;
+  *02-good.plist)
+    printf '%s\n' '{"Label":"com.example.good","Program":"/usr/bin/example","RunAtLoad":true}'
+    ;;
+esac
+SH
+cat >"$fake_darwin_bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = print ] && printf 'last exit code = 7\n'
+SH
+cat >"$fake_darwin_bin/crontab" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -l ] && printf '0 * * * * echo later\n'
+SH
+cat >"$fake_darwin_bin/find" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "$FAKE_DARWIN_HOME/Library/LaunchAgents" ]; then
+  printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/01-broken.plist"
+  printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/02-good.plist"
+fi
+SH
+chmod +x "$fake_darwin_bin"/*
+if ! HOME="$fake_darwin_home" FAKE_DARWIN_HOME="$fake_darwin_home" \
+  PATH="$fake_darwin_bin:$PATH" \
+  MACHINE_UTILITIES_OBSERVED_AT=2026-01-01T00:00:00Z \
+  "$script_dir/collect-posix" "$tmp/config.json" test-host fake-darwin startup \
+  >"$fake_darwin_jsonl"; then
+  fail "fake-Darwin launchd collection did not exit zero"
+fi
+PATH="$fake_darwin_bin:$PATH" "$cli" validate "$fake_darwin_jsonl"
+jq -e -s '
+  [ .[] | select(.kind == "startup_task") ] as $tasks |
+  ($tasks | length) == 3 and
+  ($tasks[0] | .status == "partial" and .id == "launchd-user:01-broken" and
+    .data.label == "01-broken" and .data.definition_digest == null and
+    (.data | has("program") | not) and .data.active == true and
+    .data.last_result == 7 and .errors[0].code == "launchd_definition_parse_failed") and
+  ($tasks[1] | .status == "present" and .id == "launchd-user:com.example.good" and
+    .data.program == "/usr/bin/example" and .data.run_at_load == true and
+    (.data.definition_digest.value | test("^[0-9a-f]{64}$"))) and
+  ($tasks[2] | .status == "present" and .id == "cron:user" and
+    .data.entry_count == 1)
+' "$fake_darwin_jsonl" >/dev/null || fail "fake-Darwin launchd regression failed"
 plugin_cache="$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/$plugin_version"
 mkdir -p "$plugin_cache"
 cp -R "$script_dir/../." "$plugin_cache/"

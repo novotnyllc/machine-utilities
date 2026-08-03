@@ -1235,8 +1235,9 @@ if has_section startup; then
             digest=$(sha256_file "$path")
             mtime=$(file_mtime "$path")
             definition='{}'
-            if command -v plutil >/dev/null 2>&1; then
-              definition=$(plutil -convert json -o - "$path" 2>/dev/null | jq -c '{
+            definition_parse_failed=true
+            if command -v plutil >/dev/null 2>&1 &&
+              definition=$(plutil -convert json -o - "$path" 2>/dev/null | jq -e -c 'select(type == "object") | {
                 label:(.Label // null),
                 program:(.Program // .ProgramArguments[0] // null),
                 run_at_load:(.RunAtLoad // false),
@@ -1244,7 +1245,10 @@ if has_section startup; then
                 start_interval:(.StartInterval // null),
                 start_calendar_interval:(.StartCalendarInterval // null),
                 working_directory:(.WorkingDirectory // null)
-              }' 2>/dev/null || printf '{}')
+              }' 2>/dev/null); then
+              definition_parse_failed=false
+            else
+              definition='{}'
             fi
             label=$(printf '%s' "$definition" | jq -r '.label // empty' | clip)
             [ -n "$label" ] || label=$(basename "$path" .plist | clip)
@@ -1255,14 +1259,23 @@ if has_section startup; then
             [ -z "$launch_state" ] || loaded=true
             last_exit=$(printf '%s\n' "$launch_state" | awk -F'= ' '/last exit code =/ {gsub(/[^0-9-]/,"",$2); print $2; exit}')
             case $last_exit in ''|*[!0-9-]*) last_exit=null ;; esac
+            if [ "$definition_parse_failed" = true ]; then
+              status=partial
+              errors='[{"code":"launchd_definition_parse_failed","severity":"warning","retryable":false,"message":"property list could not be read or parsed"}]'
+            else
+              status=present
+              errors='[]'
+            fi
             data=$(jq -cn --arg scheduler "$scheduler" --arg scope "$scope" \
               --arg path "$path" --arg label "$label" --arg digest "$digest" --arg mtime "$mtime" \
-              --argjson loaded "$loaded" --argjson last_exit "$last_exit" --argjson definition "$definition" \
+              --argjson loaded "$loaded" --argjson last_exit "$last_exit" \
+              --argjson definition_parse_failed "$definition_parse_failed" --argjson definition "$definition" \
               '{scheduler:$scheduler,scope:$scope,label:$label,enabled:null,active:$loaded,
                 last_result:$last_exit,source_definition_path:$path,definition_mtime:$mtime,
-                definition_digest:{algorithm:"sha256",value:$digest,scope:"raw-bytes"}} + $definition')
-            emit startup_task "$scheduler:$label" present high "$data" \
-              '[{"source":"launchd+filesystem","method":"launchctl-print+plist"}]'
+                definition_digest:(if $definition_parse_failed then null else
+                  {algorithm:"sha256",value:$digest,scope:"raw-bytes"} end)} + $definition')
+            emit startup_task "$scheduler:$label" "$status" high "$data" \
+              '[{"source":"launchd+filesystem","method":"launchctl-print+plist"}]' "$errors"
           done
       done
       ;;
