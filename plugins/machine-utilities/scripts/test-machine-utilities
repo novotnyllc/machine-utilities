@@ -434,6 +434,11 @@ case ${1:-} in
     [ "${2:-}" = apply ] || exit 64
     : >"$CHEZMOI_APPLY_MARKER"
     ;;
+  git)
+    [ "$#" -eq 4 ] && [ "${2:-}" = -- ] && [ "${3:-}" = pull ] &&
+      [ "${4:-}" = --ff-only ] || exit 64
+    : >"$CHEZMOI_PULL_MARKER"
+    ;;
   *) exit 64 ;;
 esac
 SH
@@ -599,6 +604,7 @@ export BREW_STATE_FILE="$tmp/brew-state"
 export BREW_EXEC_MARKER="$tmp/brew-executed"
 export OP_SECRET_FILE="$tmp/op-secret"
 export CHEZMOI_APPLY_MARKER="$tmp/chezmoi-applied"
+export CHEZMOI_PULL_MARKER="$tmp/chezmoi-pulled"
 export SKILLS_UPDATE_MARKER="$tmp/skills-updated"
 export AGENT_EXEC_MARKER="$tmp/agent-executed"
 export RUNTIME_UPDATE_MARKER="$tmp/runtime-updated"
@@ -2235,6 +2241,12 @@ cat >"$tmp/chezmoi-plan-draft.json" <<'JSON'
   "target": "test-host",
   "operations": [
     {
+      "type": "chezmoi-pull",
+      "kind": "file",
+      "id": "chezmoi:source",
+      "argv": ["chezmoi", "git", "--", "pull", "--ff-only"]
+    },
+    {
       "type": "chezmoi-apply",
       "kind": "chezmoi_state",
       "id": "live",
@@ -2258,14 +2270,18 @@ jq '.operations[0].argv += ["--force"]' "$tmp/chezmoi-plan-draft.json" \
   "$tmp/unsafe-chezmoi-plan.json"
 unsafe_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/unsafe-chezmoi-plan.json")
 rm -f "$CHEZMOI_APPLY_MARKER"
+rm -f "$CHEZMOI_PULL_MARKER"
 if "$cli" apply-plan "$tmp/unsafe-chezmoi-plan.json" "$unsafe_chezmoi_plan_id" \
   "$tmp/unsafe-chezmoi-result.jsonl" >/dev/null 2>&1; then
   fail "chezmoi mutation accepted extra argv"
 fi
 [ ! -e "$CHEZMOI_APPLY_MARKER" ] ||
   fail "unsafe chezmoi argv reached the native command"
+[ ! -e "$CHEZMOI_PULL_MARKER" ] ||
+  fail "unsafe chezmoi pull argv reached the native command"
 "$cli" apply-plan "$tmp/chezmoi-plan.json" \
   "$chezmoi_plan_id" "$tmp/chezmoi-applied.jsonl"
+[ -e "$CHEZMOI_PULL_MARKER" ] || fail "safe chezmoi fast-forward pull was not executed"
 [ -e "$CHEZMOI_APPLY_MARKER" ] || fail "safe chezmoi apply was not executed"
 
 "$cli" collect --target test-host --section auth --output "$tmp/auth-plan-snapshot.jsonl"

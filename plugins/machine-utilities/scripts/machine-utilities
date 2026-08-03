@@ -1657,8 +1657,8 @@ EOF
       return
       ;;
     chezmoi-pull)
-      { [ $# -eq 4 ] && [ "$1" = chezmoi ] && [ "$2" = git ] &&
-        [ "$3" = pull ] && [ "$4" = --ff-only ]; } || {
+      { [ $# -eq 5 ] && [ "$1" = chezmoi ] && [ "$2" = git ] &&
+        [ "$3" = -- ] && [ "$4" = pull ] && [ "$5" = --ff-only ]; } || {
         printf 'machine-utilities: unsafe chezmoi pull argv\n' >&2
         return 64
       }

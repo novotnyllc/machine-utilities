@@ -568,7 +568,7 @@ function Get-ExactArgv([object]$Operation, [object]$Config, [object]$Machine) {
         }
         "project-clone" { return Get-ProjectCommand $Operation $Config $Machine }
         "project-update" { return Get-ProjectCommand $Operation $Config $Machine }
-        "chezmoi-pull" { return @("chezmoi", "git", "pull", "--ff-only") }
+        "chezmoi-pull" { return @("chezmoi", "git", "--", "pull", "--ff-only") }
         "chezmoi-apply" { return @("chezmoi", "--no-tty", "apply") }
         default { throw "Unsupported Windows operation" }
     }
@@ -844,6 +844,13 @@ if ($SelfTest) {
         }) $null $null)
         if ((ConvertTo-CanonicalJson $RuntimeArgv) -ne '["codex","update"]') {
             throw "Agent runtime argv self-test failed"
+        }
+        $ChezmoiPullArgv = @(Get-ExactArgv ([pscustomobject]@{
+            type = "chezmoi-pull"; kind = "file"; id = "chezmoi:source"
+        }) $null $null)
+        if ((ConvertTo-CanonicalJson $ChezmoiPullArgv) -ne
+            '["chezmoi","git","--","pull","--ff-only"]') {
+            throw "Chezmoi pull argv self-test failed"
         }
         foreach ($UnsafeId in @("skills-cli:--help", "jsm:-x")) {
             $Rejected = $false

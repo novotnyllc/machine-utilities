@@ -2,15 +2,15 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "92cbf9707b36c0cc4d2dbe77c4c301467fa742600c9a819959a6bc426f02fa05"
+      "sha256": "ed78960bac3264cd8947c8364c708fa7249950c0bed56d50fa024192dffa24b4"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "ec9d68081b96bab1341d5dd91bb5ce58e1ca57f8c86bc0c7f998acf32e30d77a"
+      "sha256": "1b3c8b0ed29877dd16e34614de617cb2016411fad09f3c45f549414df71a1b21"
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "5969d6c04635a4ea1d10d4366e78c28ee7dab435a5c3cd7a1679b99b83b044b9"
+      "sha256": "9007262faddd1285aabfcadd2a77527049272a0c3d52188a37c5cc1fbe98e05a"
     },
     {
       "path": "scripts/collect-posix",
@@ -22,12 +22,12 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "233573b92d8cfbc1c1bac5437075e3a6ae3e5b09054866ac33cdbbca0d10b1e7"
+      "sha256": "b4df67033b4a4ed88d162917410224cf041f57a274fa7d9f44f909be9aa12ac8"
     }
   ],
   "marketplace": "novotnyllc",
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.4"
+  "version": "0.2.5"
 }
