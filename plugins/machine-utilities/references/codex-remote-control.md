@@ -3,6 +3,60 @@
 Use this only for a machine whose configured transport is
 `codex-remote-control`. Never substitute WSL or SSH.
 
+## Task-control capability check
+
+Task-control tools may be loaded lazily. Only when the selected targets include
+a `codex-remote-control` machine, discover and check the app tools, including
+`list_projects`, `create_thread`, and `wait_threads`; reuse that capability
+result for the bounded operation. An absent eager tool listing is not evidence
+that a tool is unavailable. Classify failure precisely:
+
+- `tool_surface_missing`: lazy discovery proves a required app tool is absent;
+- `host_offline`: `list_projects` reports the configured host in
+  `unavailableHosts` or its source as unreachable;
+- `saved_project_missing`: the host and source are reachable, but
+  `list_projects` has no saved project matching both the configured
+  remote-control host and exact native path;
+- `native_evidence_unavailable`: only WSL evidence exists for the configured
+  native Windows target;
+- `task_creation_failed`: `create_thread` fails for the matched project or its
+  client task never resolves through `wait_threads`;
+- `executor_mismatch`: the task runs but the installed executor version or
+  integrity hashes do not match; or
+- `executor_or_plugin_failure`: the verified task runs but a manager command
+  or requested-version postcondition fails.
+
+Do not collapse these states into a generic task-control failure.
+
+## Routine named-plugin refresh
+
+An explicit named-plugin refresh does not require a full native inventory or
+sealed plan. Resolve the host, saved project, plugin, marketplace, requested
+version, and applicable Codex harness from the controller's configured scope.
+Use the capability check above, create a visible task in the configured saved
+project, and run native PowerShell only. Capture `codex plugin list --json`
+before and after, retaining the exact `PLUGIN@MARKETPLACE` record. In the task,
+run only these commands in order:
+
+```powershell
+codex plugin marketplace upgrade MARKETPLACE --json
+codex plugin add PLUGIN@MARKETPLACE --json
+```
+
+Require the post-state record to be installed, enabled, and equal the requested
+version. Do not use WSL, update another plugin, synchronize settings or skills,
+or claim success from manager output alone. Record a failed postcondition as
+`executor_or_plugin_failure` while preserving before-state and command output;
+keep executor version/hash mismatch separate as `executor_mismatch` only when
+an executor load or verification was attempted. This manager-native refresh
+does not require or preflight the Machine Utilities executor, because that
+would prevent it from repairing a stale Machine Utilities installation.
+Claude is not applicable to `codex-remote-control`; do not infer its state from
+WSL.
+
+Use the full protocol below for inventory, broad reconciliation, settings,
+provenance, conversions, ambiguous scope, and sealed-plan mutations.
+
 1. Treat the initiating machine's config as authoritative. Resolve one host,
    one section, and the applicable projects/policy locally; include that
    bounded JSON object and the raw-config SHA-256 in the task prompt.
