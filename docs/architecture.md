@@ -416,6 +416,12 @@ values.
     }
   },
   "capabilities": {
+    "shared-plugin": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "example-plugin"
+    },
     "example-capability": {
       "groups": ["development"],
       "codex": {"provider": "plugin", "source": "example-plugin"},

@@ -44,7 +44,8 @@ The config defines:
 - an optional `handoff_project` identifying the ordinary configured project
   used as the private cross-project coordination ledger
 - Codex/Claude capabilities, plugin or skill providers, and standalone skill
-  roots
+  roots; shared providers use one `agents`/`provider`/`source` declaration,
+  while agent-specific providers use separate `codex` and `claude` entries
 - agent definitions and credential artifacts, including their distribution
   policy
 - safe semantic settings to compare without exposing unrelated config or MCP

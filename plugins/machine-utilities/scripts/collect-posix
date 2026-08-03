@@ -788,12 +788,15 @@ if has_section agents; then
     observed_count=0
     duplicate_count=0
     for capability_agent in codex claude; do
-      provider=$(printf '%s' "$capability" | jq -r --arg agent "$capability_agent" '.value[$agent].provider // empty')
+      definition=$(printf '%s' "$capability" | jq -c --arg agent "$capability_agent" '
+        if ((.value.agents // []) | index($agent)) != null then .value
+        else .value[$agent] // empty end')
+      provider=$(printf '%s' "$definition" | jq -r '.provider // empty')
       [ -n "$provider" ] || continue
-      source=$(printf '%s' "$capability" | jq -r --arg agent "$capability_agent" '.value[$agent].source')
+      source=$(printf '%s' "$definition" | jq -r '.source')
       safe_source=$(printf '%s\n' "$source" | sanitize_remote | clip)
-      expected_name=$(printf '%s' "$capability" | jq -r --arg agent "$capability_agent" --arg name "$capability_name" \
-        '.value[$agent].skill // .value[$agent].name // $name' | clip)
+      expected_name=$(printf '%s' "$definition" | jq -r --arg name "$capability_name" \
+        '.skill // .name // $name' | clip)
       matches=$(capability_matches "$capability_agent" "$provider" "$source" "$expected_name" || true)
       matches_json=$(printf '%s\n' "$matches" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
       match_count=$(printf '%s' "$matches_json" | jq 'length')

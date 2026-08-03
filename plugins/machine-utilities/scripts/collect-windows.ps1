@@ -433,11 +433,26 @@ function Assert-WorkerConfig([object]$Value) {
     if ($null -ne $Value.capabilities) {
         foreach ($Property in $Value.capabilities.PSObject.Properties) {
             if ($Property.Name -notmatch '^[A-Za-z0-9._][A-Za-z0-9._-]*$') { throw "Invalid capability configuration" }
-            $ProviderCount = 0
-            foreach ($Agent in @("codex", "claude")) {
-                $Definition = Get-ExactPropertyValue $Property.Value $Agent
-                if ($null -eq $Definition) { continue }
-                $ProviderCount++
+            $Definitions = @()
+            $AgentsProperty = $Property.Value.PSObject.Properties |
+                Where-Object { $_.Name -ceq "agents" } | Select-Object -First 1
+            if ($null -ne $AgentsProperty) {
+                $SharedAgents = @($AgentsProperty.Value)
+                if ($SharedAgents.Count -eq 0 -or
+                    @($SharedAgents | Sort-Object -Unique).Count -ne $SharedAgents.Count -or
+                    @($SharedAgents | Where-Object { $_ -cnotin @("codex", "claude") }).Count -gt 0 -or
+                    $null -ne (Get-ExactPropertyValue $Property.Value "codex") -or
+                    $null -ne (Get-ExactPropertyValue $Property.Value "claude")) {
+                    throw "Invalid shared capability agents"
+                }
+                $Definitions = @($Property.Value)
+            } else {
+                foreach ($Agent in @("codex", "claude")) {
+                    $Definition = Get-ExactPropertyValue $Property.Value $Agent
+                    if ($null -ne $Definition) { $Definitions += $Definition }
+                }
+            }
+            foreach ($Definition in $Definitions) {
                 if (@("plugin", "skills-cli", "jsm", "manual", "plugin-source") -notcontains [string]$Definition.provider -or
                     [string]::IsNullOrWhiteSpace([string]$Definition.source) -or
                     [string]$Definition.source -match '\?' -or
@@ -452,7 +467,7 @@ function Assert-WorkerConfig([object]$Value) {
                     throw "Invalid plugin capability source"
                 }
             }
-            if ($ProviderCount -eq 0) { throw "Capability has no provider" }
+            if ($Definitions.Count -eq 0) { throw "Capability has no provider" }
         }
     }
     if ($null -ne $Value.skill_roots) {
@@ -897,7 +912,12 @@ if (Test-Section "agents") {
             $Name = Limit-Text $Property.Name
             $Providers = @()
             foreach ($Agent in @("codex", "claude")) {
-                $Definition = Get-ExactPropertyValue $Property.Value $Agent
+                $SharedAgents = @(Get-ExactPropertyValue $Property.Value "agents")
+                $Definition = if (Test-ExactMember $SharedAgents $Agent) {
+                    $Property.Value
+                } else {
+                    Get-ExactPropertyValue $Property.Value $Agent
+                }
                 if ($null -eq $Definition) { continue }
                 $Provider = Limit-Text $Definition.provider
                 $Source = Get-SafeRemote ([string]$Definition.source)

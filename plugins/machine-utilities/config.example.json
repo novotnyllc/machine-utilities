@@ -50,25 +50,45 @@
     "last30days": {
       "groups": ["development"],
       "requires_auth": ["xurl"],
-      "codex": {
-        "provider": "skills-cli",
-        "source": "mvanhorn/last30days-skill"
-      },
-      "claude": {
-        "provider": "skills-cli",
-        "source": "mvanhorn/last30days-skill"
-      }
+      "agents": ["codex", "claude"],
+      "provider": "skills-cli",
+      "source": "mvanhorn/last30days-skill"
     },
     "compound-engineering": {
       "groups": ["development"],
-      "codex": {
-        "provider": "plugin",
-        "source": "compound-engineering"
-      },
-      "claude": {
-        "provider": "plugin",
-        "source": "compound-engineering"
-      }
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "compound-engineering"
+    },
+    "ponytail": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "ponytail"
+    },
+    "impeccable": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "impeccable"
+    },
+    "agent-utilities": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "agent-utilities"
+    },
+    "machine-utilities": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "machine-utilities"
+    },
+    "tart-xcode-runner": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "tart-xcode-runner"
     }
   },
   "skill_roots": [
