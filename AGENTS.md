@@ -12,12 +12,12 @@ When changing the plugin version, update:
 
 - `plugins/machine-utilities/.codex-plugin/plugin.json`
 - `plugins/machine-utilities/.claude-plugin/plugin.json`
+- `<marketplace-repo>/.agents/plugins/marketplace.json`
 - `<marketplace-repo>/.agents/plugins/plugin-versions.json`
 - `<marketplace-repo>/.claude-plugin/marketplace.json`
 
 When the plugin is newly added or renamed, also update:
 
-- `<marketplace-repo>/.agents/plugins/marketplace.json`
 - `<marketplace-repo>/.claude-plugin/marketplace.json`
 - `<marketplace-repo>/README.md`
 
