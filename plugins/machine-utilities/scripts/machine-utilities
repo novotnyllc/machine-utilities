@@ -1826,7 +1826,7 @@ EOF
         }
         shift 4
         validate_chezmoi_targets "$@" || return
-        jq -e --args "$@" '.targets == $ARGS.positional' "$operation" >/dev/null || {
+        jq -e --args '.targets == $ARGS.positional' -- "$@" <"$operation" >/dev/null || {
           printf 'machine-utilities: targeted chezmoi argv does not match the sealed targets\n' >&2
           return 64
         }
