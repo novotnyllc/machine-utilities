@@ -1232,12 +1232,14 @@ if has_section startup; then
         [ -d "$directory" ] || continue
         find "$directory" -maxdepth 1 -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort |
           while IFS= read -r path; do
-            digest=$(sha256_file "$path")
             mtime=$(file_mtime "$path")
             definition='{}'
             definition_parse_failed=true
+            digest=
             if command -v plutil >/dev/null 2>&1 &&
-              definition=$(plutil -convert json -o - "$path" 2>/dev/null | jq -e -c 'select(type == "object") | {
+              definition=$(
+                set -o pipefail
+                plutil -convert json -o - "$path" 2>/dev/null | jq -e -c 'select(type == "object") | {
                 label:(.Label // null),
                 program:(.Program // .ProgramArguments[0] // null),
                 run_at_load:(.RunAtLoad // false),
@@ -1245,8 +1247,16 @@ if has_section startup; then
                 start_interval:(.StartInterval // null),
                 start_calendar_interval:(.StartCalendarInterval // null),
                 working_directory:(.WorkingDirectory // null)
-              }' 2>/dev/null); then
-              definition_parse_failed=false
+              }' 2>/dev/null
+              ); then
+              if digest=$(
+                set -o pipefail
+                sha256_file "$path"
+              ); then
+                definition_parse_failed=false
+              else
+                definition='{}'
+              fi
             else
               definition='{}'
             fi

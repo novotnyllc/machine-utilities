@@ -688,7 +688,9 @@ fake_darwin_home="$tmp/fake-darwin-home"
 fake_darwin_jsonl="$tmp/fake-darwin.jsonl"
 mkdir -p "$fake_darwin_bin" "$fake_darwin_home/Library/LaunchAgents"
 : >"$fake_darwin_home/Library/LaunchAgents/01-broken.plist"
-: >"$fake_darwin_home/Library/LaunchAgents/02-good.plist"
+: >"$fake_darwin_home/Library/LaunchAgents/02-plutil-status.plist"
+: >"$fake_darwin_home/Library/LaunchAgents/03-hash-failed.plist"
+: >"$fake_darwin_home/Library/LaunchAgents/04-good.plist"
 cat >"$fake_darwin_bin/uname" <<'SH'
 #!/usr/bin/env bash
 printf 'Darwin\n'
@@ -697,7 +699,14 @@ cat >"$fake_darwin_bin/plutil" <<'SH'
 #!/usr/bin/env bash
 case "${5:-}" in
   *01-broken.plist) exit 1 ;;
-  *02-good.plist)
+  *02-plutil-status.plist)
+    printf '%s\n' '{"Label":"com.example.plutil-status","Program":"/usr/bin/example","RunAtLoad":true}'
+    exit 1
+    ;;
+  *03-hash-failed.plist)
+    printf '%s\n' '{"Label":"com.example.hash-failed","Program":"/usr/bin/example","RunAtLoad":true}'
+    ;;
+  *04-good.plist)
     printf '%s\n' '{"Label":"com.example.good","Program":"/usr/bin/example","RunAtLoad":true}'
     ;;
 esac
@@ -706,6 +715,27 @@ cat >"$fake_darwin_bin/launchctl" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = print ] && printf 'last exit code = 7\n'
 SH
+real_sha256sum=$(command -v sha256sum || true)
+if [ -n "$real_sha256sum" ]; then
+  cat >"$fake_darwin_bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "$FAKE_DARWIN_HOME/Library/LaunchAgents/03-hash-failed.plist" ]; then
+  exit 1
+fi
+exec "$REAL_SHA256SUM" "$@"
+SH
+  export REAL_SHA256SUM="$real_sha256sum"
+else
+  real_shasum=$(command -v shasum)
+  cat >"$fake_darwin_bin/shasum" <<'SH'
+#!/usr/bin/env bash
+if [ "${3:-}" = "$FAKE_DARWIN_HOME/Library/LaunchAgents/03-hash-failed.plist" ]; then
+  exit 1
+fi
+exec "$REAL_SHASUM" "$@"
+SH
+  export REAL_SHASUM="$real_shasum"
+fi
 cat >"$fake_darwin_bin/crontab" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = -l ] && printf '0 * * * * echo later\n'
@@ -714,7 +744,9 @@ cat >"$fake_darwin_bin/find" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "$FAKE_DARWIN_HOME/Library/LaunchAgents" ]; then
   printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/01-broken.plist"
-  printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/02-good.plist"
+  printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/02-plutil-status.plist"
+  printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/03-hash-failed.plist"
+  printf '%s\n' "$FAKE_DARWIN_HOME/Library/LaunchAgents/04-good.plist"
 fi
 SH
 chmod +x "$fake_darwin_bin"/*
@@ -728,15 +760,21 @@ fi
 PATH="$fake_darwin_bin:$PATH" "$cli" validate "$fake_darwin_jsonl"
 jq -e -s '
   [ .[] | select(.kind == "startup_task") ] as $tasks |
-  ($tasks | length) == 3 and
+  ($tasks | length) == 5 and
   ($tasks[0] | .status == "partial" and .id == "launchd-user:01-broken" and
     .data.label == "01-broken" and .data.definition_digest == null and
     (.data | has("program") | not) and .data.active == true and
     .data.last_result == 7 and .errors[0].code == "launchd_definition_parse_failed") and
-  ($tasks[1] | .status == "present" and .id == "launchd-user:com.example.good" and
+  ($tasks[1] | .status == "partial" and .id == "launchd-user:02-plutil-status" and
+    .data.label == "02-plutil-status" and .data.definition_digest == null and
+    (.data | has("program") | not) and .errors[0].code == "launchd_definition_parse_failed") and
+  ($tasks[2] | .status == "partial" and .id == "launchd-user:03-hash-failed" and
+    .data.label == "03-hash-failed" and .data.definition_digest == null and
+    (.data | has("program") | not) and .errors[0].code == "launchd_definition_parse_failed") and
+  ($tasks[3] | .status == "present" and .id == "launchd-user:com.example.good" and
     .data.program == "/usr/bin/example" and .data.run_at_load == true and
     (.data.definition_digest.value | test("^[0-9a-f]{64}$"))) and
-  ($tasks[2] | .status == "present" and .id == "cron:user" and
+  ($tasks[4] | .status == "present" and .id == "cron:user" and
     .data.entry_count == 1)
 ' "$fake_darwin_jsonl" >/dev/null || fail "fake-Darwin launchd regression failed"
 plugin_cache="$tmp/home/.codex/plugins/cache/novotnyllc/machine-utilities/$plugin_version"
