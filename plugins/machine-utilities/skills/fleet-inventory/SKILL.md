@@ -39,5 +39,27 @@ For `codex-remote-control`, Codex must read and follow
 transport as unsupported. Never route Windows through WSL unless the config
 explicitly chooses a different transport.
 
+## Protected broker readiness
+
+For an enrolled or proposed protected target, run
+`"$CLI" privilege-status HOST SNAPSHOT` and report transport, node identity,
+broker, adapter mechanism, protected machine-package, and bounded profile
+readiness separately. The shared protected workflow vocabulary for both Codex
+and Claude is `prepare-privilege-identity`, `prepare-privilege-enrollment`,
+`verify-privilege-plan`, `submit-privilege-plan`,
+`lookup-privilege-result`, `preview-privilege-upgrade`, and
+`preview-privilege-revocation`. This inventory skill invokes none of the
+mutating commands.
+
+Preserve `needs_enrollment`, `drifted`, `transport_unavailable`,
+`unsupported_context`, `unsupported_security_boundary`, `partial`, and
+`stale` exactly. Show the public audit identity: fleet CA fingerprint and
+generation, originating node ID, node-key fingerprint, certificate serial and
+validity, and pinned host-key fingerprint. Never print private-key material.
+Never ask for or relay a sudo or Administrator password. Enrollment,
+upgrade, policy activation, and revocation stop at their local human
+password/UAC boundary; no WSL, shell, Codex-task, or interactive SSH fallback
+may substitute for the configured protected adapter.
+
 Conclude with observed drift, unavailable evidence, and exact next actions.
 Do not mutate anything from this skill.

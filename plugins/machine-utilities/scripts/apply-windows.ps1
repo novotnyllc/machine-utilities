@@ -114,6 +114,42 @@ function Test-BoundedStrings([object]$Value) {
     return $true
 }
 
+function Test-ContainsProtectedPlanField([object]$Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return $false }
+    $ProtectedNames = @(
+        "action_id", "broker", "broker_protocol", "certificate_source_addresses", "context", "enrollment",
+        "observed_execution_principal", "payload", "policy", "policy_token", "privilege", "privilege_request",
+        "request", "request_sid", "required_context", "semantic_action", "target_uid"
+    )
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($Key in $Value.Keys) {
+            $NormalizedKey = ([string]$Key).ToLowerInvariant().Replace('-', '_')
+            if ($NormalizedKey -cin $ProtectedNames -or (Test-ContainsProtectedPlanField $Value[$Key])) { return $true }
+        }
+        return $false
+    }
+    if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
+        foreach ($Item in $Value) { if (Test-ContainsProtectedPlanField $Item) { return $true } }
+        return $false
+    }
+    foreach ($Property in @($Value.PSObject.Properties)) {
+        $NormalizedName = $Property.Name.ToLowerInvariant().Replace('-', '_')
+        if ($NormalizedName -cin $ProtectedNames -or (Test-ContainsProtectedPlanField $Property.Value)) { return $true }
+    }
+    return $false
+}
+
+function Test-ExactProperties([object]$Value, [string[]]$Expected) {
+    if ($null -eq $Value) { return $false }
+    $Actual = if ($Value -is [Collections.IDictionary]) {
+        @($Value.Keys | ForEach-Object { [string]$_ })
+    } else { @($Value.PSObject.Properties.Name) }
+    [Array]::Sort($Actual, [StringComparer]::Ordinal)
+    $Wanted = @($Expected)
+    [Array]::Sort($Wanted, [StringComparer]::Ordinal)
+    return ($Actual.Count -eq $Wanted.Count -and ($Actual -join "`0") -ceq ($Wanted -join "`0"))
+}
+
 function Test-HexSha256([object]$Value) {
     return $Value -is [string] -and [string]$Value -match "^[0-9a-f]{64}$"
 }
@@ -353,6 +389,9 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
         -not (Test-HexSha256 $Plan.precondition_digest.value)) {
         throw "Invalid sealed Windows plan"
     }
+    if (Test-ContainsProtectedPlanField $Plan) {
+        throw "Protected schema 3/4 fields are forbidden in the ordinary interactive Windows lane"
+    }
     $ControllerDigest = if ($null -ne $Plan.controller_configuration_digest) {
         $Plan.controller_configuration_digest
     } else {
@@ -368,6 +407,13 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
     $Operations = @($Plan.operations)
     if ($Operations.Count -eq 0 -or $Operations.Count -gt 128) { throw "Invalid plan operations" }
     foreach ($Operation in $Operations) {
+        $ExpectedOperationProperties = if ([string]$Operation.type -eq "package-upgrade") {
+            @("argv", "candidate_version", "id", "kind", "type")
+        } else { @("argv", "id", "kind", "type") }
+        if (-not (Test-ExactProperties $Operation $ExpectedOperationProperties) -or
+            [string]$Operation.type -eq "semantic-action") {
+            throw "Invalid ordinary Windows operation shape"
+        }
         if (@($Operation.argv).Count -eq 0 -or @($Operation.argv).Count -gt 64 -or
             @($Operation.argv | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
             throw "Invalid operation argv"
@@ -818,6 +864,20 @@ if ($SelfTest) {
         if (-not (Test-BoundedStrings ([DateTime]::UtcNow))) {
             throw "JSON scalar self-test failed"
         }
+        $ProtectedInjection = [pscustomobject]@{
+            schema = "machine-utilities.plan"
+            schema_version = 2
+            operations = @([pscustomobject]@{
+                type = "package-upgrade"; kind = "package"; id = "fixture"
+                argv = @("winget", "upgrade"); policy_token = "forbidden"
+            })
+        }
+        if (-not (Test-ContainsProtectedPlanField $ProtectedInjection) -or
+            (Test-ExactProperties $ProtectedInjection.operations[0] @(
+                "argv", "candidate_version", "id", "kind", "type"
+            ))) {
+            throw "Protected schema-2 injection self-test failed"
+        }
         $CanonicalTimestamp = ConvertTo-CanonicalJson ([DateTime]::Parse(
             "2026-01-02T03:04:05Z",
             [Globalization.CultureInfo]::InvariantCulture,
@@ -1219,6 +1279,18 @@ if ($SelfTest) {
             }
         }
 
+        foreach ($ChildSelfTest in @(
+            @{ Path = (Join-Path $PSScriptRoot "privilege-broker-windows.ps1"); Marker = "PASS: privilege-broker-windows fixture-safe self-check" },
+            @{ Path = (Join-Path $PSScriptRoot "profile-worker-windows.ps1"); Marker = "PASS: profile-worker-windows fixture-safe self-check" },
+            @{ Path = (Join-Path $PSScriptRoot "register-profile-task-windows.ps1"); Marker = "PASS: register-profile-task-windows fixture-safe self-check" },
+            @{ Path = (Join-Path $PSScriptRoot "enroll-privilege-windows.ps1"); Marker = "PASS: enroll-privilege-windows fixture-safe self-check" }
+        )) {
+            Assert-RegularFile $ChildSelfTest.Path "Windows privilege lifecycle script" | Out-Null
+            $ChildOutput = @(& $ChildSelfTest.Path -SelfTest)
+            if (@($ChildOutput | Where-Object { $_ -ceq $ChildSelfTest.Marker }).Count -ne 1) {
+                throw "Windows privilege lifecycle child self-test failed: $($ChildSelfTest.Path)"
+            }
+        }
         Write-Output "PASS: apply-windows native boundary self-check"
         exit 0
     } finally {

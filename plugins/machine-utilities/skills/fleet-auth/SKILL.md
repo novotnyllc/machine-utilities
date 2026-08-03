@@ -61,3 +61,17 @@ per-machine least-privilege credentials for unattended work. For Windows,
 Codex uses a visible saved-project task as described in
 `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
 unsupported. Never route secrets through WSL or another machine as a bridge.
+
+Protected broker records are status-only for this skill. Use
+`"$CLI" privilege-status HOST SNAPSHOT` and the shared Codex/Claude vocabulary
+`prepare-privilege-identity`, `prepare-privilege-enrollment`,
+`verify-privilege-plan`, `submit-privilege-plan`,
+`lookup-privilege-result`, `preview-privilege-upgrade`, and
+`preview-privilege-revocation`, but never put an auth artifact, credential,
+secret reference, encrypted file, token, private key, or secret-backed template
+in a profile bundle or protected request. S4U has no network or encrypted-file
+access. Preserve `needs_enrollment`, `drifted`, `transport_unavailable`,
+`unsupported_context`, `unsupported_security_boundary`, `partial`, and
+`stale` without fallback. Never ask for or relay a sudo or Administrator password;
+enrollment and lifecycle changes stop at the local
+human password/UAC boundary.

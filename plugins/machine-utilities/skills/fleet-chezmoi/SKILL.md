@@ -49,6 +49,24 @@ supports a clean fast-forward source pull and a non-TTY full apply.
 `chezmoi add` is unsupported because allowed target paths are user-specific;
 it fails before plan sealing.
 
+For a readiness-advertised Windows profile action, render only the already
+authorized target-specific managed files into a private source root and build
+the payload with `"$CLI" profile-bundle SPEC SOURCE-ROOT OUTPUT`. Codex and
+Claude must produce the same bundle bytes. Do not include chezmoi secrets,
+secret-backed templates, credentials, installed plugin caches, arbitrary paths,
+or content outside the protected entry map. S4U is logged-off and has no
+network or encrypted-file access; use ordinary user-session reconciliation
+when those capabilities are required.
+
+Use `"$CLI" privilege-status HOST SNAPSHOT` and the shared protected vocabulary
+`prepare-privilege-identity`, `prepare-privilege-enrollment`,
+`verify-privilege-plan`, `submit-privilege-plan`,
+`lookup-privilege-result`, `preview-privilege-upgrade`, and
+`preview-privilege-revocation`. Preserve all readiness/result states and never
+fall back through WSL, a shell, or a visible Codex task.
+Never ask for or relay a sudo or Administrator password; stop lifecycle changes at the local
+human password/UAC boundary.
+
 Use local/SSH execution. If a Windows host is configured for Codex remote
 control, read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports

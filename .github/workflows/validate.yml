@@ -21,7 +21,12 @@ jobs:
         run: |
           set -eu
           bash -n plugins/machine-utilities/scripts/machine-utilities
+          bash -n plugins/machine-utilities/scripts/certify-ssh-node
           bash -n plugins/machine-utilities/scripts/collect-posix
+          bash -n plugins/machine-utilities/scripts/enroll-privilege-posix
+          bash -n plugins/machine-utilities/scripts/enroll-ssh-posix
+          bash -n plugins/machine-utilities/scripts/prepare-ssh-identity
+          bash -n plugins/machine-utilities/scripts/privilege-broker-posix
           bash -n plugins/machine-utilities/scripts/test-machine-utilities
           bash -n plugins/machine-utilities/scripts/update-integrity
           if [[ "$RUNNER_OS" == Linux ]]; then
@@ -32,6 +37,38 @@ jobs:
           fi
           plugins/machine-utilities/scripts/update-integrity
           git diff --exit-code -- plugins/machine-utilities/integrity.json
+      - name: Validate public identity and transport helpers
+        shell: bash
+        run: |
+          set -eu
+          plugins/machine-utilities/scripts/prepare-ssh-identity self-test
+          plugins/machine-utilities/scripts/certify-ssh-node self-test
+          plugins/machine-utilities/scripts/enroll-ssh-posix self-test
+      - name: Validate fleet skill frontmatter
+        shell: bash
+        run: |
+          set -eu
+          python3 - plugins/machine-utilities/skills/*/SKILL.md <<'PY'
+          import pathlib
+          import sys
+
+          for argument in sys.argv[1:]:
+              path = pathlib.Path(argument)
+              lines = path.read_text(encoding="utf-8").splitlines()
+              if not lines or lines[0] != "---" or "---" not in lines[1:]:
+                  raise SystemExit(f"invalid frontmatter boundary: {path}")
+              end = lines.index("---", 1)
+              fields = {}
+              for line in lines[1:end]:
+                  if ": " not in line:
+                      raise SystemExit(f"invalid frontmatter field: {path}: {line}")
+                  key, value = line.split(": ", 1)
+                  if key in fields or not value:
+                      raise SystemExit(f"invalid frontmatter value: {path}: {key}")
+                  fields[key] = value
+              if set(fields) != {"name", "description"} or fields["name"] != path.parent.name:
+                  raise SystemExit(f"invalid skill identity: {path}")
+          PY
       - name: Run fixture suite
         shell: bash
         run: |
@@ -42,13 +79,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 8.0.423
       - name: Validate PowerShell native boundaries and release hashes
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $scripts = @(
             "plugins/machine-utilities/scripts/collect-windows.ps1",
-            "plugins/machine-utilities/scripts/apply-windows.ps1"
+            "plugins/machine-utilities/scripts/apply-windows.ps1",
+            "plugins/machine-utilities/scripts/enroll-privilege-windows.ps1",
+            "plugins/machine-utilities/scripts/enroll-windows-sftp.ps1",
+            "plugins/machine-utilities/scripts/privilege-broker-windows.ps1",
+            "plugins/machine-utilities/scripts/profile-worker-windows.ps1",
+            "plugins/machine-utilities/scripts/register-profile-task-windows.ps1",
+            "plugins/machine-utilities/scripts/windows-native-canary-runner.ps1"
           )
           foreach ($script in $scripts) {
             $tokens = $null
@@ -61,6 +107,10 @@ jobs:
           & pwsh -NoLogo -NoProfile -NonInteractive -File `
             "plugins/machine-utilities/scripts/apply-windows.ps1" -SelfTest
           if ($LASTEXITCODE -ne 0) { throw "Windows native boundary self-test failed" }
+          foreach ($script in @($scripts | Where-Object { $_ -notlike "*apply-windows.ps1" })) {
+            & pwsh -NoLogo -NoProfile -NonInteractive -File $script -SelfTest
+            if ($LASTEXITCODE -ne 0) { throw "Windows self-test failed: $script" }
+          }
           $root = Resolve-Path "plugins/machine-utilities"
           $integrity = Get-Content "$root/integrity.json" -Raw | ConvertFrom-Json
           foreach ($file in @($integrity.files)) {
@@ -89,4 +139,21 @@ jobs:
             }
           } finally {
             Remove-Item -LiteralPath $requirementPath -Force -ErrorAction SilentlyContinue
+          }
+      - name: Verify compiled WinGet helper contracts
+        shell: pwsh
+        working-directory: plugins/machine-utilities/windows
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet restore WinGetBroker.Tests/WinGetBroker.Tests.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { throw "Locked WinGet helper restore failed" }
+          dotnet run --no-restore --configuration Release --framework net8.0 `
+            --project WinGetBroker.Tests/WinGetBroker.Tests.csproj
+          if ($LASTEXITCODE -ne 0) { throw "WinGet helper contract tests failed" }
+          dotnet restore WinGetBroker/WinGetBroker.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { throw "Locked WinGet helper restore failed" }
+          foreach ($rid in @("win-x64", "win-arm64")) {
+            dotnet build WinGetBroker/WinGetBroker.csproj --no-restore --configuration Release `
+              --framework net8.0-windows10.0.26100.0 --runtime $rid
+            if ($LASTEXITCODE -ne 0) { throw "WinGet helper build failed: $rid" }
           }

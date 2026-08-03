@@ -1,10 +1,14 @@
+[CmdletBinding(DefaultParameterSetName = "Collect")]
 param(
-    [Parameter(Mandatory = $true)][string]$ConfigPath,
-    [Parameter(Mandatory = $true)][string]$HostId,
-    [Parameter(Mandatory = $true)][ValidatePattern("^[0-9A-Fa-f]{64}$")][string]$ControllerConfigDigest,
+    [Parameter(Mandatory = $true, ParameterSetName = "Collect")][string]$ConfigPath,
+    [Parameter(Mandatory = $true, ParameterSetName = "Collect")][string]$HostId,
+    [Parameter(Mandatory = $true, ParameterSetName = "Collect")]
+    [ValidatePattern("^[0-9A-Fa-f]{64}$")][string]$ControllerConfigDigest,
+    [Parameter(ParameterSetName = "Collect")]
     [string]$SnapshotId = ([DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ") + "-" + $PID),
-    [string[]]$Sections = @("all"),
-    [switch]$AllowAuthVerify
+    [Parameter(ParameterSetName = "Collect")][string[]]$Sections = @("all"),
+    [Parameter(ParameterSetName = "Collect")][switch]$AllowAuthVerify,
+    [Parameter(Mandatory = $true, ParameterSetName = "SelfTest")][switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -225,7 +229,27 @@ function Test-PrivilegeConstraints([string[]]$PolicyLines, [string[]]$Lines, [st
             $Parts = $_.Split('|'); if ($Parts[0] -ceq "profile") { $Parts[1] } else { $Parts[2] }
         } | Sort-Object -Unique)
     }
-    return [pscustomobject]@{ Generation = $Generation; Digest = $FileDigest; Tokens = $Tokens }
+    $Profiles = @($Lines | Select-Object -Skip 1 | Where-Object {
+        $_.StartsWith("profile|", [StringComparison]::Ordinal)
+    } | ForEach-Object {
+        $Fields = $_.Split('|')
+        [ordered]@{
+            policy_token = $Fields[1]
+            target_sid = $Fields[2]
+            profile_root_id = $Fields[3]
+            entry_map_digest = $Fields[4]
+            marketplace_set_digest = $Fields[5]
+            delete_mode = $Fields[6]
+            max_entries = [int64]$Fields[7]
+            max_bytes = [int64]$Fields[8]
+        }
+    })
+    return [pscustomobject]@{
+        Generation = $Generation
+        Digest = $FileDigest
+        Tokens = $Tokens
+        Profiles = $Profiles
+    }
 }
 
 function Test-WindowsProtectedFile([string]$Path) {
@@ -246,6 +270,508 @@ function Test-WindowsProtectedFile([string]$Path) {
         }
         return $true
     } catch { return $false }
+}
+
+function Test-WindowsPublicProjectionFile([string]$Path) {
+    try {
+        if ($env:OS -ne "Windows_NT") { return $false }
+        $Item = Get-Item -LiteralPath $Path -Force
+        if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        $Acl = Get-Acl -LiteralPath $Path
+        if ([string]$Acl.Owner -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators)$') { return $false }
+        foreach ($Rule in $Acl.Access) {
+            if ($Rule.AccessControlType -eq "Allow" -and
+                ($Rule.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::Write -bor
+                    [Security.AccessControl.FileSystemRights]::Modify -bor
+                    [Security.AccessControl.FileSystemRights]::FullControl -bor
+                    [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                    [Security.AccessControl.FileSystemRights]::TakeOwnership)) -ne 0 -and
+                [string]$Rule.IdentityReference -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Read-ExactCanonicalFields(
+    [string[]]$Lines,
+    [string[]]$Names,
+    [string]$Header,
+    [string]$Trailer
+) {
+    if ($null -eq $Lines -or $Lines.Count -ne $Names.Count + 2 -or
+        $Lines[0] -cne $Header -or $Lines[-1] -cne $Trailer) { return $null }
+    $Fields = [ordered]@{}
+    for ($Index = 0; $Index -lt $Names.Count; $Index++) {
+        $Parts = $Lines[$Index + 1].Split('|')
+        if ($Parts.Count -ne 2 -or $Parts[0] -cne $Names[$Index] -or
+            $Parts[1].Length -gt 4096 -or $Fields.Contains($Parts[0])) { return $null }
+        $Fields[$Parts[0]] = $Parts[1]
+    }
+    return [pscustomobject]$Fields
+}
+
+function ConvertFrom-WindowsSftpCanonicalBytes([byte[]]$Bytes, [int]$MaximumBytes) {
+    if ($null -eq $Bytes -or $Bytes.Count -lt 1 -or $Bytes.Count -gt $MaximumBytes -or
+        $Bytes[-1] -ne 10) { return $null }
+    foreach ($Byte in $Bytes) {
+        if ($Byte -ne 10 -and ($Byte -lt 32 -or $Byte -gt 126)) { return $null }
+    }
+    $Text = [Text.Encoding]::ASCII.GetString($Bytes)
+    if ($Text.Contains("`r") -or $Text.Contains("`0")) { return $null }
+    return [string[]]@($Text.Substring(0, $Text.Length - 1).Split("`n"))
+}
+
+function Get-WindowsSftpBytesSha256([byte[]]$Bytes) {
+    $Hasher = [Security.Cryptography.SHA256]::Create()
+    try { return (($Hasher.ComputeHash($Bytes) | ForEach-Object { $_.ToString("x2") }) -join "") }
+    finally { $Hasher.Dispose() }
+}
+
+function Test-WindowsSftpDigest([string]$Value) { return $Value -cmatch '^[0-9a-f]{64}$' }
+function Test-WindowsSftpThumbprint([string]$Value) {
+    return $Value -cmatch '^(?:[0-9A-F]{40}|[0-9A-F]{64})$'
+}
+function Test-WindowsSftpFingerprint([string]$Value) {
+    return $Value -cmatch '^SHA256:[A-Za-z0-9+/]{43}=?$'
+}
+function Test-WindowsSftpSid([string]$Value) {
+    return $Value -cmatch '^S-[0-9]+(?:-[0-9]+){1,14}$' -and $Value -cnotmatch '-500$'
+}
+function Test-WindowsSftpHost([string]$Value) {
+    return $Value.Length -le 253 -and
+        $Value -cmatch '^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'
+}
+function Test-WindowsSftpUInt([string]$Value, [bool]$Positive = $false) {
+    if ($Value -cnotmatch '^(0|[1-9][0-9]{0,18})$') { return $false }
+    return -not $Positive -or $Value -cne "0"
+}
+function Test-WindowsSftpCidr([string]$Value) {
+    $Parts = $Value.Split('/')
+    if ($Parts.Count -ne 2 -or $Parts[1] -notmatch '^(0|[1-9][0-9]{0,2})$') { return $false }
+    [Net.IPAddress]$Address = $null
+    if (-not [Net.IPAddress]::TryParse($Parts[0], [ref]$Address)) { return $false }
+    [int]$Prefix = $Parts[1]
+    if ($Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { return $Prefix -le 32 }
+    if ($Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) { return $Prefix -le 128 }
+    return $false
+}
+function Test-WindowsSftpCidrs([string]$Value) {
+    if ($Value.Length -lt 1 -or $Value.Length -gt 2048) { return $false }
+    $Items = [string[]]@($Value.Split(','))
+    if ($Items.Count -lt 1 -or $Items.Count -gt 32) { return $false }
+    $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $Previous = ""
+    foreach ($Item in $Items) {
+        if (-not (Test-WindowsSftpCidr $Item) -or -not $Seen.Add($Item) -or
+            ($Previous.Length -gt 0 -and [StringComparer]::Ordinal.Compare($Previous, $Item) -ge 0)) {
+            return $false
+        }
+        $Previous = $Item
+    }
+    return $true
+}
+
+function Read-WindowsSftpCandidateLines([string[]]$Lines) {
+    $Names = @(
+        "operation", "authorization", "host", "request-account", "request-sid", "endpoint-principal",
+        "primary-ca-fingerprint", "primary-ca-generation", "previous-ca-fingerprint",
+        "previous-ca-generation", "krl-generation", "management-cidrs", "host-key-fingerprint",
+        "intent-sha256", "controller-signature-sha256", "controller-signing-thumbprint",
+        "release-publisher-thumbprint", "protected-entrypoint-sha256", "u3-state", "u3-epoch",
+        "u3-generation-sha256", "u3-active-pointer-sha256", "u3-task-sha256", "u3-broker-sha256",
+        "chroot-contract-sha256", "slot-acl-sha256", "results-acl-sha256", "quota-contract-sha256",
+        "openssh-contract-sha256", "configuration-sha256", "firewall-contract-sha256", "issued-at",
+        "expires-at", "controller-signing"
+    )
+    $Fields = Read-ExactCanonicalFields $Lines $Names "windows-sftp-enrollment-candidate|1" "end-candidate|"
+    if ($null -eq $Fields -or $Fields.operation -cnotin @("install", "repair") -or
+        $Fields.authorization -cne "inert-unsigned-local-observation" -or
+        -not (Test-WindowsSftpHost $Fields.host) -or
+        $Fields.'request-account' -cne "MachineUtilitiesRequest" -or
+        $Fields.'endpoint-principal' -cne "machine-utilities-windows" -or
+        -not (Test-WindowsSftpSid $Fields.'request-sid') -or
+        -not (Test-WindowsSftpFingerprint $Fields.'primary-ca-fingerprint') -or
+        -not (Test-WindowsSftpUInt $Fields.'primary-ca-generation' $true) -or
+        -not (Test-WindowsSftpUInt $Fields.'krl-generation' $true) -or
+        -not (Test-WindowsSftpCidrs $Fields.'management-cidrs') -or
+        -not (Test-WindowsSftpFingerprint $Fields.'host-key-fingerprint') -or
+        -not (Test-WindowsSftpThumbprint $Fields.'controller-signing-thumbprint') -or
+        -not (Test-WindowsSftpThumbprint $Fields.'release-publisher-thumbprint') -or
+        $Fields.'u3-state' -cne "verified" -or -not (Test-WindowsSftpUInt $Fields.'u3-epoch' $true) -or
+        $Fields.'controller-signing' -cne "required-separate") { return $null }
+    if ($Fields.'previous-ca-fingerprint' -ceq "-") {
+        if ($Fields.'previous-ca-generation' -cne "0") { return $null }
+    } elseif (-not (Test-WindowsSftpFingerprint $Fields.'previous-ca-fingerprint') -or
+        -not (Test-WindowsSftpUInt $Fields.'previous-ca-generation' $true) -or
+        $Fields.'previous-ca-fingerprint' -ceq $Fields.'primary-ca-fingerprint') { return $null }
+    foreach ($Name in @(
+            "intent-sha256", "controller-signature-sha256", "protected-entrypoint-sha256",
+            "u3-generation-sha256", "u3-active-pointer-sha256", "u3-task-sha256", "u3-broker-sha256",
+            "chroot-contract-sha256", "slot-acl-sha256", "results-acl-sha256", "quota-contract-sha256",
+            "openssh-contract-sha256", "configuration-sha256", "firewall-contract-sha256")) {
+        if (-not (Test-WindowsSftpDigest $Fields.$Name)) { return $null }
+    }
+    if (-not (Test-WindowsSftpUInt $Fields.'issued-at' $true) -or
+        -not (Test-WindowsSftpUInt $Fields.'expires-at' $true)) { return $null }
+    [int64]$IssuedAt = $Fields.'issued-at'; [int64]$ExpiresAt = $Fields.'expires-at'
+    if ($ExpiresAt -le $IssuedAt -or ($ExpiresAt - $IssuedAt) -gt 86400) { return $null }
+    return $Fields
+}
+
+function Read-WindowsSftpReadinessLines([string[]]$Lines) {
+    if ($null -eq $Lines -or $Lines.Count -lt 15) { return $null }
+    $StateLine = $Lines[1].Split('|')
+    if ($StateLine.Count -ne 2 -or $StateLine[0] -cne "state") { return $null }
+    $Names = @("state", "reason", "host", "request-sid", "intent-sha256", "candidate-sha256",
+        "host-key-fingerprint", "transport-ready", "broker-ready", "node-identity-ready",
+        "action-context-ready", "controller-signature-ready", "readiness-authority")
+    if ($StateLine[1] -ceq "revoked") { $Names += "revoke-intent-sha256" }
+    $Fields = Read-ExactCanonicalFields $Lines $Names "windows-sftp-readiness|1" "end-readiness|"
+    if ($null -eq $Fields -or
+        $Fields.state -cnotin @("ready", "awaiting-controller-signature", "revoked", "draining", "drifted") -or
+        $Fields.reason -cnotmatch '^[a-z][a-z0-9_]{0,127}$' -or
+        -not (Test-WindowsSftpHost $Fields.host) -or -not (Test-WindowsSftpSid $Fields.'request-sid') -or
+        -not (Test-WindowsSftpDigest $Fields.'intent-sha256') -or
+        -not (Test-WindowsSftpDigest $Fields.'candidate-sha256') -or
+        -not (Test-WindowsSftpFingerprint $Fields.'host-key-fingerprint') -or
+        $Fields.'transport-ready' -cnotin @("true", "false") -or
+        $Fields.'controller-signature-ready' -cnotin @("true", "false") -or
+        $Fields.'broker-ready' -cne "observed-separately" -or
+        $Fields.'node-identity-ready' -cne "observed-separately" -or
+        $Fields.'action-context-ready' -cne "observed-separately") { return $null }
+    if ($Fields.state -ceq "ready") {
+        if ($Fields.reason -cne "controller_signed_receipt_and_local_transport_verified" -or
+            $Fields.'transport-ready' -cne "true" -or $Fields.'controller-signature-ready' -cne "true" -or
+            $Fields.'readiness-authority' -cne "controller-signed-receipt-plus-local-observation") {
+            return $null
+        }
+    } elseif ($Fields.state -ceq "revoked") {
+        if ($Fields.reason -cne "managed_transport_removed" -or $Fields.'transport-ready' -cne "false" -or
+            $Fields.'controller-signature-ready' -cne "false" -or
+            $Fields.'readiness-authority' -cne "controller-signed-revocation-plus-local-observation" -or
+            -not (Test-WindowsSftpDigest $Fields.'revoke-intent-sha256')) { return $null }
+    } elseif ($Fields.'transport-ready' -cne "false" -or
+        $Fields.'controller-signature-ready' -cne "false" -or
+        $Fields.'readiness-authority' -cne "controller-signed-receipt-plus-local-observation") {
+        return $null
+    }
+    return $Fields
+}
+
+function Test-WindowsSftpDetachedCms(
+    [byte[]]$Content,
+    [byte[]]$Signature,
+    [string]$ExpectedThumbprint,
+    [int64]$IssuedAt,
+    [int64]$ExpiresAt
+) {
+    try {
+        Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction SilentlyContinue
+        $Cms = [Security.Cryptography.Pkcs.SignedCms]::new(
+            [Security.Cryptography.Pkcs.ContentInfo]::new($Content), $true)
+        $Cms.Decode($Signature)
+        $Cms.CheckSignature($true)
+        if ($Cms.SignerInfos.Count -ne 1 -or $null -eq $Cms.SignerInfos[0].Certificate) { return $false }
+        $Certificate = $Cms.SignerInfos[0].Certificate
+        $Issued = [DateTimeOffset]::FromUnixTimeSeconds($IssuedAt).UtcDateTime
+        $Expires = [DateTimeOffset]::FromUnixTimeSeconds($ExpiresAt).UtcDateTime
+        return $Certificate.Thumbprint.ToUpperInvariant() -ceq $ExpectedThumbprint -and
+            $Certificate.NotBefore.ToUniversalTime() -le $Issued -and
+            $Certificate.NotAfter.ToUniversalTime() -ge $Expires
+    } catch { return $false }
+}
+
+function Test-WindowsSftpCandidateReadinessBinding(
+    [object]$Candidate,
+    [object]$Readiness,
+    [string]$CandidateSha256
+) {
+    return $null -ne $Candidate -and $null -ne $Readiness -and
+        $Readiness.state -ceq "ready" -and $Readiness.'transport-ready' -ceq "true" -and
+        $Readiness.'controller-signature-ready' -ceq "true" -and
+        $Readiness.'candidate-sha256' -ceq $CandidateSha256 -and
+        $Readiness.host -ceq $Candidate.host -and
+        $Readiness.'request-sid' -ceq $Candidate.'request-sid' -and
+        $Readiness.'intent-sha256' -ceq $Candidate.'intent-sha256' -and
+        $Readiness.'host-key-fingerprint' -ceq $Candidate.'host-key-fingerprint'
+}
+
+function Test-WindowsExactProjectionPath(
+    [string]$Path,
+    [string]$ExpectedSddl,
+    [bool]$Directory
+) {
+    try {
+        if ($env:OS -ne "Windows_NT") { return $false }
+        $Item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ([bool]$Item.PSIsContainer -ne $Directory -or
+            ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        $Expected = [Security.AccessControl.RawSecurityDescriptor]::new($ExpectedSddl)
+        $ObservedSddl = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetSecurityDescriptorSddlForm(
+            [Security.AccessControl.AccessControlSections]::All)
+        $Observed = [Security.AccessControl.RawSecurityDescriptor]::new($ObservedSddl)
+        [byte[]]$ExpectedBytes = [byte[]]::new($Expected.BinaryLength)
+        [byte[]]$ObservedBytes = [byte[]]::new($Observed.BinaryLength)
+        $Expected.GetBinaryForm($ExpectedBytes, 0); $Observed.GetBinaryForm($ObservedBytes, 0)
+        return [Convert]::ToBase64String($ExpectedBytes) -ceq [Convert]::ToBase64String($ObservedBytes)
+    } catch { return $false }
+}
+
+function Read-WindowsSftpProtectedReadiness([string]$ProgramDataRoot) {
+    try {
+        if ($env:OS -ne "Windows_NT") { return $null }
+        $CanonicalProgramData = [IO.Path]::GetFullPath([Environment]::GetFolderPath("CommonApplicationData"))
+        if (-not [IO.Path]::GetFullPath($ProgramDataRoot).Equals(
+                $CanonicalProgramData, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $PublicRoot = Join-Path $CanonicalProgramData "MachineUtilities-Sftp-Public"
+        $ReadinessPath = Join-Path $PublicRoot "readiness"
+        $DirectorySddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+        $FileSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;BU)"
+        if (-not (Test-WindowsExactProjectionPath $PublicRoot $DirectorySddl $true) -or
+            -not (Test-WindowsExactProjectionPath $ReadinessPath $FileSddl $false)) { return $null }
+        [byte[]]$ReadinessBytes = [IO.File]::ReadAllBytes($ReadinessPath)
+        return Read-WindowsSftpReadinessLines (ConvertFrom-WindowsSftpCanonicalBytes $ReadinessBytes 16384)
+    } catch { return $null }
+}
+
+function Get-WindowsSftpContractDigests([string]$RequestSid) {
+    $SlotDirectory = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a0;;;$RequestSid)"
+    $SlotFile = "O:${RequestSid}G:BAD:P(D;;0x000c0000;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x00100002;;;$RequestSid)"
+    $ResultsDirectory = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a0;;;$RequestSid)"
+    $ResultFile = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;$RequestSid)"
+    $Chroot = @("windows-sftp-chroot-contract|1", "chroot|C:\ProgramData\MachineUtilities\chroot",
+        "request|/ingress/slot/request", "signature|/ingress/slot/request.sig", "payload|/ingress/slot/payload",
+        "commit|/ingress/slot/commit", "results|/results/<request-id>.result", "projection|direct-non-reparse",
+        "end-chroot|")
+    $Slot = @("windows-sftp-slot-acl-contract|1", "slot-directory-sddl|$SlotDirectory",
+        "slot-file-sddl|$SlotFile", "file-count|4", "create|denied", "delete|denied", "rename|denied",
+        "list|denied", "owner-rights-write-data-only|true", "end-slot-acl|")
+    $Results = @("windows-sftp-results-acl-contract|1", "results-directory-sddl|$ResultsDirectory",
+        "result-file-sddl|$ResultFile", "create|denied", "write|denied", "delete|denied", "rename|denied",
+        "list|denied", "end-results-acl|")
+    $Quota = @("windows-sftp-quota-contract|1", "request-sid|$RequestSid", "limit-bytes|68157440",
+        "warning-bytes|67108864", "tracking|enabled", "enforcement|enabled", "volume|C:\ProgramData", "end-quota|")
+    $OpenSsh = @("windows-sftp-openssh-contract|1", "request-account|MachineUtilitiesRequest",
+        "endpoint-principal|machine-utilities-windows", "chroot|C:\ProgramData\MachineUtilities\chroot",
+        "force-command|internal-sftp", "authentication|publickey-ca-certificate", "password|disabled",
+        "keyboard-interactive|disabled", "pty|disabled", "x11|disabled", "tcp-forwarding|disabled",
+        "stream-local-forwarding|disabled", "agent-forwarding|disabled", "tunnel|disabled", "user-rc|disabled",
+        "user-environment|disabled", "permit-open|none", "permit-listen|none",
+        "authorized-principals-command|absent", "end-openssh|")
+    return [pscustomobject]@{
+        Chroot = Get-TextSha256 (($Chroot -join "`n") + "`n")
+        Slot = Get-TextSha256 (($Slot -join "`n") + "`n")
+        Results = Get-TextSha256 (($Results -join "`n") + "`n")
+        Quota = Get-TextSha256 (($Quota -join "`n") + "`n")
+        OpenSsh = Get-TextSha256 (($OpenSsh -join "`n") + "`n")
+    }
+}
+
+function Get-WindowsSftpFirewallContractDigest([string]$ManagementCidrs) {
+    $Lines = @("windows-sftp-firewall-contract|1", "name|Machine Utilities Windows SFTP v1",
+        "group|Machine Utilities", "direction|inbound", "action|allow", "protocol|tcp", "local-port|22",
+        "service|sshd", "remote-addresses|$ManagementCidrs", "profiles|any",
+        "activation-order|account-then-firewall-last", "end-firewall|")
+    return Get-TextSha256 (($Lines -join "`n") + "`n")
+}
+
+function Test-WindowsSftpManagedFirewall([string]$ExpectedCidrs) {
+    try {
+        $Rules = @(NetSecurity\Get-NetFirewallRule -Name "MachineUtilities-Windows-Sftp-v1" -ErrorAction Stop)
+        if ($Rules.Count -ne 1) { return $false }
+        $Rule = $Rules[0]
+        $Port = @(NetSecurity\Get-NetFirewallPortFilter -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
+        $Address = @(NetSecurity\Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
+        $Service = @(NetSecurity\Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
+        if ($Port.Count -ne 1 -or $Address.Count -ne 1 -or $Service.Count -ne 1 -or
+            [string]$Rule.DisplayName -cne "Machine Utilities Windows SFTP v1" -or
+            [string]$Rule.Group -cne "Machine Utilities" -or [string]$Rule.Direction -cne "Inbound" -or
+            [string]$Rule.Action -cne "Allow" -or [string]$Rule.Enabled -cne "True" -or
+            [string]$Rule.Profile -cne "Any" -or [string]$Rule.EdgeTraversalPolicy -cne "Block" -or
+            [string]$Port[0].Protocol -notin @("TCP", "6") -or [string]$Port[0].LocalPort -cne "22" -or
+            [string]$Port[0].RemotePort -cne "Any" -or [string]$Address[0].LocalAddress -cne "Any" -or
+            [string]$Service[0].Service -cne "sshd") { return $false }
+        $Remote = [string[]]@($Address[0].RemoteAddress | ForEach-Object { [string]$_ })
+        [Array]::Sort($Remote, [StringComparer]::Ordinal)
+        return ($Remote -join ',') -ceq $ExpectedCidrs
+    } catch { return $false }
+}
+
+function Get-WindowsSftpProtectedObservation(
+    [string]$ProgramDataRoot,
+    [object]$ConfiguredMachine,
+    [object]$Route,
+    [object]$U3Readiness,
+    [object]$SftpReadiness
+) {
+    try {
+        if ($env:OS -ne "Windows_NT" -or $null -eq $Route -or $null -eq $U3Readiness -or
+            $null -eq $SftpReadiness -or $SftpReadiness.state -cne "ready") { return $null }
+        $CanonicalProgramData = [IO.Path]::GetFullPath([Environment]::GetFolderPath("CommonApplicationData"))
+        if (-not [IO.Path]::GetFullPath($ProgramDataRoot).Equals(
+                $CanonicalProgramData, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $PublicRoot = Join-Path $CanonicalProgramData "MachineUtilities-Sftp-Public"
+        $DirectorySddl = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+        $FileSddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x120089;;;BU)"
+        $CandidatePath = Join-Path $PublicRoot "candidate.receipt"
+        $SignaturePath = Join-Path $PublicRoot "candidate.receipt.p7s"
+        if (-not (Test-WindowsExactProjectionPath $PublicRoot $DirectorySddl $true) -or
+            -not (Test-WindowsExactProjectionPath $CandidatePath $FileSddl $false) -or
+            -not (Test-WindowsExactProjectionPath $SignaturePath $FileSddl $false)) { return $null }
+        [byte[]]$CandidateBytes = [IO.File]::ReadAllBytes($CandidatePath)
+        [byte[]]$SignatureBytes = [IO.File]::ReadAllBytes($SignaturePath)
+        if ($CandidateBytes.Count -lt 1 -or $CandidateBytes.Count -gt 65536 -or
+            $SignatureBytes.Count -lt 1 -or $SignatureBytes.Count -gt 65536) { return $null }
+        $Candidate = Read-WindowsSftpCandidateLines (
+            ConvertFrom-WindowsSftpCanonicalBytes $CandidateBytes 65536)
+        $CandidateSha256 = Get-WindowsSftpBytesSha256 $CandidateBytes
+        if (-not (Test-WindowsSftpCandidateReadinessBinding $Candidate $SftpReadiness $CandidateSha256)) {
+            return $null
+        }
+        [int64]$IssuedAt = $Candidate.'issued-at'; [int64]$ExpiresAt = $Candidate.'expires-at'
+        # The signed candidate authorizes the completed enrollment ceremony;
+        # after protected promotion it is historical evidence, not a renewable
+        # readiness lease.  The elevated verifier remains the only mutation
+        # path, while read-only local observation continues to require the
+        # exact candidate bytes, signer, and certificate coverage of the
+        # original issued/expires interval.
+        if (-not (Test-WindowsSftpDetachedCms $CandidateBytes $SignatureBytes `
+                $Candidate.'controller-signing-thumbprint' $IssuedAt $ExpiresAt)) { return $null }
+
+        $ExpectedHost = ([string]$ConfiguredMachine.expected_hostname).ToUpperInvariant()
+        $CurrentHost = ([Environment]::MachineName).ToUpperInvariant()
+        $ExpectedCidrs = [string[]]@($Route.management_networks | ForEach-Object { [string]$_ })
+        [Array]::Sort($ExpectedCidrs, [StringComparer]::Ordinal)
+        $ExpectedCidrsText = $ExpectedCidrs -join ','
+        if ($Candidate.host -cne $ExpectedHost -or $Candidate.host -cne $CurrentHost -or
+            [string]$Route.mode -cne "windows-sftp" -or [int64]$Route.port -ne 22 -or
+            [string]$Route.request_user -cne $Candidate.'request-account' -or
+            $Candidate.'endpoint-principal' -cne "machine-utilities-windows" -or
+            [string]$Route.pinned_host_key_fingerprint -cne $Candidate.'host-key-fingerprint' -or
+            $Candidate.'management-cidrs' -cne $ExpectedCidrsText) { return $null }
+
+        $Contracts = Get-WindowsSftpContractDigests $Candidate.'request-sid'
+        if ($Candidate.'chroot-contract-sha256' -cne $Contracts.Chroot -or
+            $Candidate.'slot-acl-sha256' -cne $Contracts.Slot -or
+            $Candidate.'results-acl-sha256' -cne $Contracts.Results -or
+            $Candidate.'quota-contract-sha256' -cne $Contracts.Quota -or
+            $Candidate.'openssh-contract-sha256' -cne $Contracts.OpenSsh -or
+            $Candidate.'firewall-contract-sha256' -cne
+                (Get-WindowsSftpFirewallContractDigest $Candidate.'management-cidrs')) { return $null }
+
+        # U6 readiness is a protected local projection emitted only after its
+        # elevated verifier matched the candidate's task/chroot/ACL/quota and
+        # native-canary inputs. Public v1 does not expose those protected bytes,
+        # so this collector rechecks the public U3 bindings and fixed contracts
+        # but deliberately does not claim portable independent canary proof.
+        if ($U3Readiness.lifecycle -cnotin @("needs_transport_enrollment", "ready") -or
+            $U3Readiness.'request-sid' -cne $Candidate.'request-sid' -or
+            $U3Readiness.'request-principal' -cne $Candidate.'request-account' -or
+            $U3Readiness.generation -cne $Candidate.'u3-epoch' -or
+            $U3Readiness.'generation-sha256' -cne $Candidate.'u3-generation-sha256' -or
+            $U3Readiness.'broker-sha256' -cne $Candidate.'u3-broker-sha256' -or
+            $U3Readiness.'system-task-ready' -cne "true" -or
+            $U3Readiness.'profile-task-ready' -cne "true" -or
+            $U3Readiness.'native-canary-ready' -cne "true") { return $null }
+
+        $SshdConfig = Join-Path $CanonicalProgramData "ssh/sshd_config"
+        if (-not (Test-WindowsProtectedFile $SshdConfig) -or
+            (Get-FileHash -LiteralPath $SshdConfig -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+                $Candidate.'configuration-sha256' -or
+            -not (Test-WindowsSftpManagedFirewall $Candidate.'management-cidrs')) { return $null }
+        $Account = Microsoft.PowerShell.LocalAccounts\Get-LocalUser -Name "MachineUtilitiesRequest" -ErrorAction Stop
+        if (-not [bool]$Account.Enabled -or [string]$Account.Sid.Value -cne $Candidate.'request-sid') { return $null }
+        return [pscustomobject]@{
+            Authority = "protected-local-observation"
+            Candidate = $Candidate
+            CandidateSha256 = $CandidateSha256
+            IssuedAt = $IssuedAt
+            ExpiresAt = $ExpiresAt
+        }
+    } catch { return $null }
+}
+
+function Read-WindowsBrokerReadiness([string]$Path) {
+    if (-not (Test-WindowsPublicProjectionFile $Path)) { return $null }
+    $Lines = Get-CanonicalAsciiLines $Path 8192
+    $Names = @("lifecycle", "broker-version", "broker-protocol", "broker-sha256", "generation", "generation-sha256",
+        "policy-sha256", "constraints-sha256", "winget-context-sha256", "context-canary-sha256",
+        "clock-skew-bound-seconds",
+        "request-account-state", "request-sid",
+        "request-principal", "system-task-ready", "profile-task-ready", "transport-ready", "native-canary-ready")
+    if ($null -eq $Lines -or $Lines.Count -ne $Names.Count + 2 -or
+        $Lines[0] -cne "windows-broker-readiness|1" -or $Lines[-1] -cne "end-readiness|") { return $null }
+    $Fields = [ordered]@{}
+    for ($Index = 0; $Index -lt $Names.Count; $Index++) {
+        $Parts = $Lines[$Index + 1].Split('|')
+        if ($Parts.Count -ne 2 -or $Parts[0] -cne $Names[$Index] -or $Fields.Contains($Parts[0])) { return $null }
+        $Fields[$Parts[0]] = $Parts[1]
+    }
+    if ($Fields.lifecycle -cnotin @("needs_human_enrollment", "needs_native_canary", "needs_transport_enrollment",
+            "recovery_required", "drifted", "revoked", "ready") -or
+        $Fields.'broker-version' -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+        $Fields.'broker-protocol' -cne "1" -or
+        @($Fields.'broker-sha256', $Fields.'generation-sha256', $Fields.'policy-sha256',
+            $Fields.'constraints-sha256', $Fields.'winget-context-sha256',
+            $Fields.'context-canary-sha256' | Where-Object {
+                $_ -cne "-" -and $_ -cnotmatch '^[0-9a-f]{64}$'
+            }).Count -ne 0 -or
+        ($Fields.generation -cne "-" -and $Fields.generation -notmatch '^[1-9][0-9]{0,9}$') -or
+        $Fields.'clock-skew-bound-seconds' -cne "300" -or
+        $Fields.'request-account-state' -cnotin @("absent", "disabled", "enabled") -or
+        ($Fields.'request-account-state' -ceq "absent" -and
+            ($Fields.'request-sid' -cne "-" -or $Fields.'request-principal' -cne "-")) -or
+        ($Fields.'request-account-state' -cne "absent" -and
+            ($Fields.'request-sid' -notmatch '^S-[0-9]+(?:-[0-9]+){1,14}$' -or
+             $Fields.'request-principal' -cne "MachineUtilitiesRequest")) -or
+        @($Fields.'system-task-ready', $Fields.'profile-task-ready', $Fields.'transport-ready',
+            $Fields.'native-canary-ready' | Where-Object { $_ -cnotin @("true", "false") }).Count -ne 0) { return $null }
+    if ($Fields.lifecycle -cin @("needs_native_canary", "needs_transport_enrollment", "ready") -and
+        ($Fields.generation -ceq "-" -or @($Fields.'broker-sha256', $Fields.'generation-sha256',
+            $Fields.'policy-sha256', $Fields.'constraints-sha256', $Fields.'winget-context-sha256' |
+            Where-Object { $_ -ceq "-" }).Count -ne 0)) { return $null }
+    if (($Fields.lifecycle -ceq "needs_native_canary" -and $Fields.'context-canary-sha256' -cne "-") -or
+        ($Fields.lifecycle -cin @("needs_transport_enrollment", "ready") -and
+            $Fields.'context-canary-sha256' -ceq "-")) { return $null }
+    if (($Fields.lifecycle -cne "ready" -and $Fields.'request-account-state' -ceq "enabled") -or
+        ($Fields.lifecycle -ceq "needs_transport_enrollment" -and
+            ($Fields.'request-account-state' -cne "disabled" -or
+             $Fields.'system-task-ready' -cne "true" -or $Fields.'profile-task-ready' -cne "true" -or
+             $Fields.'native-canary-ready' -cne "true" -or $Fields.'transport-ready' -cne "false")) -or
+        ($Fields.lifecycle -ceq "ready" -and
+            ($Fields.'request-account-state' -cne "enabled" -or
+             $Fields.'system-task-ready' -cne "true" -or $Fields.'profile-task-ready' -cne "true" -or
+             $Fields.'native-canary-ready' -cne "true" -or $Fields.'transport-ready' -cne "true"))) { return $null }
+    return [pscustomobject]$Fields
+}
+
+function Read-WindowsBrokerPublicResult([string]$Path) {
+    if (-not (Test-WindowsPublicProjectionFile $Path)) { return $null }
+    $Lines = Get-CanonicalAsciiLines $Path 4096
+    $Names = @("state", "reason", "request-id", "plan-id", "action-id", "enrollment-epoch",
+        "protected-result-sha256")
+    if ($null -eq $Lines -or $Lines.Count -ne $Names.Count + 2 -or
+        $Lines[0] -cne "windows-broker-public|1" -or $Lines[-1] -cne "end-public|") { return $null }
+    $Fields = [ordered]@{}
+    for ($Index = 0; $Index -lt $Names.Count; $Index++) {
+        $Parts = $Lines[$Index + 1].Split('|')
+        if ($Parts.Count -ne 2 -or $Parts[0] -cne $Names[$Index]) { return $null }
+        $Fields[$Parts[0]] = $Parts[1]
+    }
+    if ($Fields.state -cnotmatch '^[a-z][a-z0-9_-]{0,31}$' -or
+        $Fields.reason -cnotmatch '^[a-z][a-z0-9_]{0,127}$' -or
+        $Fields.'request-id' -cnotmatch '^request-[0-9a-f]{32}$' -or
+        $Fields.'plan-id' -cnotmatch '^plan-[0-9a-f]{16}$' -or
+        $Fields.'action-id' -cnotin @("profile.apply-managed-bundle.v1", "profile.inventory-managed-state.v1",
+            "winget.install-machine-package.v1", "winget.inventory-machine.v1", "winget.upgrade-machine-package.v1") -or
+        $Fields.'enrollment-epoch' -notmatch '^[1-9][0-9]{0,9}$' -or
+        ($Fields.state -cin @("completed", "partial", "rejected", "stale") -and
+            $Fields.'protected-result-sha256' -cnotmatch '^[0-9a-f]{64}$') -or
+        ($Fields.state -cnotin @("completed", "partial", "rejected", "stale") -and
+            $Fields.'protected-result-sha256' -cne "-")) { return $null }
+    return [pscustomobject]$Fields
 }
 
 function Test-WindowsIdentityFileAcl([string]$Path, [bool]$OwnerOnly) {
@@ -269,6 +795,22 @@ function Test-WindowsIdentityFileAcl([string]$Path, [bool]$OwnerOnly) {
     } catch { return $false }
 }
 
+function Test-WindowsControllerEnrollmentReceipt([object]$Receipt) {
+    if ($null -eq $Receipt) { return $false }
+    $Expected = @("broker_digest", "context_canary_digest", "enrollment_epoch", "policy_digest",
+        "winget_context_digest")
+    if ((@($Receipt.PSObject.Properties.Name | Sort-Object) -join "`n") -cne
+        (@($Expected | Sort-Object) -join "`n")) { return $false }
+    if ($Receipt.enrollment_epoch -is [string]) { return $false }
+    [long]$Epoch = 0
+    return [long]::TryParse([string]$Receipt.enrollment_epoch,
+        [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$Epoch) -and
+        $Epoch -ge 1 -and $Epoch -le [int]::MaxValue -and
+        @([string]$Receipt.broker_digest, [string]$Receipt.context_canary_digest,
+            [string]$Receipt.policy_digest, [string]$Receipt.winget_context_digest |
+            Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }).Count -eq 0
+}
+
 function Test-NodeIdentity([object]$Identity, [string]$IdentityPath, [object]$Route) {
     try {
         $ExpectedFields = @("ca_generation", "certificate_path", "certificate_principals", "certificate_serial",
@@ -278,6 +820,11 @@ function Test-NodeIdentity([object]$Identity, [string]$IdentityPath, [object]$Ro
         if ((@($Identity.PSObject.Properties.Name | Sort-Object) -join "`n") -cne
             (@($ExpectedFields | Sort-Object) -join "`n") -or
             $Identity.schema -cne "machine-utilities.node-identity" -or $Identity.schema_version -ne 1) { return $false }
+        if ($null -eq $Identity.enrollment_receipts) { return $false }
+        foreach ($ReceiptProperty in @($Identity.enrollment_receipts.PSObject.Properties)) {
+            if ($ReceiptProperty.Name -notmatch '^[A-Za-z0-9._-]+$' -or
+                -not (Test-WindowsControllerEnrollmentReceipt $ReceiptProperty.Value)) { return $false }
+        }
         $Paths = @($IdentityPath, [string]$Identity.private_key_path, [string]$Identity.certificate_path,
             [string]$Identity.known_hosts_path)
         $RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../.."))
@@ -424,7 +971,8 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
         Join-Path $HOME ".config/machine-utilities/identity.json"
     }
     $NodeIdentityReady = $false
-    $ReceiptReady = $false
+    $ReceiptPresent = $false
+    $IdentityReceiptValid = $false
     $Identity = $null
     $Receipt = $null
     if (Test-Path -LiteralPath $IdentityPath -PathType Leaf) {
@@ -432,10 +980,15 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
             $Identity = Get-Content -LiteralPath $IdentityPath -Raw | ConvertFrom-Json
             if (Test-NodeIdentity $Identity $IdentityPath $Route) {
                 $NodeIdentityReady = $true
-                $ReceiptProperty = $Identity.enrollment_receipts.PSObject.Properties[$HostId]
-                if ($null -ne $ReceiptProperty) {
-                    $Receipt = $ReceiptProperty.Value
-                    $ReceiptReady = $true
+                $ReceiptProperties = @($Identity.enrollment_receipts.PSObject.Properties |
+                    Where-Object { $_.Name -ceq $HostId })
+                if ($ReceiptProperties.Count -gt 1) { throw "ambiguous controller enrollment receipt" }
+                if ($ReceiptProperties.Count -eq 1) {
+                    $ReceiptPresent = $true
+                    $Receipt = $ReceiptProperties[0].Value
+                    # This user-owned overlay is only an expectation. It never authorizes
+                    # transport or substitutes for the protected local U6 projection.
+                    $IdentityReceiptValid = Test-WindowsControllerEnrollmentReceipt $Receipt
                 }
             }
         } catch { $Identity = $null }
@@ -454,43 +1007,75 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
             certificate_source_addresses = @($Identity.certificate_source_addresses)
         }
     }
-    $TransportReady = $NodeIdentityReady -and $null -ne $Route
-
     $ProgramDataRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramData)) {
         Join-Path $HOME ".machine-utilities-programdata"
     } else { $env:ProgramData }
-    $ProtectedRoot = Join-Path $ProgramDataRoot "MachineUtilities/active"
-    $BrokerPath = Join-Path $ProtectedRoot "broker.ps1"
-    $BrokerVersionPath = Join-Path $ProtectedRoot "broker.version"
-    $PolicyPath = Join-Path $ProtectedRoot "policy.actions"
-    $ConstraintsPath = Join-Path $ProtectedRoot "policy.constraints"
-    $ContextPath = Join-Path $ProtectedRoot "context.canary"
+    $PublicRoot = Join-Path $ProgramDataRoot "MachineUtilities-Public"
+    $ReadinessPath = Join-Path $PublicRoot "readiness"
+    $PolicyPath = Join-Path $PublicRoot "policy.actions"
+    $ConstraintsPath = Join-Path $PublicRoot "policy.constraints"
+    $SftpPublicRoot = Join-Path $ProgramDataRoot "MachineUtilities-Sftp-Public"
+    $SftpReadinessPath = Join-Path $SftpPublicRoot "readiness"
+    $Readiness = Read-WindowsBrokerReadiness $ReadinessPath
+    $ReadinessPresent = Test-Path -LiteralPath $ReadinessPath -PathType Leaf
+    $SftpReadiness = Read-WindowsSftpProtectedReadiness $ProgramDataRoot
+    $SftpReadinessPresent = Test-Path -LiteralPath $SftpReadinessPath -PathType Leaf
     $ProtectedArtifactsReady = $false
     $AdapterMechanismReady = $false
     $AdapterVerifierStatus = "not-installed"
     $BrokerVersion = $null
+    $BrokerProtocol = $null
     $BrokerDigest = $null
     $PolicyDigest = $null
     $ConstraintsDigest = $null
+    $WinGetContextDigest = $null
     $ConstraintGeneration = $null
     $ContextDigest = $null
+    $ClockSkewBoundSeconds = 300
     $ObservedContexts = @()
-    if ((Test-WindowsProtectedFile $BrokerPath) -and (Test-WindowsProtectedFile $BrokerVersionPath) -and
-        (Test-WindowsProtectedFile $PolicyPath) -and (Test-WindowsProtectedFile $ConstraintsPath) -and
-        (Test-WindowsProtectedFile $ContextPath)) {
+    $RequestAccountState = "absent"
+    $RequestSid = $null
+    $ProtectedRequestPrincipal = $null
+    $NativeCanaryReady = $false
+    $SystemTaskReady = $false
+    $ProfileTaskReady = $false
+    if ($null -ne $Readiness) {
+        $BrokerVersion = [string]$Readiness.'broker-version'
+        $BrokerProtocol = [int]$Readiness.'broker-protocol'
+        $BrokerDigest = if ($Readiness.'broker-sha256' -ceq "-") { $null } else { [string]$Readiness.'broker-sha256' }
+        $PolicyDigest = if ($Readiness.'policy-sha256' -ceq "-") { $null } else { [string]$Readiness.'policy-sha256' }
+        $ConstraintsDigest = if ($Readiness.'constraints-sha256' -ceq "-") { $null } else { [string]$Readiness.'constraints-sha256' }
+        $WinGetContextDigest = if ($Readiness.'winget-context-sha256' -ceq "-") {
+            $null
+        } else { [string]$Readiness.'winget-context-sha256' }
+        $ContextDigest = if ($Readiness.'context-canary-sha256' -ceq "-") { $null } else { [string]$Readiness.'context-canary-sha256' }
+        $ClockSkewBoundSeconds = [int]$Readiness.'clock-skew-bound-seconds'
+        $ConstraintGeneration = if ($Readiness.generation -ceq "-") { $null } else { [int64]$Readiness.generation }
+        $RequestAccountState = [string]$Readiness.'request-account-state'
+        $RequestSid = if ($Readiness.'request-sid' -ceq "-") { $null } else { [string]$Readiness.'request-sid' }
+        $ProtectedRequestPrincipal = if ($Readiness.'request-principal' -ceq "-") {
+            $null
+        } else { [string]$Readiness.'request-principal' }
+        $SystemTaskReady = $Readiness.'system-task-ready' -ceq "true"
+        $ProfileTaskReady = $Readiness.'profile-task-ready' -ceq "true"
+        $NativeCanaryReady = $Readiness.'native-canary-ready' -ceq "true"
+        $AdapterMechanismReady = $SystemTaskReady -and $ProfileTaskReady
+        $AdapterVerifierStatus = "public-projection-validated"
+    }
+    if ($null -ne $Readiness -and $null -ne $PolicyDigest -and $null -ne $ConstraintsDigest -and
+        (Test-WindowsPublicProjectionFile $PolicyPath) -and
+        (Test-WindowsPublicProjectionFile $ConstraintsPath)) {
         $PolicyLines = Get-CanonicalAsciiLines $PolicyPath 4096
         $ConstraintLines = Get-CanonicalAsciiLines $ConstraintsPath 32768
-        $BrokerVersion = [string](Get-Content -LiteralPath $BrokerVersionPath -TotalCount 1)
-        $ConstraintsDigest = (Get-FileHash -LiteralPath $ConstraintsPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        $Constraints = if ($null -ne $PolicyLines -and (Test-PrivilegePolicy $PolicyLines)) {
+        $ObservedPolicyDigest = (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $ObservedConstraintsDigest = (Get-FileHash -LiteralPath $ConstraintsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Constraints = if ($ObservedPolicyDigest -ceq $PolicyDigest -and
+            $ObservedConstraintsDigest -ceq $ConstraintsDigest -and
+            $null -ne $PolicyLines -and (Test-PrivilegePolicy $PolicyLines)) {
             Test-PrivilegeConstraints $PolicyLines $ConstraintLines $ConstraintsDigest
         } else { $null }
-        if ($null -ne $Constraints -and $BrokerVersion -match '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        if ($null -ne $Constraints -and [int64]$Constraints.Generation -eq [int64]$ConstraintGeneration) {
             $ProtectedArtifactsReady = $true
-            $ConstraintGeneration = [int64]$Constraints.Generation
-            $BrokerDigest = (Get-FileHash -LiteralPath $BrokerPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            $PolicyDigest = (Get-FileHash -LiteralPath $PolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            $ContextDigest = (Get-FileHash -LiteralPath $ContextPath -Algorithm SHA256).Hash.ToLowerInvariant()
             $ObservedContexts = @($PolicyLines | Select-Object -Skip 1 | ForEach-Object {
                 $Fields = $_.Split('|')
                 if ($Fields[3] -eq "enabled") {
@@ -502,29 +1087,77 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
                         manager_source_identity = $(if ($Fields[4] -eq "none") { "not-applicable" } else { $Fields[5] })
                         constraint_generation = [int64]$Constraints.Generation
                         policy_tokens = @($Constraints.Tokens[$Fields[1]])
+                        profile_constraints = $(if ($Fields[1].StartsWith("profile.", [StringComparison]::Ordinal)) {
+                            @($Constraints.Profiles)
+                        } else { @() })
                     }
                 }
             })
         }
     }
 
-    $BrokerReady = $false
-    $ActionContextReady = $false
-    $Lifecycle = "needs_enrollment"
-    if ($ReceiptReady -and $ProtectedArtifactsReady) {
-        if ([string]$Receipt.broker_digest -ceq $BrokerDigest -and [string]$Receipt.policy_digest -ceq $PolicyDigest -and
-            [int64]$Receipt.enrollment_epoch -eq [int64]$ConstraintGeneration) {
-            if ([string]$Receipt.context_canary_digest -ceq $ContextDigest) {
-                $Lifecycle = "needs_enrollment"
-            } else { $Lifecycle = "drifted" }
-        } else { $Lifecycle = "drifted" }
-    } elseif ($ReceiptReady -or $ProtectedArtifactsReady) {
+    $TransportObservation = Get-WindowsSftpProtectedObservation $ProgramDataRoot $ConfiguredMachine $Route `
+        $Readiness $SftpReadiness
+    $TransportObservationReady = $null -ne $TransportObservation
+    if ($TransportObservationReady) {
+        $AdapterVerifierStatus = "protected-local-observation"
+        $RequestAccountState = "enabled"
+        $RequestSid = [string]$TransportObservation.Candidate.'request-sid'
+        $ProtectedRequestPrincipal = [string]$TransportObservation.Candidate.'request-account'
+        if ($NodeIdentityReady) {
+            $IdentityCaMatches = ([string]$Identity.fleet_ca_fingerprint -ceq
+                    [string]$TransportObservation.Candidate.'primary-ca-fingerprint' -and
+                [int64]$Identity.ca_generation -eq [int64]$TransportObservation.Candidate.'primary-ca-generation') -or
+                ([string]$TransportObservation.Candidate.'previous-ca-fingerprint' -cne "-" -and
+                 [string]$Identity.fleet_ca_fingerprint -ceq
+                    [string]$TransportObservation.Candidate.'previous-ca-fingerprint' -and
+                 [int64]$Identity.ca_generation -eq [int64]$TransportObservation.Candidate.'previous-ca-generation')
+            if (-not $IdentityCaMatches) { $NodeIdentityReady = $false }
+        }
+    } elseif ($SftpReadinessPresent) {
+        $AdapterVerifierStatus = "protected-local-observation-invalid"
+    }
+    $ControllerReceiptMatches = $TransportObservationReady -and $ProtectedArtifactsReady -and
+        [int64]$TransportObservation.Candidate.'u3-epoch' -eq [int64]$ConstraintGeneration
+    $IdentityReceiptExpectationMatches = $IdentityReceiptValid -and $ProtectedArtifactsReady -and
+        [int64]$Receipt.enrollment_epoch -eq [int64]$ConstraintGeneration -and
+        [string]$Receipt.broker_digest -ceq $BrokerDigest -and
+        [string]$Receipt.policy_digest -ceq $PolicyDigest -and
+        [string]$Receipt.winget_context_digest -ceq $WinGetContextDigest -and
+        [string]$Receipt.context_canary_digest -ceq $ContextDigest
+
+    $BrokerReady = $ProtectedArtifactsReady -and $NativeCanaryReady -and $AdapterMechanismReady
+    $ActionContextReady = $BrokerReady -and $ObservedContexts.Count -gt 0
+    $TransportReady = $ControllerReceiptMatches -and $null -ne $Route -and
+        $RequestAccountState -ceq "enabled" -and
+        -not [string]::IsNullOrWhiteSpace($RequestPrincipal) -and $RequestPrincipal -ceq $ProtectedRequestPrincipal
+    $Lifecycle = if ($null -eq $Readiness) {
+        if ($ReadinessPresent) { "drifted" } else { "needs_enrollment" }
+    } elseif ($Readiness.lifecycle -ceq "needs_human_enrollment") { "needs_enrollment" }
+    elseif ($Readiness.lifecycle -ceq "revoked") { "needs_enrollment" }
+    elseif ($Readiness.lifecycle -ceq "recovery_required") { "recovery_required" }
+    elseif ($Readiness.lifecycle -cin @("needs_transport_enrollment", "ready")) {
+        if ($null -eq $SftpReadiness) {
+            if ($SftpReadinessPresent) { "drifted" } else { "needs_transport_enrollment" }
+        } elseif ($SftpReadiness.state -ceq "ready") {
+            if ($TransportObservationReady) { "ready" } else { "drifted" }
+        } elseif ($SftpReadiness.state -ceq "awaiting-controller-signature") { "needs_transport_enrollment" }
+        elseif ($SftpReadiness.state -ceq "revoked") { "needs_enrollment" }
+        else { [string]$SftpReadiness.state }
+    }
+    else { [string]$Readiness.lifecycle }
+    if ($null -ne $Readiness -and $Lifecycle -notin @("needs_enrollment", "revoked") -and
+        -not $ProtectedArtifactsReady) { $Lifecycle = "drifted" }
+    if ($Lifecycle -ceq "ready" -and (-not $BrokerReady -or -not $TransportReady -or -not $ActionContextReady)) {
         $Lifecycle = "drifted"
     }
+    $ActiveRequest = Read-WindowsBrokerPublicResult (Join-Path $PublicRoot "active")
+    $LastTerminalResult = Read-WindowsBrokerPublicResult (Join-Path $PublicRoot "last")
     $ProposalStatus = if ($null -eq $PolicyDigest) { "unobserved" } elseif ($ProposalDigest -ceq $PolicyDigest) {
         "matches-observed"
     } else { "pending-human-enrollment" }
-    $RecordStatus = if ($Lifecycle -eq "ready") { "present" } elseif ($Lifecycle -eq "drifted") { "partial" } else { "unavailable" }
+    $RecordStatus = if ($Lifecycle -eq "ready") { "present" } elseif (
+        $Lifecycle -in @("drifted", "draining", "recovery_required")) { "partial" } else { "unavailable" }
     Add-Record -Kind "privilege_broker" -Id "readiness" -Status $RecordStatus -Confidence "high" -Data ([ordered]@{
         contract_version = 1
         platform_adapter = "windows-scheduled-task-v1"
@@ -538,10 +1171,28 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
         protected_artifacts_ready = $ProtectedArtifactsReady
         adapter_mechanism_ready = $AdapterMechanismReady
         adapter_verifier_status = $AdapterVerifierStatus
-        request_principal = $RequestPrincipal
+        profile_runtime_context_evidence = @{
+            authenticated_smb = "unavailable"
+            interpretation = "ADMIN$/SAM denial and generic I/O failure are not isolation proof"
+        }
+        independent_native_canary = @{
+            ready = ($NativeCanaryReady -and $TransportObservationReady)
+            authority = $(if ($TransportObservationReady) { "protected-local-observation" } else { "unavailable" })
+            portable_cryptographic_proof = $false
+            public_u6_native_canary_details = "not-exposed"
+            authenticated_smb_controlled_share = $(if ($NativeCanaryReady -and $TransportObservationReady) {
+                "protected-readiness-observation"
+            } else { "unavailable" })
+            efs_capability_gate = $(if ($NativeCanaryReady -and $TransportObservationReady) {
+                "protected-readiness-observation"
+            } else { "unavailable" })
+        }
+        request_principal = $ProtectedRequestPrincipal
+        request_account_state = $RequestAccountState
+        protected_identity = @{ host_id = $HostId; sid = $RequestSid; request_principal = $ProtectedRequestPrincipal }
         execution_principals = @("LocalSystem", "enrolled-s4u-user")
         session_requirement = "no-console-session"
-        broker_protocol = @{ supported = @(1, 0); observed = $null }
+        broker_protocol = @{ supported = @(1, 0); observed = $BrokerProtocol }
         broker_version = $BrokerVersion
         broker_digest = $(if ($null -eq $BrokerDigest) { $null } else { @{ algorithm = "sha256"; value = $BrokerDigest } })
         policy = @{ catalog_version = 1; version = 1; action_manifest_version = 1 }
@@ -549,6 +1200,9 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
         policy_proposal_status = $ProposalStatus
         observed_policy_digest = $(if ($null -eq $PolicyDigest) { $null } else { @{ algorithm = "sha256"; value = $PolicyDigest } })
         observed_constraints_digest = $(if ($null -eq $ConstraintsDigest) { $null } else { @{ algorithm = "sha256"; value = $ConstraintsDigest } })
+        observed_winget_context_digest = $(if ($null -eq $WinGetContextDigest) { $null } else {
+            @{ algorithm = "sha256"; value = $WinGetContextDigest }
+        })
         constraint_generation = $ConstraintGeneration
         observed_action_contexts = $ObservedContexts
         context_canary_digest = $(if ($null -eq $ContextDigest) { $null } else { @{ algorithm = "sha256"; value = $ContextDigest } })
@@ -566,11 +1220,53 @@ function Add-PrivilegeReadiness([object]$Value, [object]$ConfiguredMachine) {
         }
         originating_node_identity = $OriginatingIdentity
         pinned_host_key_fingerprint = $PinnedHostKey
-        enrollment_epoch = $(if ($ReceiptReady) { [int64]$Receipt.enrollment_epoch } else { $null })
-        active_request = $null
-        last_terminal_result = $null
-        request_ttl = @{ minimum_seconds = 90; maximum_seconds = 3600 }
-    }) -Evidence @(@{ source = "protected-state"; method = "read-only-contract-inventory" })
+        transport_observation = $(if ($TransportObservationReady) { [ordered]@{
+            authority = "protected-local-observation"
+            portable_cryptographic_proof = $false
+            candidate_digest = @{ algorithm = "sha256"; value = $TransportObservation.CandidateSha256 }
+            controller_signing_thumbprint = [string]$TransportObservation.Candidate.'controller-signing-thumbprint'
+            primary_ca_fingerprint = [string]$TransportObservation.Candidate.'primary-ca-fingerprint'
+            primary_ca_generation = [int64]$TransportObservation.Candidate.'primary-ca-generation'
+            previous_ca_fingerprint = $(if ($TransportObservation.Candidate.'previous-ca-fingerprint' -ceq "-") {
+                $null
+            } else { [string]$TransportObservation.Candidate.'previous-ca-fingerprint' })
+            previous_ca_generation = [int64]$TransportObservation.Candidate.'previous-ca-generation'
+            krl_generation = [int64]$TransportObservation.Candidate.'krl-generation'
+            host_key_fingerprint = [string]$TransportObservation.Candidate.'host-key-fingerprint'
+            issued_at = [DateTimeOffset]::FromUnixTimeSeconds($TransportObservation.IssuedAt).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            expires_at = [DateTimeOffset]::FromUnixTimeSeconds($TransportObservation.ExpiresAt).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            native_canary_details = "not-publicly-exposed"
+            projection_binding = "controller-signed-candidate-plus-protected-local-readiness"
+            protected_projection_digests = @{
+                u3_active_pointer = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'u3-active-pointer-sha256' }
+                u3_generation = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'u3-generation-sha256' }
+                u3_system_task = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'u3-task-sha256' }
+                u3_broker = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'u3-broker-sha256' }
+                chroot_contract = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'chroot-contract-sha256' }
+                slot_acl_contract = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'slot-acl-sha256' }
+                results_acl_contract = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'results-acl-sha256' }
+                quota_contract = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'quota-contract-sha256' }
+                openssh_contract = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'openssh-contract-sha256' }
+                sshd_configuration = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'configuration-sha256' }
+                firewall_contract = @{ algorithm = "sha256"; value = $TransportObservation.Candidate.'firewall-contract-sha256' }
+            }
+        } } else { $null })
+        identity_receipt_expectation = @{
+            present = $ReceiptPresent
+            valid_shape = $IdentityReceiptValid
+            matches_observed_u3 = $IdentityReceiptExpectationMatches
+            authority = "user-owned-expectation-only"
+        }
+        enrollment_epoch = $(if ($TransportObservationReady) {
+            [int64]$TransportObservation.Candidate.'u3-epoch'
+        } else { $null })
+        active_request = $ActiveRequest
+        last_terminal_result = $LastTerminalResult
+        request_ttl = @{ poll_interval_seconds = 60; clock_skew_bound_seconds = $ClockSkewBoundSeconds
+            minimum_seconds = (120 + $ClockSkewBoundSeconds); maximum_seconds = 3600 }
+    }) -Evidence @(@{ source = "protected-state"; method = $(if ($TransportObservationReady) {
+        "protected-local-observation"
+    } else { "read-only-contract-inventory" }) })
 }
 
 function Get-NullableBoolean([object]$Value, [object]$Default = $null) {
@@ -882,8 +1578,7 @@ function Assert-WorkerConfig([object]$Value) {
             if (@($RouteFields | Where-Object { $_ -notin @("host", "management_networks", "mode", "pinned_host_key_fingerprint", "port", "request_user") }).Count -gt 0 -or
                 $RouteFields.Count -ne 6 -or [string]$Route.mode -ne "windows-sftp" -or
                 [string]$Route.host -notmatch '^[A-Za-z0-9][A-Za-z0-9.:-]{0,254}$' -or
-                [int64]$Route.port -lt 1 -or [int64]$Route.port -gt 65535 -or
-                [string]$Route.request_user -notmatch '^[A-Za-z0-9._-]{1,128}$' -or
+                [int64]$Route.port -ne 22 -or [string]$Route.request_user -cne "MachineUtilitiesRequest" -or
                 [string]$Route.pinned_host_key_fingerprint -notmatch '^SHA256:[A-Za-z0-9+/]{43}=?$' -or
                 @($Route.management_networks).Count -lt 1 -or @($Route.management_networks).Count -gt 32) {
                 throw "Invalid Windows automation transport"
@@ -1031,6 +1726,172 @@ function Assert-WorkerConfig([object]$Value) {
             }
         }
     }
+}
+
+function Invoke-WindowsSftpReceiptSelfTest {
+    Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction SilentlyContinue
+    $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $IssuedAt = $Now - 60
+    $ExpiresAt = $Now + 600
+    $Key = [Security.Cryptography.RSA]::Create(2048)
+    $Certificate = $null
+    $HistoricalKey = $null
+    $HistoricalCertificate = $null
+    $SecondKey = $null
+    $SecondCertificate = $null
+    try {
+        $Request = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=machine-utilities-controller", $Key, [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $Certificate = $Request.CreateSelfSigned(
+            [DateTimeOffset]::FromUnixTimeSeconds($IssuedAt - 60),
+            [DateTimeOffset]::FromUnixTimeSeconds($ExpiresAt + 60))
+        $Thumbprint = $Certificate.Thumbprint.ToUpperInvariant()
+        $DigestA = "a" * 64; $DigestB = "b" * 64; $Fingerprint = "SHA256:" + ("A" * 43)
+        [string[]]$CandidateLines = @(
+            "windows-sftp-enrollment-candidate|1", "operation|install",
+            "authorization|inert-unsigned-local-observation", "host|WINDOWS-FIXTURE",
+            "request-account|MachineUtilitiesRequest", "request-sid|S-1-5-21-1-2-3-2001",
+            "endpoint-principal|machine-utilities-windows", "primary-ca-fingerprint|$Fingerprint",
+            "primary-ca-generation|1", "previous-ca-fingerprint|-", "previous-ca-generation|0",
+            "krl-generation|1", "management-cidrs|192.0.2.0/24", "host-key-fingerprint|$Fingerprint",
+            "intent-sha256|$DigestA", "controller-signature-sha256|$DigestB",
+            "controller-signing-thumbprint|$Thumbprint", "release-publisher-thumbprint|$Thumbprint",
+            "protected-entrypoint-sha256|$DigestA", "u3-state|verified", "u3-epoch|1",
+            "u3-generation-sha256|$DigestA", "u3-active-pointer-sha256|$DigestB",
+            "u3-task-sha256|$DigestA", "u3-broker-sha256|$DigestB", "chroot-contract-sha256|$DigestA",
+            "slot-acl-sha256|$DigestB", "results-acl-sha256|$DigestA", "quota-contract-sha256|$DigestB",
+            "openssh-contract-sha256|$DigestA", "configuration-sha256|$DigestB",
+            "firewall-contract-sha256|$DigestA", "issued-at|$IssuedAt", "expires-at|$ExpiresAt",
+            "controller-signing|required-separate", "end-candidate|"
+        )
+        $Candidate = Read-WindowsSftpCandidateLines $CandidateLines
+        if ($null -eq $Candidate) { throw "self_test_candidate_rejected" }
+        [string[]]$AccountPrincipalLines = $CandidateLines.Clone()
+        $AccountPrincipalLines[6] = "endpoint-principal|MachineUtilitiesRequest"
+        if ($null -ne (Read-WindowsSftpCandidateLines $AccountPrincipalLines)) {
+            throw "self_test_account_name_endpoint_accepted"
+        }
+        [byte[]]$CandidateBytes = [Text.Encoding]::ASCII.GetBytes(($CandidateLines -join "`n") + "`n")
+        $Cms = [Security.Cryptography.Pkcs.SignedCms]::new(
+            [Security.Cryptography.Pkcs.ContentInfo]::new($CandidateBytes), $true)
+        $Signer = [Security.Cryptography.Pkcs.CmsSigner]::new($Certificate)
+        $Signer.IncludeOption = [Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+        $Cms.ComputeSignature($Signer)
+        [byte[]]$SignatureBytes = $Cms.Encode()
+        if (-not (Test-WindowsSftpDetachedCms $CandidateBytes $SignatureBytes $Thumbprint $IssuedAt $ExpiresAt)) {
+            throw "self_test_signature_rejected"
+        }
+        $HistoricalIssuedAt = $Now - 600
+        $HistoricalExpiresAt = $Now - 300
+        $HistoricalKey = [Security.Cryptography.RSA]::Create(2048)
+        $HistoricalRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=machine-utilities-historical-controller", $HistoricalKey,
+            [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $HistoricalCertificate = $HistoricalRequest.CreateSelfSigned(
+            [DateTimeOffset]::FromUnixTimeSeconds($HistoricalIssuedAt - 60),
+            [DateTimeOffset]::FromUnixTimeSeconds($HistoricalExpiresAt + 60))
+        $HistoricalThumbprint = $HistoricalCertificate.Thumbprint.ToUpperInvariant()
+        [string[]]$HistoricalCandidateLines = $CandidateLines.Clone()
+        for ($Index = 0; $Index -lt $HistoricalCandidateLines.Count; $Index++) {
+            if ($HistoricalCandidateLines[$Index] -clike "controller-signing-thumbprint|*") {
+                $HistoricalCandidateLines[$Index] = "controller-signing-thumbprint|$HistoricalThumbprint"
+            } elseif ($HistoricalCandidateLines[$Index] -clike "release-publisher-thumbprint|*") {
+                $HistoricalCandidateLines[$Index] = "release-publisher-thumbprint|$HistoricalThumbprint"
+            } elseif ($HistoricalCandidateLines[$Index] -clike "issued-at|*") {
+                $HistoricalCandidateLines[$Index] = "issued-at|$HistoricalIssuedAt"
+            } elseif ($HistoricalCandidateLines[$Index] -clike "expires-at|*") {
+                $HistoricalCandidateLines[$Index] = "expires-at|$HistoricalExpiresAt"
+            }
+        }
+        $HistoricalCandidate = Read-WindowsSftpCandidateLines $HistoricalCandidateLines
+        if ($null -eq $HistoricalCandidate -or
+            [int64]$HistoricalCandidate.'issued-at' -ne $HistoricalIssuedAt -or
+            [int64]$HistoricalCandidate.'expires-at' -ne $HistoricalExpiresAt -or
+            $HistoricalExpiresAt -ge $Now) { throw "self_test_historical_candidate_rejected" }
+        [byte[]]$HistoricalCandidateBytes = [Text.Encoding]::ASCII.GetBytes(
+            ($HistoricalCandidateLines -join "`n") + "`n")
+        $HistoricalCms = [Security.Cryptography.Pkcs.SignedCms]::new(
+            [Security.Cryptography.Pkcs.ContentInfo]::new($HistoricalCandidateBytes), $true)
+        $HistoricalSigner = [Security.Cryptography.Pkcs.CmsSigner]::new($HistoricalCertificate)
+        $HistoricalSigner.IncludeOption = [Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+        $HistoricalCms.ComputeSignature($HistoricalSigner)
+        if (-not (Test-WindowsSftpDetachedCms $HistoricalCandidateBytes $HistoricalCms.Encode() `
+                $HistoricalThumbprint $HistoricalIssuedAt $HistoricalExpiresAt)) {
+            throw "self_test_historical_authorization_rejected"
+        }
+        $CandidateSha256 = Get-WindowsSftpBytesSha256 $CandidateBytes
+        [string[]]$ReadinessLines = @(
+            "windows-sftp-readiness|1", "state|ready",
+            "reason|controller_signed_receipt_and_local_transport_verified", "host|WINDOWS-FIXTURE",
+            "request-sid|S-1-5-21-1-2-3-2001", "intent-sha256|$DigestA",
+            "candidate-sha256|$CandidateSha256", "host-key-fingerprint|$Fingerprint",
+            "transport-ready|true", "broker-ready|observed-separately",
+            "node-identity-ready|observed-separately", "action-context-ready|observed-separately",
+            "controller-signature-ready|true",
+            "readiness-authority|controller-signed-receipt-plus-local-observation", "end-readiness|"
+        )
+        $Readiness = Read-WindowsSftpReadinessLines $ReadinessLines
+        if (-not (Test-WindowsSftpCandidateReadinessBinding $Candidate $Readiness $CandidateSha256)) {
+            throw "self_test_readiness_binding_rejected"
+        }
+
+        [string[]]$TamperedCandidateLines = $CandidateLines.Clone()
+        $TamperedCandidateLines[2] = "authorization|self-asserted"
+        if ($null -ne (Read-WindowsSftpCandidateLines $TamperedCandidateLines)) {
+            throw "self_test_candidate_tamper_accepted"
+        }
+        [byte[]]$TamperedContent = $CandidateBytes.Clone()
+        $TamperedContent[10] = $TamperedContent[10] -bxor 1
+        if (Test-WindowsSftpDetachedCms $TamperedContent $SignatureBytes $Thumbprint $IssuedAt $ExpiresAt) {
+            throw "self_test_content_tamper_accepted"
+        }
+        [byte[]]$TamperedSignature = $SignatureBytes.Clone()
+        $TamperedSignature[0] = $TamperedSignature[0] -bxor 1
+        if (Test-WindowsSftpDetachedCms $CandidateBytes $TamperedSignature $Thumbprint $IssuedAt $ExpiresAt) {
+            throw "self_test_signature_tamper_accepted"
+        }
+        [string[]]$TamperedReadinessLines = $ReadinessLines.Clone()
+        $TamperedReadinessLines[6] = "candidate-sha256|$DigestB"
+        $TamperedReadiness = Read-WindowsSftpReadinessLines $TamperedReadinessLines
+        if (Test-WindowsSftpCandidateReadinessBinding $Candidate $TamperedReadiness $CandidateSha256) {
+            throw "self_test_readiness_digest_tamper_accepted"
+        }
+        $TamperedReadinessLines = $ReadinessLines.Clone()
+        $TamperedReadinessLines[8] = "transport-ready|false"
+        if ($null -ne (Read-WindowsSftpReadinessLines $TamperedReadinessLines)) {
+            throw "self_test_readiness_state_tamper_accepted"
+        }
+
+        $SecondKey = [Security.Cryptography.RSA]::Create(2048)
+        $SecondRequest = [Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=machine-utilities-second-controller", $SecondKey,
+            [Security.Cryptography.HashAlgorithmName]::SHA256,
+            [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $SecondCertificate = $SecondRequest.CreateSelfSigned(
+            [DateTimeOffset]::FromUnixTimeSeconds($IssuedAt - 60),
+            [DateTimeOffset]::FromUnixTimeSeconds($ExpiresAt + 60))
+        $SecondSigner = [Security.Cryptography.Pkcs.CmsSigner]::new($SecondCertificate)
+        $SecondSigner.IncludeOption = [Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
+        $Cms.ComputeSignature($SecondSigner)
+        if (Test-WindowsSftpDetachedCms $CandidateBytes $Cms.Encode() $Thumbprint $IssuedAt $ExpiresAt) {
+            throw "self_test_multi_signer_accepted"
+        }
+        Write-Output "PASS: Windows SFTP protected-local receipt contracts"
+    } finally {
+        if ($null -ne $SecondCertificate) { $SecondCertificate.Dispose() }
+        if ($null -ne $SecondKey) { $SecondKey.Dispose() }
+        if ($null -ne $HistoricalCertificate) { $HistoricalCertificate.Dispose() }
+        if ($null -ne $HistoricalKey) { $HistoricalKey.Dispose() }
+        if ($null -ne $Certificate) { $Certificate.Dispose() }
+        $Key.Dispose()
+    }
+}
+
+if ($SelfTest) {
+    Invoke-WindowsSftpReceiptSelfTest
+    exit 0
 }
 
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {

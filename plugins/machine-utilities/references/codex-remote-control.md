@@ -66,6 +66,132 @@ authoritative partial result with fresh post-inventory whenever collection is
 still possible; validate and preserve that evidence even though the task
 failed.
 
+Codex remote control is an ordinary, interactive schema-2 lane only.
+`apply-windows.ps1` rejects semantic actions and every protected broker field,
+even if those fields are injected into an otherwise ordinary operation.
+Schema-3 and schema-4 plans never use the Codex task, the legacy SSH workspace,
+WSL, SCP, a shell fallback, or another execution context.
+
+Protected Windows operations use only the enrolled `windows-sftp` route. The
+controller signs a closed request and transfers exactly the four preallocated
+slot files `request`, `request.sig`, `payload`, and `commit`; `commit` is last.
+Machine-package and inventory actions have an empty payload. Only
+`profile.apply-managed-bundle.v1` has a nonempty payload. The four exact
+chroot-relative upload paths are `/ingress/slot/request`,
+`/ingress/slot/request.sig`, `/ingress/slot/payload`, and
+`/ingress/slot/commit`. Polling performs only bounded `get` attempts for
+`/results/REQUEST-ID.result`; it never resubmits. The client accepts only the
+fixed sanitized public-result fields bound to the request, plan, action,
+epoch, and protected-result digest, and preserves both that protected digest
+and the exact public-projection digest in operation/final evidence. The SFTP
+batch contains no directory creation, listing, execution, SCP, or shell
+command.
+
+The shared lifecycle commands are `privilege-status`,
+`prepare-privilege-enrollment`, `verify-privilege-plan`,
+`submit-privilege-plan`, `lookup-privilege-result`,
+`preview-privilege-upgrade`, and `preview-privilege-revocation`. They are also
+the Claude vocabulary. Preparation and previews are inert and stop before a
+human password or UAC boundary. They never request or relay an Administrator
+credential. `lookup-privilege-result` performs result-only reads and never
+recreates or resubmits a slot. See `windows-sftp.md` for the owner-operated
+enrollment-to-revocation runbook.
+
+For a configured Windows SFTP route, `privilege-status` is not a Codex
+inventory task. It creates a fresh signed `broker.readiness.v1` request, uses
+the same four exact slot uploads with `commit` last, and performs bounded reads
+only from `/results/REQUEST-ID.readiness`. The response must match the request
+ID, configured ceremony-derived `request_sid`, request principal, and pinned
+route; it must be canonical, sorted, unique, and unexpired. It never reads the
+normal `.result`, `active`, `last`, or a directory listing. An unavailable or
+invalid response yields unavailable readiness, not a fallback to Codex, local
+files, WSL, or ordinary SSH.
+
+Plugin integrity and protected host attestation answer different questions.
+`integrity.json` authenticates the installed plugin source and controller
+executor. Protected readiness separately attests the Administrator-owned
+broker generation, policy, WinGet provider context, tasks, SFTP configuration,
+ACLs, and native-canary receipts. A plugin update does not upgrade protected
+code, and removing the plugin does not revoke its broker, request account,
+certificate trust, policy, or tasks.
+
+Ordinary Windows inventory still surfaces SFTP state as a
+`protected-local-observation`: exact local public-file ACLs, a controller-signed
+candidate, its detached CMS signer, and current local readiness/route
+projections are checked together. Once promoted, the candidate is historical
+authorization evidence. Validation binds its exact bytes and verifies that the
+signer certificate covered the original `issued-at`/`expires-at` interval; it
+does not require that certificate to be valid today and does not turn history
+into current mutation authority. U6 v1 public bytes do not publish the native
+canary evidence needed for portable proof, so copied files and user-owned
+identity-overlay receipts remain non-authoritative.
+
+The remote readiness control is a separate fresh protected-broker observation.
+It returns broker/generation/policy/constraint/WinGet/provider hashes, live
+task/transport/native-canary gates, action/token preconditions, and profile
+constraints. It intentionally reports no controller policy-proposal digest,
+context-canary digest, or action-specific constraint-set digest. It therefore
+cannot replace the ordinary inventory and precondition evidence needed to seal
+or verify a mixed schema-4 plan. The ordinary `collect` path remains Codex
+Desktop and is never silently routed through SFTP.
+
+Build logged-off profile payloads with `machine-utilities profile-bundle`.
+The builder compiles each destination's handler, artifact, manager, and logical
+identity; sorts destinations ordinally; binds the expected live presence,
+digest, and manager; and emits an uncompressed length-prefixed manifest and
+payload. It rejects case collisions, traversal, links, target-local overlays,
+credentials, caches, internal state, startup/task paths, and secret-backed
+templates. Caller identity is not serialized, so Codex and Claude callers
+produce identical bytes from identical inputs.
+
+The dedicated SFTP request SID and the non-elevated S4U profile target SID are
+different identities. Before staging a profile request, the controller
+revalidates the active protected token and its target SID, profile-root ID,
+entry-map digest, marketplace-set digest, deletion mode, entry cap, and byte
+cap from fresh readiness. It then validates every canonical manifest field,
+payload offset/length/digest, compiled destination/handler/artifact/manager
+association, and expected live state. The request SID is never accepted as the
+S4U target or as authority to widen the entry map.
+
+`automation_transport.request_sid` is mandatory and fail-closed. Pin it only
+from the exact authenticated controller intent/candidate receipt after the
+owner completes the Windows `-Preview`, `-Install` or `-Repair`, isolated
+detached-signing, staging, and `-Verify` ceremony. Do not infer it from a local
+account lookup, Codex or static readiness, the profile SID, or old enrollment
+history. A missing pin or a different SID in the fresh remote response rejects
+readiness. See `windows-sftp.md` for the fixed filenames and ceremony order;
+neither the fleet CA nor controller-signing private key enters automation.
+
+Protected POSIX automation uses the root-owned forced command
+`/usr/local/libexec/machine-utilities/posix-dispatcher`, which executes only
+`/usr/local/libexec/machine-utilities/current/scripts/machine-utilities
+dispatch-posix-request`. The bounded stdin protocol contains either one sealed
+ordinary schema-2 plan plus worker configuration or one signed broker envelope;
+it has no caller-selected command, executable, shell option, or workspace path.
+Linux broker envelopes reach only
+`sudo -n /usr/libexec/machine-utilities/posix-broker`. macOS supports the
+ordinary bounded lane and rejects protected root actions.
+
+Standalone schema-3 plans for each closed APT, WinGet, and profile action are
+executed by the same fixed broker path as mixed schema-4 plans. The internal
+projection adds only freshly verified UID/SID, certificate source-address,
+Windows platform-context evidence, and the matching action/token precondition.
+On Windows those fields come from fresh signed SFTP readiness, so logged-off
+submission never requires ordinary Codex collection. The projection does not
+add an executable, argv, package/source/dependency control, environment, or
+fallback context. POSIX
+result queries are freshly signed with the current node overlay certificate,
+including after renewal or from another enrolled node, while terminal evidence
+continues to match the original mutation's journaled identity and certificate.
+
+For upgrade or revocation, enter draining first and reject new submissions.
+Readiness and fresh result lookup remain available for protocol 1 and protocol
+0 while an active request reaches a protected terminal state; then remove only
+the adapter-owned grant. Emergency revocation may remove the grant earlier but
+must retain explicit partial or stale evidence. Return `needs_broker_upgrade`
+only when the sealed action/context is absent from the observed protocol, not
+for readiness, query, drain, or revocation controls.
+
 The controller does not need a local copy of the remote path. Task creation
 uses the saved remote project. Cross-host handoff is separate and requires the
 same repository to be saved on both source and destination hosts.

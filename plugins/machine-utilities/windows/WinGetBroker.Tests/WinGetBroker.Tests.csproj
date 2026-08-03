@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>MachineUtilities.WinGetBroker.Tests</AssemblyName>
+    <TargetFramework>net8.0</TargetFramework>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="BrokerTests.cs" />
+    <ProjectReference Include="../WinGetBroker/WinGetBroker.csproj" />
+    <None Include="../../references/windows-winget-provider.lock"
+          Link="windows-winget-provider.lock"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../WinGetBroker/packages.lock.json"
+          Link="packages.lock.json"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../references/privilege-policy.default"
+          Link="privilege-policy.default"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

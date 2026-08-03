@@ -67,3 +67,27 @@ is absent from its restricted `PATH`. For Windows Codex tasks read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
 unsupported rather than using WSL. Re-inventory after changes and report
 unresolved provenance as unknown, not guessed.
+
+## Protected profile actions
+
+Use `"$CLI" privilege-status HOST SNAPSHOT` before proposing protected profile
+work. The only agent-content action is the readiness-advertised
+`profile.apply-managed-bundle.v1` or read-only
+`profile.inventory-managed-state.v1` in `windows-user-s4u-v1`. Build identical
+Codex/Claude bytes with `"$CLI" profile-bundle SPEC SOURCE-ROOT OUTPUT`; include
+only bounded config scalars, standalone-skill files, agent definitions, and
+local marketplace desired records already authorized by the protected entry
+map. Never copy credentials, secret-backed templates, installed plugin caches,
+agent internal state, startup tasks, or arbitrary paths. A staged plugin
+desired record is `manager_activation_pending` until the next ordinary user
+session lets its manager activate it; logged-off S4U success is not plugin
+activation evidence.
+
+The shared protected lifecycle vocabulary is `prepare-privilege-identity`,
+`prepare-privilege-enrollment`, `verify-privilege-plan`,
+`submit-privilege-plan`, `lookup-privilege-result`,
+`preview-privilege-upgrade`, and `preview-privilege-revocation`. Preserve every
+readiness/result state without fallback, including
+`unsupported_security_boundary`, `partial`, and `stale`.
+Never ask for or relay a sudo or Administrator password; stop at the local human
+password/UAC boundary.

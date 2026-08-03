@@ -18,3 +18,26 @@ bytes. The automation client must bypass ordinary SSH configuration and agents.
 Enrollment and protected policy activation remain human operations. Editing a
 portable `policy_proposal` only prepares a candidate; it never changes the
 root- or Administrator-owned active generation.
+
+Use `machine-utilities prepare-privilege-identity` to wrap the fixed
+`prepare-ssh-identity prepare` helper. It emits only the public certificate
+request and preparation record; it never performs remote access, elevation, or
+CA use. Both Codex and Claude must ignore `SSH_AUTH_SOCK` for unattended work
+and must never display, copy, request, or relay the private node key or an
+elevation password.
+
+Certification is an isolated owner ceremony. Obtain the authenticated release
+digest for `scripts/certify-ssh-node` through a separate trusted path, compare
+it with the signing account's protected `helper.sha256`, and independently
+hash the executing helper inside that account before every signing operation.
+Inspect the public manifest before signing and the certificate afterward. The
+CA private key is offline, absent from fleet-node and service-account
+configuration, and never returned with the public certificate or receipt.
+
+Certificates have finite validity. Renewal prepares a new local certificate,
+canaries it against representative POSIX and Windows endpoints, and switches
+the node overlay only after those checks pass. Keep the old identity during
+the canary. Revoke a compromised node with an owner-generated KRL and confirm
+the expected KRL generation on every target; rotate the CA through a proven
+dual-trust window. See `windows-sftp.md` for the complete enrollment,
+upgrade, recovery, and revocation sequence.

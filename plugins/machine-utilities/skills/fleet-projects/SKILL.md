@@ -51,6 +51,22 @@ Cross-host handoff requires matching saved-project repository identity at both
 ends; creating a remote task directly only requires the destination saved
 project.
 
+Protected broker readiness is independent of project and Codex saved-project
+readiness. Use `"$CLI" privilege-status HOST SNAPSHOT` and report the public
+node/CA/certificate/host-key identity, transport, broker, machine-package, and
+profile readiness without treating a visible Codex task as a protected
+fallback. The shared Codex/Claude vocabulary is
+`prepare-privilege-identity`, `prepare-privilege-enrollment`,
+`verify-privilege-plan`, `submit-privilege-plan`,
+`lookup-privilege-result`, `preview-privilege-upgrade`, and
+`preview-privilege-revocation`. Project source, Git credentials, working trees,
+and installed plugin caches are never profile payloads. Preserve
+`needs_enrollment`, `drifted`, `transport_unavailable`,
+`unsupported_context`, `unsupported_security_boundary`, `partial`, and
+`stale` without fallback. Never ask for or relay a sudo or Administrator password;
+stop lifecycle changes at the local human
+password/UAC boundary.
+
 Use each project's own Git repository and exact commit as the authoritative
 handoff substrate for project work. A separately configured private
 coordination repository may hold structured pointers, ownership, status, and

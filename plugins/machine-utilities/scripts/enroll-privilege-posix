@@ -60,6 +60,10 @@ readonly state_root=$root_prefix/var/lib/machine-utilities
 readonly broker_path=$root_prefix/usr/libexec/machine-utilities/posix-broker
 readonly sudoers_path=$root_prefix/etc/sudoers.d/machine-utilities-posix-broker
 readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
+readonly ssh_keygen=/usr/bin/ssh-keygen
+readonly revocation_reserve_bytes=1048576
+readonly revocation_reserve_provision_bytes=4194304
+readonly revocation_reserve=$state_root/revocation.reserve
 readonly command=${1:-}
 shift || true
 
@@ -69,6 +73,7 @@ portable_stat() {
 file_owner() { portable_stat %Su %U "$1"; }
 file_mode() { portable_stat %Lp %a "$1"; }
 file_size() { portable_stat %z %s "$1"; }
+file_blocks() { portable_stat %b %b "$1"; }
 
 capture_current_process_id() {
   local destination=$1 observed pid_file
@@ -136,6 +141,81 @@ protected_file() {
     safe_permissions "$1" && [ "$(file_size "$1")" -le "$2" ]
 }
 
+system_ssh_keygen_digest() {
+  local ancestor
+  for ancestor in /usr /usr/bin; do
+    [ -d "$ancestor" ] && [ ! -L "$ancestor" ] && [ "$(file_owner "$ancestor")" = root ] &&
+      safe_permissions "$ancestor" || return 1
+  done
+  [ -f "$ssh_keygen" ] && [ ! -L "$ssh_keygen" ] && [ -x "$ssh_keygen" ] &&
+    [ "$(file_owner "$ssh_keygen")" = root ] && safe_permissions "$ssh_keygen" &&
+    [ "$(file_size "$ssh_keygen")" -le 33554432 ] || return 1
+  sha256_file "$ssh_keygen"
+}
+
+revocation_reserve_file_valid() {
+  local candidate=$1 observed_size observed_blocks
+  protected_file "$candidate" "$revocation_reserve_provision_bytes" &&
+    exact_mode "$candidate" 600 || return 1
+  observed_size=$(file_size "$candidate") || return 1
+  observed_blocks=$(file_blocks "$candidate") || return 1
+  [[ $observed_blocks =~ ^[0-9]{1,8}$ ]] || return 1
+  [ "$observed_size" -ge "$revocation_reserve_bytes" ] &&
+    [ "$observed_size" -le "$revocation_reserve_provision_bytes" ] &&
+    [ $((observed_blocks * 512)) -ge "$revocation_reserve_bytes" ]
+}
+
+revocation_reserve_valid() {
+  revocation_reserve_file_valid "$revocation_reserve"
+}
+
+ensure_revocation_reserve() {
+  local desired_bytes=${1:-$revocation_reserve_bytes} reserve_tmp
+  if [ -e "$revocation_reserve" ] || [ -L "$revocation_reserve" ]; then
+    revocation_reserve_valid
+    return
+  fi
+  [ "$desired_bytes" -ge "$revocation_reserve_bytes" ] &&
+    [ "$desired_bytes" -le "$revocation_reserve_provision_bytes" ] &&
+    [ $((desired_bytes % 1024)) -eq 0 ] || return 1
+  reserve_tmp=$state_root/.revocation.reserve.pending
+  if [ -e "$reserve_tmp" ] || [ -L "$reserve_tmp" ]; then
+    protected_file "$reserve_tmp" "$revocation_reserve_provision_bytes" &&
+      exact_mode "$reserve_tmp" 600 || return 1
+    /bin/rm -f "$reserve_tmp" && durable_sync "$state_root" || return 1
+  fi
+  if ! /bin/dd if=/dev/zero of="$reserve_tmp" bs=1024 count=$((desired_bytes / 1024)) \
+      >/dev/null 2>&1 ||
+    ! /bin/chmod 0600 "$reserve_tmp" ||
+    { [ "$fixture_mode" = false ] && ! /usr/bin/chown root:root "$reserve_tmp"; } ||
+    ! durable_sync "$reserve_tmp" || ! revocation_reserve_file_valid "$reserve_tmp"; then
+    /bin/rm -f "$reserve_tmp" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  fi
+  u2_pause revocation-reserve-prepared || {
+    /bin/rm -f "$reserve_tmp" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  }
+  if [ -e "$revocation_reserve" ] || [ -L "$revocation_reserve" ] ||
+    ! /bin/mv "$reserve_tmp" "$revocation_reserve"; then
+    /bin/rm -f "$reserve_tmp" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  fi
+  if ! durable_sync "$state_root" || ! revocation_reserve_valid; then
+    /bin/rm -f "$revocation_reserve" 2>/dev/null || true
+    durable_sync "$state_root" 2>/dev/null || true
+    return 1
+  fi
+}
+
+consume_revocation_reserve() {
+  revocation_reserve_valid || return 1
+  /bin/rm -f "$revocation_reserve" && durable_sync "$state_root"
+}
+
 token() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; }
 digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
 
@@ -173,7 +253,8 @@ verify_bootstrap_bundle() {
   protected_file "$receipt" 1024 || return 1
   [ "$(/usr/bin/sed -n '1p' "$receipt")" = \
     "bootstrap|1|manifest-sha256=$manifest_digest|release-principal=machine-utilities-release" ] || return 1
-  /usr/bin/ssh-keygen -Y verify -f "$bootstrap_root/release-allowed-signers" \
+  system_ssh_keygen_digest >/dev/null || return 1
+  "$ssh_keygen" -Y verify -f "$bootstrap_root/release-allowed-signers" \
     -I machine-utilities-release -n machine-utilities-release \
     -s "$bundle/bootstrap.manifest.sig" <"$bundle/bootstrap.manifest" >/dev/null 2>&1 || return 1
 
@@ -717,7 +798,7 @@ validate_apt_context() {
 
 validate_candidate_semantics() {
   validate_host_and_context && validate_apt_context && /bin/bash -n "$bundle/privilege-broker-posix" || return 1
-  observed_ca=$(/usr/bin/ssh-keygen -lf "$bundle/fleet-ca.pub" -E sha256 2>/dev/null |
+  observed_ca=$("$ssh_keygen" -lf "$bundle/fleet-ca.pub" -E sha256 2>/dev/null |
     /usr/bin/awk 'NR==1{print $2}')
   [ "$observed_ca" = "$ca_fingerprint" ] || return 1
 }
@@ -747,7 +828,7 @@ load_current_generation() {
     current_epoch=${BASH_REMATCH[1]}
     current_generation=$config_root/$current_target
     protected_directory "$current_generation" || return 1
-    for current_file in policy.actions policy.constraints broker.sha256 host.identity context.canary apt.context \
+    for current_file in policy.actions policy.constraints broker.sha256 ssh-keygen.sha256 host.identity context.canary apt.context \
       apt/source-authority; do
       protected_file "$current_generation/$current_file" 1048576 || return 1
     done
@@ -873,7 +954,8 @@ validate_public_canary_receipt() {
 }
 
 validate_coherent_enrollment() {
-  local expected_epoch=$1 generation expected_sudoers generation_policy generation_bound epoch_line
+  local expected_epoch=$1 ssh_attestation_mode=$2 generation expected_sudoers generation_policy
+  local generation_bound epoch_line recorded_ssh_keygen_digest
   [[ $expected_epoch =~ ^[1-9][0-9]{0,9}$ ]] || return 1
   generation=$config_root/generations/$expected_epoch
   protected_directory "$config_root" && exact_mode "$config_root" 755 &&
@@ -887,7 +969,7 @@ validate_coherent_enrollment() {
     [ "$(/usr/bin/readlink "$config_root/active")" = "generations/$expected_epoch" ] || return 1
   protected_file "$broker_path" 33554432 && exact_mode "$broker_path" 755 &&
     protected_file "$sudoers_path" 4096 && exact_mode "$sudoers_path" 440 || return 1
-  for expected_file in policy.actions policy.constraints broker.sha256 broker.version host.identity \
+  for expected_file in policy.actions policy.constraints broker.sha256 broker.version ssh-keygen.sha256 host.identity \
     context.canary apt.conf apt.context; do
     protected_file "$generation/$expected_file" 1048576 && exact_mode "$generation/$expected_file" 644 || return 1
   done
@@ -895,11 +977,19 @@ validate_coherent_enrollment() {
     protected_file "$config_root/trust/$expected_file" 1048576 &&
       exact_mode "$config_root/trust/$expected_file" 644 || return 1
   done
+  recorded_ssh_keygen_digest=$(/usr/bin/sed -n '1p' "$generation/ssh-keygen.sha256") || return 1
   [ "$(/usr/bin/sed -n '1p' "$generation/broker.version")" = 1.0.0 ] &&
     [ "$(/usr/bin/wc -l <"$generation/broker.version" | /usr/bin/tr -d ' ')" = 1 ] &&
     [ "$(sha256_file "$broker_path")" = "$(/usr/bin/sed -n '1p' "$generation/broker.sha256")" ] &&
     [ "$(/usr/bin/wc -l <"$generation/broker.sha256" | /usr/bin/tr -d ' ')" = 1 ] &&
+    digest "$recorded_ssh_keygen_digest" &&
+    [ "$(/usr/bin/wc -l <"$generation/ssh-keygen.sha256" | /usr/bin/tr -d ' ')" = 1 ] &&
     /bin/bash -n "$broker_path" || return 1
+  case $ssh_attestation_mode in
+    current) [ "$recorded_ssh_keygen_digest" = "$(system_ssh_keygen_digest)" ] || return 1 ;;
+    recorded) ;;
+    *) return 1 ;;
+  esac
   generation_policy=$(sha256_file "$generation/policy.actions") || return 1
   IFS='|' read -r epoch_line constraint_version generation_field policy_field constraint_extra \
     <"$generation/policy.constraints" || return 1
@@ -913,6 +1003,7 @@ validate_coherent_enrollment() {
   for state_directory in replay journal audit lock rollback quarantine; do
     protected_directory "$state_root/$state_directory" && exact_mode "$state_root/$state_directory" 700 || return 1
   done
+  revocation_reserve_valid || return 1
   ( bundle=$generation; epoch=$expected_epoch; validate_host_and_context && validate_apt_context ) || return 1
   validate_public_enrollment_receipt "$expected_epoch" "$generation" &&
     validate_public_canary_receipt "$expected_epoch"
@@ -922,7 +1013,8 @@ validate_unenrolled_state() {
   local path enrollment
   for path in "$config_root/active" "$broker_path" "$sudoers_path" \
     "$config_root/trust/fleet-ca.pub" "$config_root/trust/allowed_signers" \
-    "$config_root/trust/revoked.krl" "$root_prefix/var/lib/machine-utilities-public/canary"; do
+    "$config_root/trust/revoked.krl" "$root_prefix/var/lib/machine-utilities-public/canary" \
+    "$revocation_reserve"; do
     [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
   done
   if [ -d "$config_root/generations" ]; then
@@ -1230,7 +1322,7 @@ retire_recovery_directory() {
 }
 
 recover_existing_lifecycle() {
-  local recovery_rc=0 owner_state
+  local recovery_rc=0 owner_state recovery_owner_operation
   protected_directory "$lifecycle_recovery" && exact_mode "$lifecycle_recovery" 700 || return 2
   if lifecycle_owner_state "$lifecycle_recovery"; then owner_state=0
   else owner_state=$?
@@ -1247,6 +1339,11 @@ recover_existing_lifecycle() {
     [ "$recovery_rc" -eq 0 ] || return "$recovery_rc"
   else
     [ ! -e "$state_root/draining" ] && [ ! -L "$state_root/draining" ] || return 2
+    recovery_owner_operation=$(record_value_from "$lifecycle_recovery/owner" operation) || return 2
+    if [ "$recovery_owner_operation" = revoke ] && [ -L "$config_root/active" ] &&
+      { [ ! -e "$revocation_reserve" ] && [ ! -L "$revocation_reserve" ]; }; then
+      ensure_revocation_reserve "$revocation_reserve_provision_bytes" || return 2
+    fi
   fi
   retire_recovery_directory
 }
@@ -1855,7 +1952,7 @@ restore_revoke_quarantine() {
     "$quarantine/fleet-ca.pub" "$quarantine/allowed_signers" "$quarantine/revoked.krl"
   )
   if [ ! -e "$quarantine" ] && [ ! -L "$quarantine" ]; then
-    validate_coherent_enrollment "$recovery_from"
+    validate_coherent_enrollment "$recovery_from" recorded
     return
   fi
   protected_directory "$quarantine" && exact_mode "$quarantine" 700 || return 1
@@ -1886,7 +1983,7 @@ restore_revoke_quarantine() {
       durable_sync || return 1
     fi
   done
-  validate_coherent_enrollment "$recovery_from"
+  validate_coherent_enrollment "$recovery_from" recorded
 }
 
 cleanup_rolled_back_quarantine() {
@@ -1909,7 +2006,7 @@ advance_recovery_phase() {
 
 validate_recovery_old_install() {
   if [ "$recovery_from" -eq 0 ]; then validate_unenrolled_state
-  else validate_coherent_enrollment "$recovery_from"
+  else validate_coherent_enrollment "$recovery_from" recorded
   fi
 }
 
@@ -1955,15 +2052,21 @@ recover_install_transaction() {
       ;;
     rollback-finalizing) ;;
     committed)
-      validate_coherent_enrollment "$recovery_to" || return 1
+      validate_coherent_enrollment "$recovery_to" current || return 1
       advance_recovery_phase commit-finalizing || return 1
       ;;
     commit-finalizing)
-      validate_coherent_enrollment "$recovery_to" || return 1
+      validate_coherent_enrollment "$recovery_to" current || return 1
       ;;
     *) return 1 ;;
   esac
   cleanup_install_artifacts || return 1
+  if [ "$recovery_phase" = rollback-finalizing ] && [ "$recovery_from" -eq 0 ] &&
+    { [ -e "$revocation_reserve" ] || [ -L "$revocation_reserve" ]; }; then
+    protected_file "$revocation_reserve" "$revocation_reserve_provision_bytes" &&
+      exact_mode "$revocation_reserve" 600 || return 1
+    /bin/rm -f "$revocation_reserve" && durable_sync "$state_root" || return 1
+  fi
   if [ "$recovery_phase" = rollback-finalizing ]; then validate_recovery_old_install || return 1; fi
   validate_and_remove_drain "$drain_record" true || return 1
   if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
@@ -1991,7 +2094,7 @@ recover_revoke_transaction() {
   cleanup_artifact_prepare "$quarantine_prepare" "$state_root/quarantine" "$recovery_id" 700 600 || return 1
   case $recovery_phase in
     waiting)
-      validate_coherent_enrollment "$recovery_from" || return 1
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
       validate_drain "$drain_record" || return 1
       if [ -e "$state_root/lock/active" ] || [ -L "$state_root/lock/active" ]; then
         active_request_in_progress || return 1
@@ -2002,24 +2105,24 @@ recover_revoke_transaction() {
       advance_recovery_phase rollback-finalizing || return 1
       ;;
     intent|drained)
-      validate_coherent_enrollment "$recovery_from" || return 1
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
       advance_recovery_phase rolled-back || return 1
       u2_pause recovery-rolled-back || return 1
       advance_recovery_phase rollback-finalizing || return 1
       ;;
     quarantining)
       restore_revoke_quarantine "$quarantine" || return 1
-      validate_coherent_enrollment "$recovery_from" || return 1
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
       advance_recovery_phase rolled-back || return 1
       u2_pause recovery-rolled-back || return 1
       advance_recovery_phase rollback-finalizing || return 1
       ;;
     rolled-back)
-      validate_coherent_enrollment "$recovery_from" || return 1
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
       advance_recovery_phase rollback-finalizing || return 1
       ;;
     rollback-finalizing)
-      validate_coherent_enrollment "$recovery_from" || return 1
+      validate_coherent_enrollment "$recovery_from" recorded || return 1
       ;;
     committed)
       validate_completed_revocation "$recovery_from" "$recovery_manifest" "$quarantine" || return 1
@@ -2032,7 +2135,7 @@ recover_revoke_transaction() {
   esac
   if [ "$recovery_phase" = rollback-finalizing ]; then
     cleanup_rolled_back_quarantine "$quarantine" || return 1
-    validate_coherent_enrollment "$recovery_from" || return 1
+    validate_coherent_enrollment "$recovery_from" recorded || return 1
   fi
   validate_and_remove_drain "$drain_record" true || return 1
   cleanup_revoke_temporary
@@ -2041,6 +2144,12 @@ recover_revoke_transaction() {
 recover_lifecycle_transaction() {
   local directory=$1
   validate_transaction_record "$directory" || return 1
+  if [ "$recovery_operation" = revoke ]; then
+    case $recovery_phase in
+      committed|commit-finalizing) ;;
+      *) ensure_revocation_reserve "$revocation_reserve_provision_bytes" || return 1 ;;
+    esac
+  fi
   case $recovery_operation in
     install) recover_install_transaction "$directory" || return $? ;;
     revoke) recover_revoke_transaction "$directory" || return $? ;;
@@ -2136,6 +2245,7 @@ install_bundle() (
   local lifecycle_lock_reason='' transaction_started=false rollback_performed=false
   local backup='' staging='' final_generation='' new_broker='' new_ca='' new_signers='' new_krl='' sudoers_temp=''
   local receipt_temp='' canary_temp='' draining='' drain_record='' active_temp='' rollback_ok=true drain_owned=false rc
+  local ssh_keygen_digest=''
   local transaction_operation='' transaction_id='' transaction_boot='' transaction_start='' transaction_from=''
   local transaction_to='' transaction_manifest='' transaction_confirmation='' transaction_phase=''
   created_directories=()
@@ -2259,7 +2369,10 @@ install_bundle() (
   if [ "$current_epoch" -eq 0 ]; then
     validate_unenrolled_state || { result drifted incoherent_unenrolled_state linux; exit 65; }
   else
-    validate_coherent_enrollment "$current_epoch" || { result drifted incoherent_existing_enrollment linux; exit 65; }
+    validate_coherent_enrollment "$current_epoch" recorded || {
+      result drifted incoherent_existing_enrollment linux
+      exit 65
+    }
   fi
   begin_transaction install "$current_epoch" "$epoch" "$manifest_digest" "$confirmation_digest" || {
     result drifted transaction_intent_write_failed linux
@@ -2326,10 +2439,14 @@ install_bundle() (
         ;;
     esac
   done <"$bundle/bootstrap.manifest"
+  ssh_keygen_digest=$(system_ssh_keygen_digest) || { result rejected system_ssh_keygen_drift linux; exit 65; }
   printf '%s\n' "$(manifest_file_digest privilege-broker-posix)" >"$staging/broker.sha256"
   printf '%s\n' 1.0.0 >"$staging/broker.version"
-  /bin/chmod 0644 "$staging/broker.sha256" "$staging/broker.version"
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$staging/broker.sha256" "$staging/broker.version"; fi
+  printf '%s\n' "$ssh_keygen_digest" >"$staging/ssh-keygen.sha256"
+  /bin/chmod 0644 "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
+  if [ "$fixture_mode" = false ]; then
+    /usr/bin/chown root:root "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
+  fi
   [ "$(sha256_file "$staging/policy.actions")" = "$policy_digest" ] &&
     [ "$(sha256_file "$staging/policy.constraints")" = "$constraints_digest" ] &&
     [ "$(sha256_file "$staging/apt.context")" = "$(manifest_file_digest apt.context)" ] &&
@@ -2344,7 +2461,7 @@ install_bundle() (
   copy_manifest_file fleet-ca.pub "$new_ca"
   copy_manifest_file allowed_signers "$new_signers"
   copy_manifest_file revoked.krl "$new_krl"
-  observed_ca=$(/usr/bin/ssh-keygen -lf "$new_ca" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1{print $2}')
+  observed_ca=$("$ssh_keygen" -lf "$new_ca" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1{print $2}')
   [ "$observed_ca" = "$ca_fingerprint" ] || { result rejected fleet_ca_fingerprint_mismatch linux; exit 65; }
   printf '%s ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker ""\n' \
     "$request_user" >"$sudoers_temp"
@@ -2391,6 +2508,10 @@ install_bundle() (
     exit 65
   }
 
+  ensure_revocation_reserve "$revocation_reserve_provision_bytes" || {
+    result drifted revocation_reserve_creation_failed linux
+    exit 74
+  }
   run_enrollment_canary || { result drifted enrollment_canary_failed linux; exit 65; }
   sudoers_digest=$(sha256_file "$sudoers_path")
   {
@@ -2422,10 +2543,10 @@ install_bundle() (
   u2_pause install-after-public-receipt || { result drifted fixture_pause_failed linux; exit 65; }
   u2_failpoint after-public-receipt
 
-  if ! validate_coherent_enrollment "$epoch"; then
+  if ! validate_coherent_enrollment "$epoch" current; then
     if [ "$fixture_mode" = true ]; then
       set -x
-      validate_coherent_enrollment "$epoch" || true
+      validate_coherent_enrollment "$epoch" current || true
       set +x
     fi
     result drifted post_activation_coherence_failed linux
@@ -2473,7 +2594,10 @@ revoke_bundle() (
       committed|commit-finalizing) durable_commit=true; return 0 ;;
       waiting)
         preserve_drain=true
-        if [ "$lifecycle_owned" = true ]; then park_lifecycle_transaction || rollback_ok=false; fi
+        ensure_revocation_reserve "$revocation_reserve_provision_bytes" || rollback_ok=false
+        if [ "$rollback_ok" = true ] && [ "$lifecycle_owned" = true ]; then
+          park_lifecycle_transaction || rollback_ok=false
+        fi
         return 0
         ;;
     esac
@@ -2492,6 +2616,10 @@ revoke_bundle() (
         fi
       else
         if [ "$drain_owned" = true ]; then /bin/rm -f "$draining" 2>/dev/null || true; fi
+        if [ -L "$config_root/active" ] && [ ! -e "$revocation_reserve" ] &&
+          [ ! -L "$revocation_reserve" ]; then
+          ensure_revocation_reserve "$revocation_reserve_provision_bytes" || rc=74
+        fi
         remove_created_directories
       fi
     fi
@@ -2540,11 +2668,13 @@ revoke_bundle() (
     result drifted revocation_generation_mismatch linux
     exit 65
   }
-  validate_coherent_enrollment "$expected_epoch" || {
+  validate_coherent_enrollment "$expected_epoch" recorded || {
       result drifted incoherent_existing_enrollment linux
       exit 65
-    }
+  }
   [ ! -e "$public_root/active" ] || { result draining public_active_request_must_settle linux; exit 75; }
+  consume_revocation_reserve || { result drifted revocation_reserve_release_failed linux; exit 74; }
+  u2_pause revocation-reserve-released || { result drifted fixture_pause_failed linux; exit 65; }
   transaction_id="revoke-$expected_epoch-0-$revoke_manifest_digest"
   quarantine=$state_root/quarantine/revoked-$expected_epoch-$revoke_manifest_digest
   status_temp=$state_root/.revoked-status.$transaction_id
@@ -2574,6 +2704,10 @@ revoke_bundle() (
   if [ -e "$state_root/lock/active" ]; then
     active_request_in_progress || { result drifted active_lock_invalid linux; exit 65; }
     write_transaction_phase waiting || { result drifted transaction_phase_write_failed linux; exit 74; }
+    ensure_revocation_reserve "$revocation_reserve_provision_bytes" || {
+      result drifted revocation_reserve_restore_failed linux
+      exit 74
+    }
     u2_pause lifecycle-waiting-before-park || { result drifted fixture_pause_failed linux; exit 65; }
     park_lifecycle_transaction || { result drifted lifecycle_park_failed linux; exit 74; }
     preserve_drain=true

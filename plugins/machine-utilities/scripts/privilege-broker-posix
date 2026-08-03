@@ -1,9 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-# The sudoers grant names this file with an empty argument string. Keep the
-# argument check before platform, filesystem, request, or journal work.
-[ "$#" -eq 0 ] || exit 64
+# The sudoers grant names this file with an empty argument string. The sole
+# non-public entry point is the broker's fixed internal launcher. It accepts a
+# request identifier only; the native path and arguments are always derived
+# again from protected state.
+internal_launch=false
+internal_request_id=
+if [ "$#" -eq 2 ] && [ "$1" = --internal-launch-v1 ] &&
+  [[ $2 =~ ^request-[0-9a-f]{32}$ ]]; then
+  internal_launch=true
+  internal_request_id=$2
+elif [ "$#" -ne 0 ]; then
+  exit 64
+fi
 
 umask 077
 export LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -16,12 +26,28 @@ readonly broker_version=1.0.0
 readonly request_namespace=machine-utilities-request
 readonly max_request_bytes=16384
 readonly max_signature_bytes=16384
+readonly max_journal_bytes=131072
+readonly max_audit_bytes=10485760
+readonly terminal_reserve_bytes=196608
 
 request_id=unknown
 plan_id=unknown
 admission_owned=false
 native_started=false
 claim_directory=
+claim_stage=
+effect_phase=none
+journal_sequence=0
+native_pid=-
+native_pgid=-
+native_start=-
+native_exit=-
+admission_boot=-
+launch_record_digest=-
+launch_gate=
+launch_gate_released=false
+launch_guard_open=false
+launch_writer_open=false
 
 result() {
   state=$1
@@ -31,6 +57,7 @@ result() {
 }
 
 reject() {
+  cleanup_claim_stage || true
   if [ "$admission_owned" = true ] && [ "$native_started" = false ]; then
     /bin/rm -f "$lock_root/active/admission" 2>/dev/null || true
     /bin/rmdir "$lock_root/active" 2>/dev/null || true
@@ -38,6 +65,17 @@ reject() {
   fi
   result rejected "$1"
   exit "${2:-65}"
+}
+
+cleanup_claim_stage() {
+  local candidate=${claim_stage:-}
+  [ -n "$candidate" ] || return 0
+  [ "$candidate" = "${replay_root:-}/.claim-${request_id:-unknown}-$$" ] || return 1
+  if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+    /bin/rm -rf "$candidate" || return 1
+    durable_sync "${replay_root:-/nonexistent}" || return 1
+  fi
+  claim_stage=
 }
 
 portable_stat() {
@@ -51,6 +89,7 @@ portable_stat() {
 file_owner() { portable_stat %Su %U "$1"; }
 file_mode() { portable_stat %Lp %a "$1"; }
 file_size() { portable_stat %z %s "$1"; }
+file_blocks() { portable_stat %b %b "$1"; }
 
 sha256_file() {
   if [ -x /usr/bin/sha256sum ]; then
@@ -66,6 +105,10 @@ sha256_stream() {
   else
     /usr/bin/shasum -a 256 | /usr/bin/awk '{print tolower($1)}'
   fi
+}
+
+durable_sync() {
+  /bin/sync -f "$1" 2>/dev/null || /bin/sync
 }
 
 fixture_root=${MACHINE_UTILITIES_U2_FIXTURE_ROOT:-}
@@ -91,10 +134,14 @@ readonly generations_root=$config_root/generations
 readonly active_link=$config_root/active
 readonly trust_root=$config_root/trust
 readonly state_root=$root_prefix/var/lib/machine-utilities
+readonly revocation_reserve=$state_root/revocation.reserve
+readonly revocation_reserve_bytes=1048576
+readonly revocation_reserve_max_bytes=4194304
 readonly replay_root=$state_root/replay
 readonly journal_root=$state_root/journal
 readonly audit_root=$state_root/audit
 readonly lock_root=$state_root/lock
+readonly public_root=$root_prefix/var/lib/machine-utilities-public
 readonly max_claims=64
 readonly reserved_claim_slots=8
 readonly max_clock_skew=300
@@ -103,6 +150,28 @@ if [ -x /usr/bin/date ]; then date_tool=/usr/bin/date
 else date_tool=/bin/date
 fi
 readonly date_tool
+
+exact_mode() {
+  [ "$(file_mode "$1")" = "$2" ]
+}
+
+record_value_from() {
+  /usr/bin/awk -F '|' -v key="$2" '$1==key{if(found++)exit 1;value=$2}
+    END{if(found!=1)exit 1;print value}' "$1"
+}
+
+https_source_uri() {
+  local uri=$1 authority_and_path path segment
+  [ "${#uri}" -le 1024 ] &&
+    [[ $uri =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~:@+,-]+)*$ ]] || return 1
+  authority_and_path=${uri#https://}
+  case $authority_and_path in
+    */*) path=/${authority_and_path#*/} ;;
+    *) return 0 ;;
+  esac
+  IFS='/' read -r -a uri_segments <<<"${path#/}"
+  for segment in "${uri_segments[@]}"; do [ "$segment" != . ] && [ "$segment" != .. ] || return 1; done
+}
 
 permissions_safe() {
   mode=$(file_mode "$1") || return 1
@@ -127,12 +196,204 @@ protected_file() {
     [ "$(file_size "$path")" -le "$maximum" ]
 }
 
+attested_system_ssh_keygen() {
+  local expected_digest=$1 ancestor
+  digest "$expected_digest" || return 1
+  for ancestor in /usr /usr/bin; do
+    [ -d "$ancestor" ] && [ ! -L "$ancestor" ] &&
+      [ "$(file_owner "$ancestor")" = root ] && permissions_safe "$ancestor" || return 1
+  done
+  [ -f "$ssh_keygen" ] && [ ! -L "$ssh_keygen" ] && [ -x "$ssh_keygen" ] &&
+    [ "$(file_owner "$ssh_keygen")" = root ] && permissions_safe "$ssh_keygen" &&
+    [ "$(file_size "$ssh_keygen")" -le 33554432 ] &&
+    [ "$(sha256_file "$ssh_keygen")" = "$expected_digest" ]
+}
+
 token() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; }
 atom() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._+@:,-]{0,255}$ ]]; }
 uint() { [[ $1 =~ ^(0|[1-9][0-9]{0,19})$ ]]; }
 digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
 fingerprint() { [[ $1 =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]]; }
 iso_time() { [[ $1 =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; }
+
+fixture_pause() {
+  local phase=$1 marker
+  [ "$fixture_mode" = true ] && [ "${MACHINE_UTILITIES_U2_PAUSE_AT:-}" = "$phase" ] || return 0
+  marker=${MACHINE_UTILITIES_U2_PAUSE_MARKER:-}
+  case $marker in /*) ;; *) return 1 ;; esac
+  printf 'pause|1|point=%s|pid=%s\n' "$phase" "$$" >"$marker" || return 1
+  while [ ! -e "$marker.continue" ]; do
+    [ ! -e "$marker.kill" ] || exit 137
+    /bin/sleep 0.05
+  done
+}
+
+internal_process_start_identity() {
+  local inspected_pid=$1 observed_start
+  uint "$inspected_pid" && [ "$inspected_pid" != 0 ] || return 1
+  if [ -r "/proc/$inspected_pid/stat" ]; then
+    observed_start=$(/usr/bin/sed 's/^.*) //' "/proc/$inspected_pid/stat" | /usr/bin/awk '{print $20}') || return 1
+    [[ $observed_start =~ ^[0-9]+$ ]] || return 1
+  else
+    observed_start=$(/bin/ps -o lstart= -p "$inspected_pid" 2>/dev/null) || return 1
+  fi
+  [ -n "$observed_start" ] && printf '%s\n' "$observed_start" | sha256_stream
+}
+
+run_internal_launcher() {
+  local gate_token claim launch_record launch_digest launch_request launch_action launch_token
+  local launch_target launch_epoch launch_broker_digest launch_policy_digest launch_constraints_digest
+  local launch_apt_context_digest launch_precondition_digest launch_action_digest launch_exact_version
+  local launch_gate_digest active_target_internal generation_internal admission_file journal_file
+  local admission_kind admission_version admission_request parent_pid parent_start child_pid child_pgid
+  local child_start launch_boot admission_state admission_effect admission_epoch admission_launch_digest admission_extra
+  local apt_context_internal apt_config_internal apt_get_internal apt_get_expected policy_internal constraints_internal
+  local policy_record_internal selected_context_internal selected_state_internal
+  local selected_constraint_internal package_internal artifact_internal artifact_expected exact_internal
+  local journal_launch_digest observed_start native_arguments_internal
+
+  IFS= read -r gate_token <&9 || exit 74
+  digest "$(printf '%s\n' "$gate_token" | sha256_stream)" || exit 74
+  claim=$replay_root/$internal_request_id
+  launch_record=$claim/launch.record
+  admission_file=$lock_root/active/admission
+  journal_file=$claim/journal
+  protected_directory "$state_root" && protected_directory "$replay_root" &&
+    protected_directory "$lock_root" && protected_directory "$lock_root/active" &&
+    protected_directory "$claim" && protected_file "$launch_record" 8192 &&
+    protected_file "$admission_file" 4096 && protected_file "$journal_file" "$max_journal_bytes" || exit 74
+  /usr/bin/awk -F '|' '
+    BEGIN { key[1]="launch-record";key[2]="request-id";key[3]="action-id";key[4]="policy-token"
+      key[5]="generation-target";key[6]="enrollment-epoch";key[7]="broker-sha256"
+      key[8]="policy-sha256";key[9]="constraints-sha256";key[10]="apt-context-sha256"
+      key[11]="precondition-sha256";key[12]="action-evidence-sha256";key[13]="exact-version"
+      key[14]="gate-sha256";key[15]="end-launch" }
+    $0!~/^[ -~]*$/||length($0)>2048||NF!=2||$1!=key[NR]{exit 1}
+    NR==1{if($2!="1")exit 1}
+    NR==15{if($2!="")exit 1}
+    END{if(NR!=15)exit 1}
+  ' "$launch_record" || exit 74
+  launch_request=$(record_value_from "$launch_record" request-id) || exit 74
+  launch_action=$(record_value_from "$launch_record" action-id) || exit 74
+  launch_token=$(record_value_from "$launch_record" policy-token) || exit 74
+  launch_target=$(record_value_from "$launch_record" generation-target) || exit 74
+  launch_epoch=$(record_value_from "$launch_record" enrollment-epoch) || exit 74
+  launch_broker_digest=$(record_value_from "$launch_record" broker-sha256) || exit 74
+  launch_policy_digest=$(record_value_from "$launch_record" policy-sha256) || exit 74
+  launch_constraints_digest=$(record_value_from "$launch_record" constraints-sha256) || exit 74
+  launch_apt_context_digest=$(record_value_from "$launch_record" apt-context-sha256) || exit 74
+  launch_precondition_digest=$(record_value_from "$launch_record" precondition-sha256) || exit 74
+  launch_action_digest=$(record_value_from "$launch_record" action-evidence-sha256) || exit 74
+  launch_exact_version=$(record_value_from "$launch_record" exact-version) || exit 74
+  launch_gate_digest=$(record_value_from "$launch_record" gate-sha256) || exit 74
+  launch_digest=$(sha256_file "$launch_record") || exit 74
+  [ "$launch_request" = "$internal_request_id" ] && token "$launch_action" &&
+    { [ "$launch_token" = - ] || token "$launch_token"; } &&
+    [[ $launch_target =~ ^generations/([1-9][0-9]{0,9})$ ]] && [ "${BASH_REMATCH[1]}" = "$launch_epoch" ] &&
+    uint "$launch_epoch" && digest "$launch_broker_digest" && digest "$launch_policy_digest" &&
+    digest "$launch_constraints_digest" && digest "$launch_apt_context_digest" &&
+    digest "$launch_precondition_digest" && digest "$launch_action_digest" &&
+    { [ "$launch_exact_version" = - ] || [[ $launch_exact_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]]; } &&
+    digest "$launch_gate_digest" &&
+    [ "$(printf '%s\n' "$gate_token" | sha256_stream)" = "$launch_gate_digest" ] || exit 74
+
+  active_target_internal=$(/usr/bin/readlink "$active_link" 2>/dev/null) || exit 75
+  [ "$active_target_internal" = "$launch_target" ] && [ ! -e "$state_root/draining" ] || exit 75
+  generation_internal=$config_root/$launch_target
+  policy_internal=$generation_internal/policy.actions
+  constraints_internal=$generation_internal/policy.constraints
+  apt_context_internal=$generation_internal/apt.context
+  apt_config_internal=$generation_internal/apt.conf
+  apt_get_internal=$root_prefix/usr/bin/apt-get
+  protected_directory "$generation_internal" && protected_file "$policy_internal" 65536 &&
+    protected_file "$constraints_internal" 65536 && protected_file "$apt_context_internal" 65536 &&
+    protected_file "$apt_config_internal" 65536 && protected_file "$apt_get_internal" 33554432 &&
+    [ -x "$apt_get_internal" ] && [ "$(sha256_file "$policy_internal")" = "$launch_policy_digest" ] &&
+    [ "$(sha256_file "$constraints_internal")" = "$launch_constraints_digest" ] &&
+    [ "$(sha256_file "$apt_context_internal")" = "$launch_apt_context_digest" ] || exit 75
+  if [ "$fixture_mode" = true ]; then
+    [ "$(sha256_file "$0")" = "$launch_broker_digest" ] ||
+      [ "$(sha256_file "$broker_path")" = "$launch_broker_digest" ] || exit 75
+  else
+    [ "$0" = "$broker_path" ] && [ "$(sha256_file "$broker_path")" = "$launch_broker_digest" ] || exit 75
+  fi
+  apt_get_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="apt-get"{if(found++)exit 1;print $3}
+    END{if(found!=1)exit 1}' "$apt_context_internal") || exit 75
+  digest "$apt_get_expected" && [ "$(sha256_file "$apt_get_internal")" = "$apt_get_expected" ] || exit 75
+
+  IFS='|' read -r admission_kind admission_version admission_request parent_pid parent_start child_pid child_pgid \
+    child_start launch_boot admission_state admission_effect admission_epoch admission_launch_digest admission_extra \
+    <"$admission_file" || exit 74
+  observed_start=$(internal_process_start_identity $$) || exit 74
+  [ "$admission_kind" = admission ] && [ "$admission_version" = 2 ] &&
+    [ "$admission_request" = "$internal_request_id" ] && uint "$parent_pid" && digest "$parent_start" &&
+    [ "$child_pid" = "$$" ] && [ "$child_pgid" = "$$" ] && [ "$child_start" = "$observed_start" ] &&
+    digest "$launch_boot" && [ "$admission_state" = executing ] && [ "$admission_effect" = possible ] &&
+    [ "$admission_epoch" = "$launch_epoch" ] && [ "$admission_launch_digest" = "$launch_digest" ] &&
+    [ -z "$admission_extra" ] || exit 74
+  journal_launch_digest=$(/usr/bin/awk -F '|' -v request="$internal_request_id" '
+    NR==1{if($0!="journal|2")exit 1}
+    $1=="request-id"{if($2!=request||seen_request++)exit 1;request_ok=1}
+    $1=="state"{if($2!="executing"||seen_state++)exit 1;state_ok=1}
+    $1=="effect-phase"{if($2!="possible"||seen_effect++)exit 1;effect_ok=1}
+    $1=="launch-record-sha256"{if(seen_launch++)exit 1;launch=$2}
+    END{if(!request_ok||!state_ok||!effect_ok||seen_launch!=1)exit 1;print launch}
+  ' "$journal_file") || exit 74
+  [ "$journal_launch_digest" = "$launch_digest" ] || exit 74
+
+  policy_record_internal=$(/usr/bin/awk -F '|' -v action="$launch_action" \
+    '$1=="action"&&$2==action{if(found++)exit 1;print} END{if(found!=1)exit 1}' "$policy_internal") || exit 75
+  IFS='|' read -r _ _ selected_context_internal selected_state_internal _ _ <<<"$policy_record_internal"
+  [ "$selected_context_internal" = posix-root-v1 ] && [ "$selected_state_internal" = enabled ] || exit 75
+  native_arguments_internal=(--quiet=2)
+  case $launch_action in
+    apt.update-metadata.v1)
+      [ "$launch_token" = - ] && [ "$launch_exact_version" = - ] || exit 75
+      native_arguments_internal+=(update)
+      ;;
+    apt.autoremove.v1)
+      [ "$launch_token" = - ] && [ "$launch_exact_version" = - ] || exit 75
+      native_arguments_internal+=(--yes autoremove)
+      ;;
+    apt.install-package-version.v1)
+      selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
+        '$1=="apt-install"&&$2=="apt.install-package-version.v1"&&$3==token{if(found++)exit 1;print}
+         END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
+      IFS='|' read -r _ _ _ package_internal _ exact_internal artifact_expected _ \
+        <<<"$selected_constraint_internal"
+      [ "$launch_exact_version" = "$exact_internal" ] && digest "$artifact_expected" || exit 75
+      artifact_internal=$generation_internal/apt/artifacts/$launch_token.deb
+      protected_file "$artifact_internal" 33554432 &&
+        [ "$(sha256_file "$artifact_internal")" = "$artifact_expected" ] || exit 75
+      native_arguments_internal+=(--yes --no-remove --no-install-recommends install "$artifact_internal")
+      ;;
+    apt.upgrade-package.v1)
+      selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
+        '$1=="apt-upgrade"&&$2=="apt.upgrade-package.v1"&&$3==token{if(found++)exit 1;print}
+         END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
+      IFS='|' read -r _ _ _ package_internal _ _ _ _ _ \
+        <<<"$selected_constraint_internal"
+      [[ $launch_exact_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || exit 75
+      native_arguments_internal+=(--yes --no-remove --only-upgrade install "$package_internal=$launch_exact_version")
+      ;;
+    *) exit 75 ;;
+  esac
+  fixture_pause internal-before-effect || exit 74
+  [ "$(/usr/bin/readlink "$active_link" 2>/dev/null)" = "$launch_target" ] &&
+    [ ! -e "$state_root/draining" ] && [ "$(sha256_file "$launch_record")" = "$launch_digest" ] &&
+    [ "$(sha256_file "$policy_internal")" = "$launch_policy_digest" ] &&
+    [ "$(sha256_file "$constraints_internal")" = "$launch_constraints_digest" ] &&
+    [ "$(sha256_file "$apt_context_internal")" = "$launch_apt_context_digest" ] &&
+    [ "$(sha256_file "$apt_get_internal")" = "$apt_get_expected" ] || exit 75
+  exec /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    DEBIAN_FRONTEND=noninteractive APT_CONFIG="$apt_config_internal" \
+    "$apt_get_internal" "${native_arguments_internal[@]}"
+}
+
+if [ "$internal_launch" = true ]; then
+  run_internal_launcher
+  exit 70
+fi
 
 request_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-request.XXXXXX)
 certificate_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-certificate.XXXXXX)
@@ -143,11 +404,51 @@ certificate_details_tmp=$(/usr/bin/mktemp /tmp/machine-utilities-certificate-det
 policy_group_tmp=$(/usr/bin/mktemp -d /tmp/machine-utilities-policy.XXXXXX)
 readonly request_tmp certificate_tmp signature_tmp printed_key_tmp verify_output_tmp certificate_details_tmp policy_group_tmp
 cleanup() {
+  cleanup_claim_stage || true
   /bin/rm -f "$request_tmp" "$certificate_tmp" "$signature_tmp" \
     "$printed_key_tmp" "$verify_output_tmp" "$certificate_details_tmp"
   /bin/rm -rf "$policy_group_tmp"
 }
+cleanup_launch_gate() {
+  if [ "$launch_guard_open" = true ]; then
+    exec 8>&-
+    launch_guard_open=false
+  fi
+  if [ "$launch_writer_open" = true ]; then
+    exec 9>&-
+    launch_writer_open=false
+  fi
+  if [ -n "$launch_gate" ]; then
+    [ -n "$claim_directory" ] && [ "$launch_gate" = "$claim_directory/launch.gate" ] || return 1
+    if [ -e "$launch_gate" ] || [ -L "$launch_gate" ]; then
+      [ -p "$launch_gate" ] && [ ! -L "$launch_gate" ] || return 1
+      /bin/rm -f "$launch_gate" || return 1
+      durable_sync "$claim_directory" || return 1
+    fi
+    launch_gate=
+  fi
+}
+terminate_blocked_native() {
+  if [ "$native_started" = true ] && [ "$launch_gate_released" = false ]; then
+    /bin/kill -TERM "$native_pid" 2>/dev/null || true
+    wait "$native_pid" 2>/dev/null || true
+    native_started=false
+  fi
+  cleanup_launch_gate
+}
 interrupted() {
+  trap - HUP INT TERM
+  if [ "$native_started" = true ] && [ "$launch_gate_released" = false ]; then
+    terminate_blocked_native || true
+    if [ -n "$claim_directory" ]; then
+      claim_failure parent_interrupted_before_native_effect 143
+    fi
+  else
+    cleanup_launch_gate || true
+  fi
+  if [ "$admission_owned" = true ] && [ "$native_started" = false ]; then
+    reject parent_interrupted 143
+  fi
   cleanup
   exit 143
 }
@@ -250,9 +551,8 @@ if IFS= read -r extra || [ -n "$extra" ]; then reject trailing_request_data; fi
 token "$target_host_id" && uint "$target_uid" &&
   [[ $plan_id =~ ^plan-[0-9a-f]{16}$ ]] &&
   [[ $request_id =~ ^request-[0-9a-f]{32}$ ]] &&
-  { [[ $action_id = broker.query-result.v1 && $requested_protocol =~ ^(0|1)$ ]] ||
-    [[ $action_id != broker.query-result.v1 && $requested_protocol = "$broker_protocol" ]]; } &&
-  [[ $requested_broker_version = "$broker_version" ]] &&
+  [[ $requested_protocol =~ ^(0|1)$ ]] &&
+  [[ $requested_broker_version =~ ^[0-9]{1,9}[.][0-9]{1,9}[.][0-9]{1,9}$ ]] &&
   digest "$requested_broker_digest" && digest "$requested_policy_digest" &&
   digest "$requested_constraints_digest" && digest "$requested_precondition_digest" &&
   uint "$created_at" && uint "$expires_at" &&
@@ -282,6 +582,10 @@ case $action_id in
     ;;
   *) reject unknown_action ;;
 esac
+[ "$action_id" = broker.query-result.v1 ] || {
+  [ "$requested_protocol" = "$broker_protocol" ] &&
+    [ "$requested_broker_version" = "$broker_version" ]
+} || reject unsupported_broker_protocol
 
 protected_directory "$config_root" && protected_directory "$generations_root" &&
   protected_directory "$trust_root" && protected_directory "$state_root" &&
@@ -294,14 +598,26 @@ boot_identity() {
     IFS= read -r observed_boot </proc/sys/kernel/random/boot_id
     printf '%s\n' "$observed_boot" | sha256_stream
   else
-    /usr/sbin/sysctl -n kern.boottime 2>/dev/null | sha256_stream
+    /usr/sbin/sysctl -n kern.boottime 2>/dev/null | /usr/bin/awk '
+      NR==1 {
+        if ($1!="{" || $2!="sec" || $3!="=" || $5!="usec" || $6!="=" || $8!="}") exit 1
+        sec=$4; sub(/,$/,"",sec); usec=$7
+        if (sec!~/^(0|[1-9][0-9]*)$/ || length(sec)>20 ||
+            usec!~/^(0|[1-9][0-9]*)$/ || length(usec)>6 || usec+0>999999) exit 1
+        print "boot|1|sec=" sec "|usec=" usec
+        found=1
+      }
+      END { if (NR!=1 || !found) exit 1 }
+    ' | sha256_stream
   fi
 }
 
 process_start_identity() {
   process_id=$1
   if [ -r "/proc/$process_id/stat" ]; then
-    /usr/bin/awk '{print $22}' "/proc/$process_id/stat" | sha256_stream
+    observed_start=$(/usr/bin/sed 's/^.*) //' "/proc/$process_id/stat" | /usr/bin/awk '{print $20}') || return 1
+    [[ $observed_start =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$observed_start" | sha256_stream
   else
     /bin/ps -o lstart= -p "$process_id" 2>/dev/null | sha256_stream
   fi
@@ -321,18 +637,158 @@ group_live() {
   fi
 }
 
-update_existing_journal_state() {
-  existing_journal=$1
-  new_state=$2
-  new_reason=$3
-  existing_tmp=$existing_journal.$$
-  /usr/bin/awk -F '|' -v state="$new_state" -v reason="$new_reason" '
-    BEGIN{state_seen=0;reason_seen=0}
-    $1=="state"{print "state|"state;state_seen=1;next}
-    $1=="reason"{print "reason|"reason;reason_seen=1;next}
+group_identity_live() {
+  local process_group=$1 expected_leader_start=$2 observed_leader_start
+  uint "$process_group" && digest "$expected_leader_start" || return 1
+  group_live "$process_group" || return 1
+  # Never infer identity from a numeric group alone: a fully retired group can
+  # be reused and then lose its new leader while retaining unrelated members.
+  /bin/kill -0 "$process_group" 2>/dev/null || return 1
+  observed_leader_start=$(process_start_identity "$process_group" 2>/dev/null) || return 1
+  [ "$observed_leader_start" = "$expected_leader_start" ]
+}
+
+journal_value() {
+  /usr/bin/awk -F '|' -v key="$2" '$1==key{if(found++)exit 1;value=$2}
+    END{if(found!=1)exit 1;print value}' "$1"
+}
+
+canonical_journal_valid() {
+  local candidate=$1
+  protected_file "$candidate" "$max_journal_bytes" &&
+    /usr/bin/awk -F '|' '
+      BEGIN {
+        key[1]="journal"; key[2]="sequence"; key[3]="state"; key[4]="reason"
+        key[5]="effect-phase"; key[6]="retain-until"; key[7]="request-id"
+        key[8]="plan-id"; key[9]="action-id"; key[10]="broker-protocol"
+        key[11]="target-host-id"; key[12]="target-uid"; key[13]="broker-version"
+        key[14]="broker-sha256"; key[15]="policy-sha256"; key[16]="constraints-sha256"
+        key[17]="precondition-sha256"; key[18]="created-at"; key[19]="expires-at"
+        key[20]="transport"; key[21]="request-principal"; key[22]="required-context"
+        key[23]="observed-execution-principal"; key[24]="console-session-state"
+        key[25]="platform-boundary"; key[26]="enrollment-epoch"
+        key[27]="context-canary-sha256"; key[28]="pinned-host-key-fingerprint"
+        key[29]="originating-node-id"; key[30]="fleet-domain"
+        key[31]="fleet-ca-fingerprint"; key[32]="ca-generation"
+        key[33]="node-key-fingerprint"; key[34]="certificate-serial"
+        key[35]="certificate-valid-after"; key[36]="certificate-valid-before"
+        key[37]="source-addresses-sha256"; key[38]="manager-source-identity"
+        key[39]="request-sha256"; key[40]="certificate-sha256"; key[41]="signature-sha256"
+        key[42]="action-evidence-sha256"; key[43]="launch-record-sha256"
+        key[44]="native-pid"; key[45]="native-pgid"; key[46]="native-process-start"
+        key[47]="native-boot"; key[48]="native-exit"; key[49]="metadata-sha256"
+        key[50]="pre-state-sha256"; key[51]="post-state-sha256"
+        key[52]="artifact-sha256"; key[53]="closure-sha256"
+        key[54]="closure-members-sha256"; key[55]="end-journal"
+      }
+      $0!~/^[ -~]*$/ || length($0)>4096 || NR>55 { exit 1 }
+      { if(NF!=2 || $1!=key[NR]) exit 1 }
+      NR==1 { if($2!="2")exit 1; next }
+      NR==2 || NR==6 || NR==12 || NR==18 || NR==19 || NR==26 || NR==32 || NR==34 {
+        if($2!~/^(0|[1-9][0-9]{0,19})$/)exit 1; next
+      }
+      NR==3 { if($2!~/^(validating|executing|verifying|recovering|completed|partial|rejected|stale)$/)exit 1; next }
+      NR==4 { if($2!~/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)exit 1; next }
+      NR==5 { if($2!~/^(none|launch-blocked|possible|exited|verified)$/)exit 1; next }
+      NR==7 { if($2!~/^request-[0-9a-f]{32}$/)exit 1; next }
+      NR==8 { if($2!~/^plan-[0-9a-f]{16}$/)exit 1; next }
+      NR==10 { if($2!~/^(0|1)$/)exit 1; next }
+      NR==14 || NR==15 || NR==16 || NR==17 || NR==27 || NR==37 || NR==39 || NR==40 ||
+      NR==41 || NR==42 || NR==43 || NR==46 || NR==47 || NR==49 || NR==50 || NR==51 ||
+      NR==52 || NR==53 || NR==54 {
+        if($2!="-" && (length($2)!=64 || $2!~/^[0-9a-f]+$/))exit 1; next
+      }
+      NR==44 || NR==45 || NR==48 { if($2!="-" && $2!~/^(0|[1-9][0-9]{0,19})$/)exit 1; next }
+      NR==55 { if($2!="")exit 1; next }
+      { if($2=="" || index($2,"|")!=0)exit 1 }
+      END { if(NR!=55)exit 1 }
+    ' "$candidate"
+}
+
+tombstone_valid() {
+  local candidate=$1 expected_request=$2 tombstone_kind tombstone_version tombstone_request
+  local tombstone_until tombstone_epoch tombstone_request_digest tombstone_extra
+  protected_file "$candidate" 2048 || return 1
+  IFS='|' read -r tombstone_kind tombstone_version tombstone_request tombstone_until \
+    tombstone_epoch tombstone_request_digest tombstone_extra <"$candidate" || return 1
+  [ "$tombstone_kind" = tombstone ] && [ "$tombstone_version" = 2 ] &&
+    [ "$tombstone_request" = "$expected_request" ] && uint "$tombstone_until" &&
+    uint "$tombstone_epoch" && digest "$tombstone_request_digest" && [ -z "$tombstone_extra" ] &&
+    [ "$(/usr/bin/wc -l <"$candidate" | /usr/bin/tr -d ' ')" = 1 ]
+}
+
+repair_result_projection() {
+  local canonical=$1 projection=$2 projection_tmp
+  canonical_journal_valid "$canonical" || return 1
+  if canonical_journal_valid "$projection" 2>/dev/null &&
+    [ "$(sha256_file "$projection")" = "$(sha256_file "$canonical")" ]; then
+    return 0
+  fi
+  projection_tmp=$journal_root/.projection.$$
+  /bin/cp "$canonical" "$projection_tmp" && /bin/chmod 0600 "$projection_tmp" &&
+    [ "$(sha256_file "$projection_tmp")" = "$(sha256_file "$canonical")" ] &&
+    durable_sync "$projection_tmp" && /bin/mv -f "$projection_tmp" "$projection" &&
+    durable_sync "$journal_root"
+}
+
+repair_public_projection() {
+  local canonical=$1 public_state public_reason public_request public_plan public_action public_epoch
+  local public_kind public_tmp
+  canonical_journal_valid "$canonical" || return 1
+  public_state=$(journal_value "$canonical" state) || return 1
+  public_reason=$(journal_value "$canonical" reason) || return 1
+  public_request=$(journal_value "$canonical" request-id) || return 1
+  public_plan=$(journal_value "$canonical" plan-id) || return 1
+  public_action=$(journal_value "$canonical" action-id) || return 1
+  public_epoch=$(journal_value "$canonical" enrollment-epoch) || return 1
+  case $public_state in
+    completed|partial|rejected|stale) public_kind=last ;;
+    *) public_kind=active ;;
+  esac
+  if [ ! -e "$public_root" ]; then
+    /bin/mkdir "$public_root" && /bin/chmod 0755 "$public_root" || return 1
+  fi
+  protected_directory "$public_root" || return 1
+  public_tmp=$public_root/.repair.$$
+  {
+    printf 'broker-public|1\nstate|%s\nreason|%s\nrequest-id|%s\nplan-id|%s\n' \
+      "$public_state" "$public_reason" "$public_request" "$public_plan"
+    printf 'action-id|%s\nenrollment-epoch|%s\n' "$public_action" "$public_epoch"
+  } >"$public_tmp" && /bin/chmod 0644 "$public_tmp" && durable_sync "$public_tmp" &&
+    /bin/mv -f "$public_tmp" "$public_root/$public_kind" && durable_sync "$public_root" || return 1
+  if [ "$public_kind" = last ] && [ -f "$public_root/active" ] &&
+    /usr/bin/grep -Fqx "request-id|$public_request" "$public_root/active"; then
+    /bin/rm -f "$public_root/active" && durable_sync "$public_root"
+  fi
+}
+
+transition_existing_journal() {
+  local existing_journal=$1 new_state=$2 new_reason=$3 new_effect=$4 existing_sequence transition_tmp existing_request existing_state
+  canonical_journal_valid "$existing_journal" || return 1
+  existing_state=$(journal_value "$existing_journal" state) || return 1
+  case $existing_state in
+    completed|partial|rejected|stale)
+      existing_request=${existing_journal%/*}
+      existing_request=${existing_request##*/}
+      repair_result_projection "$existing_journal" "$journal_root/$existing_request.result"
+      return
+      ;;
+  esac
+  existing_sequence=$(journal_value "$existing_journal" sequence) || return 1
+  transition_tmp=${existing_journal%/*}/.journal-transition.$$
+  /usr/bin/awk -F '|' -v OFS='|' -v sequence="$((existing_sequence + 1))" \
+      -v state="$new_state" -v reason="$new_reason" -v effect="$new_effect" '
+    $1=="sequence"{$2=sequence}
+    $1=="state"{$2=state}
+    $1=="reason"{$2=reason}
+    $1=="effect-phase"{$2=effect}
     {print}
-    END{if(!state_seen||!reason_seen)exit 1}
-  ' "$existing_journal" >"$existing_tmp" && /bin/mv -f "$existing_tmp" "$existing_journal"
+  ' "$existing_journal" >"$transition_tmp" && /bin/chmod 0600 "$transition_tmp" &&
+    canonical_journal_valid "$transition_tmp" && durable_sync "$transition_tmp" &&
+    /bin/mv -f "$transition_tmp" "$existing_journal" && durable_sync "${existing_journal%/*}" || return 1
+  existing_request=${existing_journal%/*}
+  existing_request=${existing_request##*/}
+  repair_result_projection "$existing_journal" "$journal_root/$existing_request.result"
 }
 
 release_admission() {
@@ -343,22 +799,38 @@ release_admission() {
 }
 
 reconcile_admission() {
+  reconcile_mode=${1:-mutation}
+  admission_boot_match=false
+  admission_broker_live=false
+  admission_group_live=false
   [ -d "$lock_root/active" ] || return 0
   protected_directory "$lock_root/active" &&
-    protected_file "$lock_root/active/admission" 2048 || reject admission_state_drift
+    protected_file "$lock_root/active/admission" 4096 || reject admission_state_drift
   IFS='|' read -r admission_kind admission_version admission_request broker_pid broker_start \
-    native_pid native_pgid native_start admission_boot admission_state \
+    native_pid native_pgid native_start admission_boot admission_state admission_effect admission_epoch \
+    admission_launch_digest admission_extra \
     <"$lock_root/active/admission" || reject admission_state_drift
-  [ "$admission_kind" = admission ] && [ "$admission_version" = 1 ] &&
+  [ "$admission_kind" = admission ] && [ "$admission_version" = 2 ] &&
     [[ $admission_request =~ ^request-[0-9a-f]{32}$ ]] && uint "$broker_pid" &&
     digest "$broker_start" &&
-    { [ "$native_pid" = - ] || uint "$native_pid"; } &&
-    { [ "$native_pgid" = - ] || uint "$native_pgid"; } &&
-    { [ "$native_start" = - ] || digest "$native_start"; } &&
+    { { [ "$native_pid" = - ] && [ "$native_pgid" = - ] && [ "$native_start" = - ]; } ||
+      { uint "$native_pid" && uint "$native_pgid" && digest "$native_start"; }; } &&
     digest "$admission_boot" &&
-    [[ $admission_state =~ ^(admitted|claimed|executing|verifying)$ ]] || reject admission_state_drift
+    [[ $admission_state =~ ^(admitted|claimed|launch-blocked|executing|verifying)$ ]] &&
+    [[ $admission_effect =~ ^(none|launch-blocked|possible|exited|verified)$ ]] &&
+    uint "$admission_epoch" && { [ "$admission_launch_digest" = - ] || digest "$admission_launch_digest"; } &&
+    [ -z "$admission_extra" ] || reject admission_state_drift
 
   current_boot=$(boot_identity)
+  if [ "$admission_boot" = "$current_boot" ]; then
+    admission_boot_match=true
+    if process_identity_live "$broker_pid" "$broker_start"; then
+      admission_broker_live=true
+    fi
+    if [ "$native_pgid" != - ] && group_identity_live "$native_pgid" "$native_start"; then
+      admission_group_live=true
+    fi
+  fi
   if [ -f "$state_root/emergency-terminate" ]; then
     protected_file "$state_root/emergency-terminate" 512 || reject emergency_state_drift
     IFS='|' read -r emergency_kind emergency_version emergency_request emergency_pgid emergency_boot \
@@ -366,20 +838,57 @@ reconcile_admission() {
     [ "$emergency_kind" = emergency ] && [ "$emergency_version" = 1 ] &&
       [ "$emergency_request" = "$admission_request" ] && [ "$emergency_pgid" = "$native_pgid" ] &&
       [ "$emergency_boot" = "$admission_boot" ] || reject emergency_state_drift
-    if [ "$native_pgid" != - ] && [ "$current_boot" = "$admission_boot" ] && group_live "$native_pgid"; then
+    if [ "$native_pgid" != - ] && [ "$current_boot" = "$admission_boot" ] &&
+      group_identity_live "$native_pgid" "$native_start"; then
       if [ "$fixture_mode" = true ]; then /bin/kill -TERM "$native_pgid" 2>/dev/null || true
       else /bin/kill -TERM -- "-$native_pgid" 2>/dev/null || true
       fi
     fi
     emergency_journal=$replay_root/$admission_request/journal
-    [ ! -f "$emergency_journal" ] ||
-      update_existing_journal_state "$emergency_journal" partial emergency_termination_requested || true
+    if [ -f "$emergency_journal" ]; then
+      emergency_effect=$(journal_value "$emergency_journal" effect-phase) || reject journal_recovery_failed 74
+      case $emergency_effect in
+        none|launch-blocked)
+          transition_existing_journal "$emergency_journal" stale emergency_before_native_effect "$emergency_effect" ||
+            reject journal_recovery_failed 74
+          ;;
+        possible|exited|verified)
+          transition_existing_journal "$emergency_journal" partial emergency_termination_requested "$emergency_effect" ||
+            reject journal_recovery_failed 74
+          ;;
+      esac
+    fi
     /bin/rm -f "$state_root/emergency-terminate"
-  elif [ "$admission_boot" = "$current_boot" ] &&
-    { process_identity_live "$broker_pid" "$broker_start" ||
-      { [ "$native_pgid" != - ] && group_live "$native_pgid"; }; }; then
+  elif [ "$admission_boot_match" = true ] &&
+    { [ "$admission_broker_live" = true ] || [ "$admission_group_live" = true ]; }; then
     if [ -f "$replay_root/$admission_request/journal" ]; then
-      update_existing_journal_state "$replay_root/$admission_request/journal" recovering process_group_live || true
+      live_journal=$replay_root/$admission_request/journal
+      live_effect=$(journal_value "$live_journal" effect-phase) || reject journal_recovery_failed 74
+      live_state=$(journal_value "$live_journal" state) || reject journal_recovery_failed 74
+      case $live_state in
+        completed|partial|rejected|stale)
+          repair_result_projection "$live_journal" "$journal_root/$admission_request.result" ||
+            reject result_projection_repair_failed 74
+          if [ "$reconcile_mode" = query ] && [ "$admission_request" != "$request_id" ]; then
+            return 0
+          fi
+          [ "$reconcile_mode" != query ] || repair_public_projection "$live_journal" ||
+            reject result_projection_repair_failed 74
+          [ "$reconcile_mode" != query ] || return 0
+          /bin/cat "$live_journal"
+          exit 75
+          ;;
+      esac
+      if [ "$reconcile_mode" = query ] && [ "$admission_request" = "$request_id" ]; then
+        repair_result_projection "$live_journal" "$journal_root/$admission_request.result" ||
+          reject result_projection_repair_failed 74
+        repair_public_projection "$live_journal" || reject result_projection_repair_failed 74
+        return 0
+      elif [ "$reconcile_mode" = query ]; then
+        return 0
+      fi
+      transition_existing_journal "$live_journal" recovering process_group_live "$live_effect" ||
+        reject journal_recovery_failed 74
     fi
     result recovering active_admission_live
     exit 75
@@ -387,16 +896,32 @@ reconcile_admission() {
 
   orphan_journal=$replay_root/$admission_request/journal
   if [ -f "$orphan_journal" ]; then
-    if [ "$admission_state" = executing ] || [ "$admission_state" = verifying ]; then
-      update_existing_journal_state "$orphan_journal" partial orphaned_native_state ||
-        reject journal_recovery_failed 74
-    else
-      update_existing_journal_state "$orphan_journal" stale broker_died_before_native ||
-        reject journal_recovery_failed 74
-    fi
-  else
-    printf 'result|1\nstate|stale\nreason|admission_without_claim\nrequest-id|%s\nplan-id|unknown\n' \
-      "$admission_request" >"$journal_root/$admission_request.result" || reject journal_recovery_failed 74
+    orphan_effect=$(journal_value "$orphan_journal" effect-phase) || reject journal_recovery_failed 74
+    case $orphan_effect in
+      none|launch-blocked)
+        transition_existing_journal "$orphan_journal" stale broker_died_before_native "$orphan_effect" ||
+          reject journal_recovery_failed 74
+        ;;
+      possible|exited)
+        transition_existing_journal "$orphan_journal" partial orphaned_native_state "$orphan_effect" ||
+          reject journal_recovery_failed 74
+        ;;
+      verified)
+        transition_existing_journal "$orphan_journal" completed post_state_verified verified ||
+          reject journal_recovery_failed 74
+        ;;
+    esac
+    case $orphan_effect in
+      none|launch-blocked|possible|exited|verified)
+        /bin/rm -f "$replay_root/$admission_request/terminal.reserve" || reject journal_recovery_failed 74
+        orphan_gate=$replay_root/$admission_request/launch.gate
+        if [ -e "$orphan_gate" ] || [ -L "$orphan_gate" ]; then
+          [ -p "$orphan_gate" ] && [ ! -L "$orphan_gate" ] || reject journal_recovery_failed 74
+          /bin/rm -f "$orphan_gate" || reject journal_recovery_failed 74
+        fi
+        durable_sync "$replay_root/$admission_request"
+        ;;
+    esac
   fi
   /bin/rm -f "$lock_root/active/admission"
   /bin/rmdir "$lock_root/active" || reject admission_recovery_failed 74
@@ -408,10 +933,10 @@ acquire_admission() {
   admission_owned=true
   broker_start=$(process_start_identity $$)
   admission_boot=$(boot_identity)
-  printf 'admission|1|%s|%s|%s|-|-|-|%s|admitted\n' \
-    "$request_id" "$$" "$broker_start" "$admission_boot" >"$lock_root/active/admission" ||
+  printf 'admission|2|%s|%s|%s|-|-|-|%s|admitted|none|%s|-\n' \
+    "$request_id" "$$" "$broker_start" "$admission_boot" "$active_epoch" >"$lock_root/active/admission" ||
     reject admission_record_failed 74
-  protected_file "$lock_root/active/admission" 2048 || reject admission_record_failed 74
+  protected_file "$lock_root/active/admission" 4096 || reject admission_record_failed 74
   if [ -e "$state_root/draining" ]; then
     protected_file "$state_root/draining" 2048 || reject drain_state_drift
     release_admission
@@ -433,18 +958,31 @@ readonly policy=$generation/policy.actions
 readonly constraints=$generation/policy.constraints
 readonly broker_digest_file=$generation/broker.sha256
 readonly broker_version_file=$generation/broker.version
+readonly ssh_keygen_digest_file=$generation/ssh-keygen.sha256
 readonly context_canary=$generation/context.canary
 readonly host_identity=$generation/host.identity
 readonly apt_config=$generation/apt.conf
 readonly apt_context=$generation/apt.context
 for protected in "$policy" "$constraints" "$broker_digest_file" "$broker_version_file" \
-  "$context_canary" "$host_identity" "$apt_config" "$apt_context"; do
+  "$ssh_keygen_digest_file" "$context_canary" "$host_identity" "$apt_config" "$apt_context"; do
   protected_file "$protected" 65536 || reject protected_file_drift
 done
 protected_file "$trust_root/fleet-ca.pub" 8192 &&
   protected_file "$trust_root/allowed_signers" 16384 &&
   protected_file "$trust_root/revoked.krl" 1048576 || reject trust_state_drift
-[ -x "$ssh_keygen" ] || reject unsupported_openssh
+if [ "$action_id" != broker.query-result.v1 ]; then
+  revocation_reserve_blocks=$(file_blocks "$revocation_reserve" 2>/dev/null || true)
+  protected_file "$revocation_reserve" "$revocation_reserve_max_bytes" &&
+    exact_mode "$revocation_reserve" 600 &&
+    [ "$(file_size "$revocation_reserve")" -ge "$revocation_reserve_bytes" ] &&
+    [[ $revocation_reserve_blocks =~ ^[0-9]{1,8}$ ]] &&
+    [ $((revocation_reserve_blocks * 512)) -ge "$revocation_reserve_bytes" ] ||
+    reject revocation_reserve_drift
+fi
+expected_ssh_keygen_digest=$(/usr/bin/sed -n '1p' "$ssh_keygen_digest_file") ||
+  reject openssh_attestation_drift
+[ "$(/usr/bin/wc -l <"$ssh_keygen_digest_file" | /usr/bin/tr -d ' ')" = 1 ] &&
+  attested_system_ssh_keygen "$expected_ssh_keygen_digest" || reject openssh_attestation_drift
 
 if [ "$fixture_mode" = false ]; then
   [ "$0" = "$broker_path" ] && protected_file "$broker_path" 1048576 && [ -x "$broker_path" ] ||
@@ -589,6 +1127,8 @@ TZ=UTC "$ssh_keygen" -Lf "$printed_key_tmp" >"$certificate_details_tmp" 2>/dev/n
 
 observed_node_fingerprint=$($ssh_keygen -lf "$printed_key_tmp" -E sha256 2>/dev/null |
   /usr/bin/awk 'NR==1{print $2}')
+observed_certificate_type=$(/usr/bin/awk '/^[[:space:]]*Type:/ {sub(/^[[:space:]]*/,"");print;count++}
+  END{if(count!=1)exit 1}' "$certificate_details_tmp") || reject certificate_parse_failed
 observed_ca_fingerprint=$(/usr/bin/awk '/^[[:space:]]*Signing CA:/ {for(i=1;i<=NF;i++) if($i~/^SHA256:/){print $i;exit}}' "$certificate_details_tmp")
 observed_key_id=$(/usr/bin/awk -F '"' '/^[[:space:]]*Key ID:/ {print $2;exit}' "$certificate_details_tmp")
 observed_serial=$(/usr/bin/awk '/^[[:space:]]*Serial:/ {print $2;exit}' "$certificate_details_tmp")
@@ -616,6 +1156,7 @@ if [ "$requested_source_addresses" = - ]; then : >"$policy_group_tmp/expected.so
 else printf '%s\n' "${requested_source_addresses//,/\n}" | /usr/bin/sort >"$policy_group_tmp/expected.sources"
 fi
 [ "$observed_node_fingerprint" = "$requested_node_fingerprint" ] &&
+  [ "$observed_certificate_type" = 'Type: ssh-ed25519-cert-v01@openssh.com user certificate' ] &&
   [ "$observed_ca_fingerprint" = "$protected_ca_fingerprint" ] &&
   [ "$observed_key_id" = "$signing_principal" ] &&
   [ "$observed_serial" = "$requested_certificate_serial" ] &&
@@ -627,19 +1168,33 @@ fi
   reject certificate_identity_mismatch
 
 if [ "$action_id" = broker.query-result.v1 ]; then
+  # Query never admits work, but it is an authenticated recovery trigger. A
+  # dead admission is terminalized from the persisted effect phase before the
+  # canonical result is returned; a live admission is reported unchanged.
+  reconcile_admission query
   query_claim=$replay_root/$request_id
   query_journal=$query_claim/journal
-  protected_directory "$query_claim" && protected_file "$query_claim/tombstone" 2048 &&
-    protected_file "$query_journal" 65536 || reject result_not_found 66
-  /usr/bin/awk -F '|' -v request="$request_id" -v plan="$plan_id" -v node="$node_id" \
-      -v fingerprint="$requested_node_fingerprint" -v serial="$requested_certificate_serial" '
-    $1=="request-id" { if ($2!=request || seen_request++) exit 1; found_request=1 }
-    $1=="plan-id" { if ($2!=plan || seen_plan++) exit 1; found_plan=1 }
-    $1=="originating-node-id" { if ($2!=node || seen_node++) exit 1; found_node=1 }
-    $1=="node-key-fingerprint" { if ($2!=fingerprint || seen_fingerprint++) exit 1; found_fingerprint=1 }
-    $1=="certificate-serial" { if ($2!=serial || seen_serial++) exit 1; found_serial=1 }
-    END { if (!found_request || !found_plan || !found_node || !found_fingerprint || !found_serial) exit 1 }
+  protected_directory "$query_claim" && tombstone_valid "$query_claim/tombstone" "$request_id" &&
+    canonical_journal_valid "$query_journal" || reject result_not_found 66
+  /usr/bin/awk -F '|' -v request="$request_id" -v plan="$plan_id" -v host="$target_host_id" \
+      -v uid="$target_uid" -v principal="$request_principal" -v version="$requested_broker_version" '
+    $1=="request-id" { if ($2!=request || seen[$1]++) exit 1; found[$1]=1 }
+    $1=="plan-id" { if ($2!=plan || seen[$1]++) exit 1; found[$1]=1 }
+    $1=="target-host-id" { if ($2!=host || seen[$1]++) exit 1; found[$1]=1 }
+    $1=="target-uid" { if ($2!=uid || seen[$1]++) exit 1; found[$1]=1 }
+    $1=="request-principal" { if ($2!=principal || seen[$1]++) exit 1; found[$1]=1 }
+    $1=="broker-version" { if ($2!=version || seen[$1]++) exit 1; found[$1]=1 }
+    END {
+      split("request-id plan-id target-host-id target-uid request-principal broker-version",required," ")
+      for(i in required)if(!found[required[i]])exit 1
+    }
   ' "$query_journal" || reject result_binding_mismatch
+  query_request_digest=$(journal_value "$query_journal" request-sha256) || reject result_binding_mismatch
+  IFS='|' read -r _ _ _ _ _ query_tombstone_digest <"$query_claim/tombstone" || reject result_binding_mismatch
+  [ "$query_request_digest" = "$query_tombstone_digest" ] || reject result_binding_mismatch
+  repair_result_projection "$query_journal" "$journal_root/$request_id.result" ||
+    reject result_projection_repair_failed 74
+  repair_public_projection "$query_journal" || reject result_projection_repair_failed 74
   /bin/cat "$query_journal"
   exit 0
 fi
@@ -661,10 +1216,8 @@ artifact_digest=-
 closure_digest=-
 case $action_id in
   apt.update-metadata.v1)
-    derived_argv='/usr/bin/apt-get --quiet=2 update'
     ;;
   apt.autoremove.v1)
-    derived_argv='/usr/bin/apt-get --quiet=2 --yes --no-remove autoremove'
     ;;
   apt.install-package-version.v1)
     selected_constraint=$(/usr/bin/awk -F '|' -v token="$policy_token" \
@@ -673,7 +1226,6 @@ case $action_id in
 $selected_constraint
 EOF
     [ -n "$package_id" ] || reject policy_token_not_found
-    derived_argv="/usr/bin/apt-get --quiet=2 --yes --no-remove --no-install-recommends install $package_id=$exact_version"
     ;;
   apt.upgrade-package.v1)
     selected_constraint=$(/usr/bin/awk -F '|' -v token="$policy_token" \
@@ -683,7 +1235,6 @@ $selected_constraint
 EOF
     [ -n "$package_id" ] || reject policy_token_not_found
     exact_version=$maximum_version
-    derived_argv="/usr/bin/apt-get --quiet=2 --yes --no-remove --only-upgrade install $package_id=$exact_version"
     ;;
 esac
 if [ "$constraint_kind" = none ]; then
@@ -812,36 +1363,214 @@ done
   [ "$(sha256_file "$dpkg_deb_path")" = "$dpkg_deb_digest" ] &&
   [ "$(sha256_file "$setsid_path")" = "$setsid_digest" ] || reject apt_dependency_drift
 
+validate_protected_ancestors() {
+  local candidate=$1 ancestor
+  case $candidate in /*) ;; *) return 1 ;; esac
+  if [ -n "$root_prefix" ]; then
+    case $candidate in "$root_prefix"|"$root_prefix"/*) ;; *) return 1 ;; esac
+  fi
+  ancestor=${candidate%/*}
+  [ -n "$ancestor" ] || ancestor=/
+  while :; do
+    protected_directory "$ancestor" || return 1
+    if [ -n "$root_prefix" ] && [ "$ancestor" = "$root_prefix" ]; then break; fi
+    [ "$ancestor" = / ] && break
+    ancestor=${ancestor%/*}
+    [ -n "$ancestor" ] || ancestor=/
+  done
+}
+
+path_identity_mode() {
+  file_mode "$1" | /usr/bin/sed 's/.*\(...\)$/\1/'
+}
+
+# This grammar is shared byte-for-byte with enrollment. It binds the type,
+# owner, mode, contents, and every nested directory, and refuses unsafe
+# ancestors before observing a candidate.
 path_set_digest() {
-  listing=$policy_group_tmp/path-set
+  local listing label candidate member relative answer
+  listing=$policy_group_tmp/path-set.$$
   : >"$listing" || return 1
   while [ "$#" -gt 0 ]; do
     label=$1
     candidate=$2
     shift 2
+    validate_protected_ancestors "$candidate" || { /bin/rm -f "$listing"; return 1; }
     if [ -L "$candidate" ]; then
+      /bin/rm -f "$listing"
       return 1
     elif [ -f "$candidate" ]; then
-      protected_file "$candidate" 33554432 || return 1
-      printf '%s|file|%s\n' "$label" "$(sha256_file "$candidate")" >>"$listing" || return 1
+      protected_file "$candidate" 33554432 || { /bin/rm -f "$listing"; return 1; }
+      printf '%s|file|owner=%s|mode=%s|sha256=%s\n' "$label" "$(file_owner "$candidate")" \
+        "$(path_identity_mode "$candidate")" "$(sha256_file "$candidate")" >>"$listing" || {
+        /bin/rm -f "$listing"
+        return 1
+      }
     elif [ -d "$candidate" ]; then
-      protected_directory "$candidate" || return 1
-      if /usr/bin/find "$candidate" -type l -print | /usr/bin/grep -q .; then return 1; fi
-      if /usr/bin/find "$candidate" ! -type d ! -type f -print | /usr/bin/grep -q .; then return 1; fi
-      printf '%s|directory\n' "$label" >>"$listing" || return 1
+      protected_directory "$candidate" || { /bin/rm -f "$listing"; return 1; }
+      if /usr/bin/find "$candidate" -type l -print | /usr/bin/grep -q . ||
+        /usr/bin/find "$candidate" ! -type d ! -type f -print | /usr/bin/grep -q .; then
+        /bin/rm -f "$listing"
+        return 1
+      fi
+      printf '%s|directory|owner=%s|mode=%s\n' "$label" "$(file_owner "$candidate")" \
+        "$(path_identity_mode "$candidate")" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
       while IFS= read -r member; do
-        protected_file "$member" 33554432 || return 1
-        printf '%s/%s|file|%s\n' "$label" "${member#"$candidate"/}" \
-          "$(sha256_file "$member")" >>"$listing" || return 1
+        protected_directory "$member" || { /bin/rm -f "$listing"; return 1; }
+        relative=${member#"$candidate"/}
+        printf '%s/%s|directory|owner=%s|mode=%s\n' "$label" "$relative" \
+          "$(file_owner "$member")" "$(path_identity_mode "$member")" >>"$listing" || {
+          /bin/rm -f "$listing"
+          return 1
+        }
+      done < <(/usr/bin/find "$candidate" -mindepth 1 -type d -print | /usr/bin/sort)
+      while IFS= read -r member; do
+        protected_file "$member" 33554432 || { /bin/rm -f "$listing"; return 1; }
+        printf '%s/%s|file|owner=%s|mode=%s|sha256=%s\n' "$label" "${member#"$candidate"/}" \
+          "$(file_owner "$member")" "$(path_identity_mode "$member")" \
+          "$(sha256_file "$member")" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
       done < <(/usr/bin/find "$candidate" -type f -print | /usr/bin/sort)
     elif [ ! -e "$candidate" ]; then
-      printf '%s|absent\n' "$label" >>"$listing" || return 1
+      printf '%s|absent\n' "$label" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
     else
+      /bin/rm -f "$listing"
       return 1
     fi
   done
-  sha256_file "$listing"
+  answer=$(sha256_file "$listing") || { /bin/rm -f "$listing"; return 1; }
+  /bin/rm -f "$listing"
+  printf '%s\n' "$answer"
 }
+
+validate_apt_source_authority() {
+  local generation_root=$1 expected_generation=$2 source_file keyring authority release signature
+  local source_uri source_suite source_component signed_by signed_by_path signed_by_fingerprint signed_by_extra
+  local authority_uri authority_suite authority_component publisher_fingerprint
+  local keyring_digest release_digest signature_digest member status_file valid_signature
+  local valid_signer valid_primary signature_rc
+  source_file=$generation_root/apt/sources.list.d/machine-utilities.sources
+  keyring=$generation_root/apt/trusted.gpg.d/fleet.gpg
+  authority=$generation_root/apt/source-authority
+  release=$generation_root/apt/metadata/Release
+  signature=$generation_root/apt/metadata/Release.gpg
+  protected_file "$generation_root/apt/sources.list" 65536 &&
+    exact_mode "$generation_root/apt/sources.list" 644 &&
+    [ "$(file_size "$generation_root/apt/sources.list")" -eq 0 ] &&
+    protected_directory "$generation_root/apt/sources.list.d" &&
+    exact_mode "$generation_root/apt/sources.list.d" 755 &&
+    protected_file "$source_file" 65536 && exact_mode "$source_file" 644 || return 1
+  while IFS= read -r member; do
+    [ "$member" = "$source_file" ] || return 1
+  done < <(/usr/bin/find "$generation_root/apt/sources.list.d" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  /usr/bin/awk -F ': ' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="Types: deb")exit 1;next}
+    NR==2{if(NF!=2||$1!="URIs")exit 1;next}
+    NR==3{if(NF!=2||$1!="Suites"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="Components"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="Signed-By"||$2!~"^/")exit 1;next}
+    NR==6{if($0!="Trusted: no")exit 1;next}
+    {exit 1} END{if(NR!=6)exit 1}
+  ' "$source_file" || return 1
+  source_uri=$(/usr/bin/sed -n '2s/^URIs: //p' "$source_file")
+  https_source_uri "$source_uri" || return 1
+  source_suite=$(/usr/bin/sed -n '3s/^Suites: //p' "$source_file")
+  source_component=$(/usr/bin/sed -n '4s/^Components: //p' "$source_file")
+  signed_by=$(/usr/bin/sed -n '5s/^Signed-By: //p' "$source_file")
+  IFS=' ' read -r signed_by_path signed_by_fingerprint signed_by_extra <<<"$signed_by"
+  [ -z "$signed_by_extra" ] &&
+    [[ $signed_by_fingerprint =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] &&
+    [ "$signed_by_path" = "$expected_generation/apt/trusted.gpg.d/fleet.gpg" ] || return 1
+  case $signed_by_path in "$root_prefix"/*) ;; *) [ -z "$root_prefix" ] || return 1 ;; esac
+  protected_file "$keyring" 33554432 && exact_mode "$keyring" 644 &&
+    protected_file "$authority" 4096 && exact_mode "$authority" 644 &&
+    protected_directory "$generation_root/apt/metadata" && exact_mode "$generation_root/apt/metadata" 755 &&
+    protected_file "$release" 1048576 && exact_mode "$release" 644 &&
+    protected_file "$signature" 1048576 && exact_mode "$signature" 644 || return 1
+  ! /usr/bin/grep -Eq '^ssh-(rsa|dss|ed25519|ecdsa)[[:space:]]' "$keyring" || return 1
+  /usr/bin/awk -F '|' '
+    $0!~/^[ -~]+$/||length($0)>1024{exit 1}
+    NR==1{if($0!="apt-source-authority|2")exit 1;next}
+    NR==2{if(NF!=2||$1!="source-uri")exit 1;next}
+    NR==3{if(NF!=2||$1!="source-suite"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==4{if(NF!=2||$1!="source-component"||$2!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1;next}
+    NR==5{if(NF!=2||$1!="publisher-primary-fingerprint"||$2!~/^([0-9A-F]{40}|[0-9A-F]{64})$/)exit 1;next}
+    NR>=6&&NR<=8{if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    {exit 1} END{if(NR!=8)exit 1}
+  ' "$authority" || return 1
+  [ "$(/usr/bin/awk -F '|' 'NR>=6{printf "%s%s",sep,$1;sep=","}' "$authority")" = \
+    'keyring-sha256,release-sha256,signature-sha256' ] || return 1
+  authority_uri=$(record_value_from "$authority" source-uri)
+  https_source_uri "$authority_uri" || return 1
+  authority_suite=$(record_value_from "$authority" source-suite)
+  authority_component=$(record_value_from "$authority" source-component)
+  publisher_fingerprint=$(record_value_from "$authority" publisher-primary-fingerprint)
+  keyring_digest=$(record_value_from "$authority" keyring-sha256)
+  release_digest=$(record_value_from "$authority" release-sha256)
+  signature_digest=$(record_value_from "$authority" signature-sha256)
+  [ "$authority_uri" = "$source_uri" ] && [ "$authority_suite" = "$source_suite" ] &&
+    [ "$authority_component" = "$source_component" ] &&
+    [ "$publisher_fingerprint" = "$signed_by_fingerprint" ] &&
+    [ "$keyring_digest" = "$(sha256_file "$keyring")" ] &&
+    [ "$release_digest" = "$(sha256_file "$release")" ] &&
+    [ "$signature_digest" = "$(sha256_file "$signature")" ] || return 1
+  /usr/bin/awk -v expected_suite="$source_suite" -v expected_component="$source_component" '
+    $0!~/^[ -~]+$/||length($0)>4096{exit 1}
+    /^Suite: / {
+      suite_count++; value=substr($0,index($0,": ")+2)
+      if(suite_count!=1||value!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+      if(value==expected_suite)matches_distribution++
+    }
+    /^Codename: / {
+      codename_count++; value=substr($0,index($0,": ")+2)
+      if(codename_count!=1||value!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+      if(value==expected_suite)matches_distribution++
+    }
+    /^Components: / {
+      components_count++; value=substr($0,length("Components: ")+1)
+      count=split(value,component,/ +/); if(count<1||count>128)exit 1
+      for(i=1;i<=count;i++){
+        if(component[i]!~/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)exit 1
+        if(component[i]==expected_component)matches++
+      }
+    }
+    END{if(suite_count+codename_count<1||matches_distribution!=1||components_count!=1||matches!=1)exit 1}
+  ' "$release" || return 1
+  status_file=$policy_group_tmp/gpgv-status.$$
+  : >"$status_file" && /bin/chmod 0600 "$status_file" || return 1
+  if /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$root_prefix/usr/bin/gpgv" --status-fd 3 --keyring "$keyring" "$signature" "$release" \
+      3>"$status_file" >/dev/null 2>&1; then signature_rc=0
+  else signature_rc=$?
+  fi
+  [ "$signature_rc" -eq 0 ] && protected_file "$status_file" 65536 && exact_mode "$status_file" 600 || {
+    /bin/rm -f "$status_file"
+    return 1
+  }
+  valid_signature=$(/usr/bin/awk '
+    $0!~/^[ -~]+$/||length($0)>4096{exit 1}
+    $1=="[GNUPG:]"&&$2=="VALIDSIG" {count++; signer=$3; primary=(NF>=12?$NF:$3)}
+    END{if(count!=1)exit 1;print signer"|"primary}
+  ' "$status_file") || { /bin/rm -f "$status_file"; return 1; }
+  /bin/rm -f "$status_file"
+  IFS='|' read -r valid_signer valid_primary <<<"$valid_signature"
+  [[ $valid_signer =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] &&
+    [[ $valid_primary =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] &&
+    [ "$valid_primary" = "$publisher_fingerprint" ]
+}
+
+validate_apt_source_authority "$generation" "$generation" || reject apt_source_authority_drift
+readonly source_authority=$generation/apt/source-authority
+authoritative_source_uri=$(record_value_from "$source_authority" source-uri) || reject apt_source_authority_drift
+authoritative_source_suite=$(record_value_from "$source_authority" source-suite) || reject apt_source_authority_drift
+authoritative_source_component=$(record_value_from "$source_authority" source-component) || reject apt_source_authority_drift
+authoritative_publisher_fingerprint=$(record_value_from "$source_authority" publisher-primary-fingerprint) ||
+  reject apt_source_authority_drift
+source_authority_digest=$(sha256_file "$source_authority") || reject apt_source_authority_drift
+authoritative_source_binding_digest=$(printf 'apt-source|2|%s|%s|%s|%s|%s\n' \
+  "$authoritative_source_uri" "$authoritative_source_suite" "$authoritative_source_component" \
+  "$authoritative_publisher_fingerprint" "$source_authority_digest" | sha256_stream) ||
+  reject apt_source_authority_drift
 
 sources_actual=$(path_set_digest source-main "$generation/apt/sources.list" \
   source-parts "$generation/apt/sources.list.d") || reject apt_source_drift
@@ -928,15 +1657,45 @@ installed_state_snapshot() {
 candidate_snapshot() {
   inspected_package=$1
   candidate_file=$policy_group_tmp/candidate
+  candidate_metadata_file=$policy_group_tmp/candidate.metadata
   "${clean_env[@]}" "$apt_cache_path" policy "$inspected_package" >"$candidate_file" 2>/dev/null || return 1
-  candidate_version=$(/usr/bin/awk '/^[[:space:]]*Candidate:[[:space:]]/ {print $2;exit}' "$candidate_file")
+  [ "$(file_size "$candidate_file")" -le 1048576 ] || return 1
+  candidate_version=$(/usr/bin/awk '/^[[:space:]]*Candidate:[[:space:]]/ {if(found++)exit 1;value=$2}
+    END{if(found!=1)exit 1;print value}' "$candidate_file") || return 1
   [[ $candidate_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || return 1
   candidate_source_line=$(/usr/bin/awk -v version="$candidate_version" '
     ($1==version)||($1=="***"&&$2==version) { selected=1; next }
-    selected && $1~/^[0-9]+$/ { $1=$1; print; exit }
-  ' "$candidate_file")
-  [ -n "$candidate_source_line" ] || return 1
-  candidate_source_digest=$(printf '%s\n' "$candidate_source_line" | sha256_stream)
+    selected && $1~/^[0-9]+$/ { if(found++)exit 1; $1=$1; value=$0; selected=0 }
+    END{if(found!=1)exit 1;print value}
+  ' "$candidate_file") || return 1
+  IFS=' ' read -r candidate_priority candidate_uri candidate_distribution candidate_architecture \
+    candidate_packages candidate_extra <<<"$candidate_source_line"
+  uint "$candidate_priority" && https_source_uri "$candidate_uri" &&
+    [ "$candidate_uri" = "$authoritative_source_uri" ] &&
+    [ "$candidate_distribution" = "$authoritative_source_suite/$authoritative_source_component" ] &&
+    [ "$candidate_architecture" = "$apt_architecture" ] && [ "$candidate_packages" = Packages ] &&
+    [ -z "$candidate_extra" ] || return 1
+  "${clean_env[@]}" "$apt_cache_path" show --no-all-versions \
+    "$inspected_package=$candidate_version" >"$candidate_metadata_file" 2>/dev/null || return 1
+  [ "$(file_size "$candidate_metadata_file")" -le 1048576 ] || return 1
+  candidate_metadata=$(/usr/bin/awk -F ': ' '
+    $0!~/^[ -~]*$/||length($0)>4096{exit 1}
+    $1=="Package"{if(package_seen++)exit 1;package=$2}
+    $1=="Version"{if(version_seen++)exit 1;version=$2}
+    $1=="Architecture"{if(architecture_seen++)exit 1;architecture=$2}
+    $1=="SHA256"{if(digest_seen++)exit 1;digest=tolower($2)}
+    END{if(package_seen!=1||version_seen!=1||architecture_seen!=1||digest_seen!=1)exit 1;
+      print package"|"version"|"architecture"|"digest}
+  ' "$candidate_metadata_file") || return 1
+  IFS='|' read -r candidate_package candidate_metadata_version candidate_metadata_architecture \
+    candidate_artifact_digest <<<"$candidate_metadata"
+  [ "$candidate_package" = "$inspected_package" ] &&
+    [ "$candidate_metadata_version" = "$candidate_version" ] &&
+    [ "$candidate_metadata_architecture" = "$apt_architecture" ] && digest "$candidate_artifact_digest" || return 1
+  candidate_source_digest=$authoritative_source_binding_digest
+  candidate_metadata_digest=$(printf 'package-metadata|2|%s|%s|%s|%s|%s\n' \
+    "$candidate_package" "$candidate_version" "$apt_architecture" "$candidate_artifact_digest" \
+    "$candidate_source_digest" | sha256_stream) || return 1
 }
 
 source_identity_matches() {
@@ -948,12 +1707,57 @@ source_identity_matches() {
 
 closure_snapshot() {
   destination=$1
-  shift
-  raw_closure=$policy_group_tmp/closure.raw
+  require_actions=$2
+  shift 2
+  raw_closure=$policy_group_tmp/closure.raw.$$
+  normalized_closure=$policy_group_tmp/closure.normalized.$$
   "${clean_env[@]}" "$apt_get_path" --quiet=2 --simulate "$@" >"$raw_closure" 2>/dev/null || return 1
-  /usr/bin/awk '/^(Inst|Conf|Remv)[[:space:]]/ {print}' "$raw_closure" >"$destination" || return 1
-  [ -s "$destination" ] && ! /usr/bin/grep -Eq '^Remv[[:space:]]' "$destination" || return 1
+  [ "$(file_size "$raw_closure")" -le 1048576 ] || return 1
+  /usr/bin/awk '
+    $0!~/^[ -~]*$/||length($0)>4096{exit 1}
+    $1=="Remv"{exit 1}
+    $1=="Inst"||$1=="Conf"{
+      kind=$1; package=$2
+      if(package!~/^[A-Za-z0-9][A-Za-z0-9.+:-]{0,255}$/)exit 1
+      version=""
+      for(i=3;i<=NF;i++)if($i~/^\(/){version=$i;sub(/^\(/,"",version);sub(/\)$/,"",version);break}
+      if(version!~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/)exit 1
+      key=kind SUBSEP package
+      if(seen[key]++||((package in package_version)&&package_version[package]!=version))exit 1
+      package_version[package]=version
+      if(kind=="Inst")installed[package]=1;else configured[package]=1
+    }
+    END{
+      for(package in package_version){
+        if(!installed[package]||!configured[package])exit 1
+        print package"|"package_version[package]
+      }
+    }
+  ' "$raw_closure" >"$normalized_closure" || return 1
+  /usr/bin/sort "$normalized_closure" >"$destination" || return 1
+  if [ "$require_actions" = required ]; then [ -s "$destination" ] || return 1
+  else [ ! -s "$destination" ] || return 1
+  fi
   sha256_file "$destination"
+}
+
+verify_dependency_closure() {
+  local closure_file=$1 closure_package closure_version post_closure=$policy_group_tmp/closure.post
+  [ -s "$closure_file" ] || return 1
+  while IFS='|' read -r closure_package closure_version; do
+    atom "$closure_package" && [[ $closure_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || return 1
+    [ "$(installed_version "$closure_package")" = "$closure_version" ] || return 1
+  done <"$closure_file"
+  case $action_id in
+    apt.install-package-version.v1)
+      closure_snapshot "$post_closure" empty --no-remove --no-install-recommends install "$artifact_path" >/dev/null
+      ;;
+    apt.upgrade-package.v1)
+      closure_snapshot "$post_closure" empty --no-remove --only-upgrade \
+        install "$package_id=$exact_version" >/dev/null
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 compute_preflight() {
@@ -974,8 +1778,10 @@ compute_preflight() {
       installed_before=$(installed_version "$package_id") || return 1
       [ "$installed_before" = - ] || return 1
       candidate_snapshot "$package_id" || return 1
+      metadata_digest=$candidate_metadata_digest
       [ "$candidate_version" = "$exact_version" ] &&
         source_identity_matches "$source_id" "$candidate_source_digest" || return 1
+      [ "$candidate_artifact_digest" = "$artifact_digest" ] || return 1
       artifact_path=$generation/apt/artifacts/$policy_token.deb
       protected_file "$artifact_path" 33554432 &&
         [ "$(sha256_file "$artifact_path")" = "$artifact_digest" ] || return 1
@@ -984,17 +1790,19 @@ compute_preflight() {
       [ "$artifact_fields" = "Package: $package_id
 Version: $exact_version
 Architecture: $apt_architecture" ] || return 1
-      observed_closure=$(closure_snapshot "$policy_group_tmp/closure" --no-remove \
+      observed_closure=$(closure_snapshot "$policy_group_tmp/closure" required --no-remove \
         --no-install-recommends install "$artifact_path") || return 1
       [ "$observed_closure" = "$closure_digest" ] || return 1
-      derived_argv="/usr/bin/apt-get --quiet=2 --yes --no-remove --no-install-recommends install $artifact_path"
-      fresh_precondition_digest=$(printf 'install|%s|absent|%s|%s|%s|%s\n' "$package_id" \
-        "$exact_version" "$source_id" "$artifact_digest" "$observed_closure" | sha256_stream)
+      closure_members_digest=$observed_closure
+      fresh_precondition_digest=$(printf 'install|2|%s|absent|%s|%s|%s|%s|%s\n' "$package_id" \
+        "$exact_version" "$source_id" "$candidate_metadata_digest" "$artifact_digest" \
+        "$observed_closure" | sha256_stream)
       ;;
     apt.upgrade-package.v1)
       installed_before=$(installed_version "$package_id") || return 1
       [ "$installed_before" != - ] || return 1
       candidate_snapshot "$package_id" || return 1
+      metadata_digest=$candidate_metadata_digest
       "${clean_env[@]}" "$dpkg_path" --compare-versions "$installed_before" lt "$candidate_version" &&
         "${clean_env[@]}" "$dpkg_path" --compare-versions "$candidate_version" ge "$minimum_version" &&
         "${clean_env[@]}" "$dpkg_path" --compare-versions "$candidate_version" le "$maximum_version" || return 1
@@ -1002,13 +1810,14 @@ Architecture: $apt_architecture" ] || return 1
       candidate_major=${candidate_without_epoch%%.*}
       uint "$candidate_major" && [ "$candidate_major" -le "$major_ceiling" ] || return 1
       source_identity_matches "$source_id" "$candidate_source_digest" || return 1
-      observed_closure=$(closure_snapshot "$policy_group_tmp/closure" --no-remove --only-upgrade \
+      observed_closure=$(closure_snapshot "$policy_group_tmp/closure" required --no-remove --only-upgrade \
         install "$package_id=$candidate_version") || return 1
       [ "$observed_closure" = "$closure_digest" ] || return 1
       exact_version=$candidate_version
-      derived_argv="/usr/bin/apt-get --quiet=2 --yes --no-remove --only-upgrade install $package_id=$exact_version"
-      fresh_precondition_digest=$(printf 'upgrade|%s|%s|%s|%s|%s|%s\n' "$package_id" \
-        "$installed_before" "$candidate_version" "$source_id" "$major_ceiling" "$observed_closure" | sha256_stream)
+      closure_members_digest=$observed_closure
+      fresh_precondition_digest=$(printf 'upgrade|2|%s|%s|%s|%s|%s|%s|%s\n' "$package_id" \
+        "$installed_before" "$candidate_version" "$source_id" "$candidate_metadata_digest" \
+        "$major_ceiling" "$observed_closure" | sha256_stream)
       ;;
   esac
 }
@@ -1019,44 +1828,101 @@ Architecture: $apt_architecture" ] || return 1
 compute_preflight || reject apt_precondition_unavailable
 [ "$fresh_precondition_digest" = "$requested_precondition_digest" ] || reject precondition_drift
 sealed_precondition_digest=$fresh_precondition_digest
+sealed_apt_context_digest=$(sha256_file "$apt_context") || reject apt_context_digest_unavailable
 
-durable_sync() {
-  /bin/sync -f "$1" 2>/dev/null || /bin/sync
+revalidate_execution_snapshot() {
+  local revalidated_target revalidated_dump
+  [ ! -e "$state_root/draining" ] || return 1
+  [ -L "$active_link" ] || return 1
+  revalidated_target=$(/usr/bin/readlink "$active_link") || return 1
+  [ "$revalidated_target" = "$active_target" ] || return 1
+  protected_directory "$generation" && protected_file "$policy" 65536 &&
+    protected_file "$constraints" 65536 && protected_file "$apt_config" 65536 &&
+    protected_file "$apt_context" 65536 && protected_file "$source_identities" 65536 || return 1
+  [ "$(sha256_file "$policy")" = "$actual_policy_digest" ] &&
+    [ "$(sha256_file "$constraints")" = "$actual_constraints_digest" ] &&
+    [ "$(sha256_file "$context_canary")" = "$actual_context_digest" ] &&
+    [ "$(sha256_file "$apt_context")" = "$sealed_apt_context_digest" ] &&
+    [ "$(sha256_file "$apt_config")" = "$apt_config_digest" ] || return 1
+  validate_apt_source_authority "$generation" "$generation" || return 1
+  [ "$(path_set_digest source-main "$generation/apt/sources.list" source-parts "$generation/apt/sources.list.d")" = "$sources_digest" ] &&
+    [ "$(path_set_digest trusted-main "$generation/apt/trusted.gpg" trusted-parts "$generation/apt/trusted.gpg.d")" = "$keyrings_digest" ] &&
+    [ "$(path_set_digest preferences-main "$generation/apt/preferences" preferences-parts "$generation/apt/preferences.d")" = "$preferences_digest" ] &&
+    [ "$(path_set_digest methods "$methods_path")" = "$methods_digest" ] &&
+    [ "$(path_set_digest gzip "$root_prefix/usr/bin/gzip" xz "$root_prefix/usr/bin/xz" \
+      bzip2 "$root_prefix/usr/bin/bzip2" lz4 "$root_prefix/usr/bin/lz4" zstd "$root_prefix/usr/bin/zstd")" = "$compressors_digest" ] &&
+    [ "$(path_set_digest apt-helper "$root_prefix/usr/lib/apt/apt-helper" \
+      apt-solvers "$root_prefix/usr/lib/apt/solvers" apt-planners "$root_prefix/usr/lib/apt/planners" \
+      gpgv "$root_prefix/usr/bin/gpgv")" = "$helpers_digest" ] || return 1
+  [ "$(sha256_file "$source_identities")" = "$source_identities_digest" ] &&
+    [ "$(sha256_file "$apt_get_path")" = "$apt_get_digest" ] &&
+    [ "$(sha256_file "$apt_config_path")" = "$apt_config_binary_digest" ] &&
+    [ "$(sha256_file "$apt_cache_path")" = "$apt_cache_digest" ] &&
+    [ "$(sha256_file "$dpkg_path")" = "$dpkg_digest" ] &&
+    [ "$(sha256_file "$dpkg_query_path")" = "$dpkg_query_digest" ] &&
+    [ "$(sha256_file "$dpkg_deb_path")" = "$dpkg_deb_digest" ] &&
+    [ "$(sha256_file "$setsid_path")" = "$setsid_digest" ] || return 1
+  revalidated_dump=$policy_group_tmp/apt.revalidated.$$
+  "${clean_env[@]}" "$apt_config_path" dump >"$revalidated_dump" 2>/dev/null &&
+    [ "$(file_size "$revalidated_dump")" -le 1048576 ] &&
+    [ "$(sha256_file "$revalidated_dump")" = "$effective_config_digest" ] || return 1
+  compute_preflight && [ "$fresh_precondition_digest" = "$sealed_precondition_digest" ] &&
+    [ "$fresh_precondition_digest" = "$requested_precondition_digest" ]
 }
+
+request_digest=$(sha256_file "$request_tmp") || reject request_digest_unavailable 74
+certificate_digest=$(sha256_file "$certificate_tmp") || reject certificate_digest_unavailable 74
+signature_digest=$(sha256_file "$signature_tmp") || reject signature_digest_unavailable 74
+source_addresses_digest=$(printf '%s\n' "$requested_source_addresses" | sha256_stream) ||
+  reject request_digest_unavailable 74
+action_evidence_digest=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  "$action_id" "$policy_token" "$constraint_kind" "$package_id" "$source_id" "$exact_version" \
+  "$minimum_version" "$maximum_version" "$major_ceiling" "$requested_manager_identity" | sha256_stream) ||
+  reject action_evidence_unavailable 74
+closure_members_digest=${closure_members_digest:--}
 
 render_journal() {
   destination=$1
   journal_state=$2
   journal_reason=$3
+  rendered_sequence=$4
   {
-    printf 'result|1\nbroker-protocol|%s\nstate|%s\nreason|%s\nrequest-id|%s\nplan-id|%s\n' \
-      "$broker_protocol" "$journal_state" "$journal_reason" "$request_id" "$plan_id"
-    printf 'action-id|%s\noriginating-node-id|%s\nnode-key-fingerprint|%s\n' \
-      "$action_id" "$node_id" "$requested_node_fingerprint"
-    printf 'certificate-serial|%s\nfleet-ca-fingerprint|%s\nca-generation|%s\n' \
-      "$requested_certificate_serial" "$requested_ca_fingerprint" "$requested_ca_generation"
-    printf 'transport|%s\nrequest-principal|%s\nrequired-context|%s\n' \
-      "$transport" "$request_principal" "$required_context"
-    printf 'observed-execution-principal|root\nconsole-session-state|none\nplatform-boundary|linux\n'
-    printf 'enrollment-epoch|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
-      "$active_epoch" "$actual_policy_digest" "$actual_constraints_digest"
-    printf 'context-canary-sha256|%s\nbroker-sha256|%s\nprecondition-sha256|%s\n' \
-      "$actual_context_digest" "$actual_broker_digest" "$requested_precondition_digest"
-    printf 'manager-source-identity|%s\nderived-argv|%s\n' "$requested_manager_identity" "$derived_argv"
-    printf 'constraint-kind|%s\npackage-id|%s\nsource-id|%s\nexact-version|%s\n' \
-      "$constraint_kind" "$package_id" "$source_id" "$exact_version"
-    printf 'minimum-version|%s\nmaximum-version|%s\nmajor-ceiling|%s\n' \
-      "$minimum_version" "$maximum_version" "$major_ceiling"
-    printf 'artifact-sha256|%s\nclosure-sha256|%s\nmetadata-sha256|%s\n' \
-      "$artifact_digest" "$closure_digest" "$metadata_digest"
-    printf 'pre-state-sha256|%s\npost-state-sha256|%s\nautoremove-pre-sha256|%s\n' \
-      "$pre_state_digest" "$post_state_digest" "$autoremove_pre_digest"
-    printf 'autoremove-post-sha256|%s\n' "$autoremove_post_digest"
+    printf 'journal|2\nsequence|%s\nstate|%s\nreason|%s\neffect-phase|%s\nretain-until|%s\n' \
+      "$rendered_sequence" "$journal_state" "$journal_reason" "$effect_phase" "$retain_until"
+    printf 'request-id|%s\nplan-id|%s\naction-id|%s\nbroker-protocol|%s\n' \
+      "$request_id" "$plan_id" "$action_id" "$requested_protocol"
+    printf 'target-host-id|%s\ntarget-uid|%s\nbroker-version|%s\n' \
+      "$target_host_id" "$target_uid" "$requested_broker_version"
+    printf 'broker-sha256|%s\npolicy-sha256|%s\nconstraints-sha256|%s\nprecondition-sha256|%s\n' \
+      "$actual_broker_digest" "$actual_policy_digest" "$actual_constraints_digest" "$requested_precondition_digest"
+    printf 'created-at|%s\nexpires-at|%s\ntransport|%s\nrequest-principal|%s\nrequired-context|%s\n' \
+      "$created_at" "$expires_at" "$transport" "$request_principal" "$required_context"
+    printf 'observed-execution-principal|%s\nconsole-session-state|%s\nplatform-boundary|%s\n' \
+      "$observed_execution_principal" "$console_session_state" "$platform_boundary"
+    printf 'enrollment-epoch|%s\ncontext-canary-sha256|%s\npinned-host-key-fingerprint|%s\n' \
+      "$active_epoch" "$actual_context_digest" "$pinned_host_key_fingerprint"
+    printf 'originating-node-id|%s\nfleet-domain|%s\nfleet-ca-fingerprint|%s\nca-generation|%s\n' \
+      "$node_id" "$fleet_domain" "$requested_ca_fingerprint" "$requested_ca_generation"
+    printf 'node-key-fingerprint|%s\ncertificate-serial|%s\ncertificate-valid-after|%s\ncertificate-valid-before|%s\n' \
+      "$requested_node_fingerprint" "$requested_certificate_serial" "$requested_valid_after" "$requested_valid_before"
+    printf 'source-addresses-sha256|%s\nmanager-source-identity|%s\n' \
+      "$source_addresses_digest" "$requested_manager_identity"
+    printf 'request-sha256|%s\ncertificate-sha256|%s\nsignature-sha256|%s\naction-evidence-sha256|%s\n' \
+      "$request_digest" "$certificate_digest" "$signature_digest" "$action_evidence_digest"
+    printf 'launch-record-sha256|%s\nnative-pid|%s\nnative-pgid|%s\nnative-process-start|%s\n' \
+      "$launch_record_digest" "$native_pid" "$native_pgid" "$native_start"
+    printf 'native-boot|%s\nnative-exit|%s\nmetadata-sha256|%s\npre-state-sha256|%s\n' \
+      "$admission_boot" "$native_exit" "$metadata_digest" "$pre_state_digest"
+    printf 'post-state-sha256|%s\nartifact-sha256|%s\nclosure-sha256|%s\nclosure-members-sha256|%s\nend-journal|\n' \
+      "$post_state_digest" "$artifact_digest" "$closure_digest" "$closure_members_digest"
   } >"$destination"
 }
 
 compact_claims() {
   capacity_limit=$((max_claims - reserved_claim_slots))
+  if [ "$fixture_mode" = true ] && [[ ${MACHINE_UTILITIES_U2_CLAIM_CAPACITY:-} =~ ^[1-9][0-9]{0,3}$ ]]; then
+    capacity_limit=$MACHINE_UTILITIES_U2_CLAIM_CAPACITY
+  fi
   claim_count=0
   for existing_claim in "$replay_root"/request-*; do
     [ -e "$existing_claim" ] || continue
@@ -1070,15 +1936,12 @@ compact_claims() {
     [ -d "$existing_claim" ] || continue
     existing_tombstone=$existing_claim/tombstone
     existing_journal=$existing_claim/journal
-    protected_file "$existing_tombstone" 2048 && protected_file "$existing_journal" 65536 ||
-      reject replay_state_drift
-    IFS='|' read -r tombstone_kind tombstone_version tombstone_request tombstone_until \
-      tombstone_epoch tombstone_state <"$existing_tombstone" || reject replay_state_drift
-    [ "$tombstone_kind" = tombstone ] && [ "$tombstone_version" = 1 ] &&
-      [ "$tombstone_request" = "${existing_claim##*/}" ] && uint "$tombstone_until" &&
-      uint "$tombstone_epoch" && [[ $tombstone_state =~ ^(completed|partial|rejected|stale)$ ]] ||
-      continue
+    tombstone_valid "$existing_tombstone" "${existing_claim##*/}" &&
+      canonical_journal_valid "$existing_journal" || reject replay_state_drift
+    IFS='|' read -r _ _ _ tombstone_until _ _ <"$existing_tombstone" || reject replay_state_drift
     [ "$tombstone_until" -le "$now" ] || continue
+    existing_state=$(journal_value "$existing_journal" state) || reject replay_state_drift
+    case $existing_state in completed|partial|rejected|stale) ;; *) continue ;; esac
     compacted=$replay_root/.compacting-${existing_claim##*/}-$$
     [ ! -e "$compacted" ] && /bin/mv "$existing_claim" "$compacted" || reject replay_compaction_failed 74
     /bin/rm -f "$journal_root/${existing_claim##*/}.result" || reject replay_compaction_failed 74
@@ -1090,60 +1953,144 @@ compact_claims() {
 
 retain_until=$((expires_at + max_clock_skew))
 journal=$journal_root/$request_id.result
+claim_stage_failpoint() {
+  local point=$1
+  [ "$fixture_mode" = true ] && [ "${MACHINE_UTILITIES_U2_CLAIM_FAIL_AT:-}" = "$point" ] || return 0
+  reject claim_reservation_failed 74
+}
 create_claim() {
+  local claim_candidate
   [ ! -e "$replay_root/$request_id" ] || reject replayed_request
   compact_claims
-  claim_stage=$replay_root/.claim-$request_id-$$
-  [ ! -e "$claim_stage" ] || reject claim_staging_collision 74
-  /bin/mkdir "$claim_stage" || reject claim_reservation_failed 74
+  claim_candidate=$replay_root/.claim-$request_id-$$
+  [ ! -e "$claim_candidate" ] && [ ! -L "$claim_candidate" ] || reject claim_staging_collision 74
+  claim_stage=$claim_candidate
+  claim_stage_failpoint before-mkdir
+  if ! /bin/mkdir "$claim_stage"; then
+    claim_stage=
+    reject claim_reservation_failed 74
+  fi
   /bin/chmod 0700 "$claim_stage" || reject claim_reservation_failed 74
+  claim_stage_failpoint after-mkdir
   /bin/cp "$request_tmp" "$claim_stage/request" &&
     /bin/cp "$certificate_tmp" "$claim_stage/certificate" &&
     /bin/cp "$signature_tmp" "$claim_stage/signature" || reject claim_reservation_failed 74
+  claim_stage_failpoint after-copy
   [ "$(sha256_file "$claim_stage/request")" = "$(sha256_file "$request_tmp")" ] ||
     reject claim_copy_mismatch 74
-  printf 'tombstone|1|%s|%s|%s|validating\n' "$request_id" "$retain_until" "$active_epoch" \
-    >"$claim_stage/tombstone" || reject claim_reservation_failed 74
+  printf 'tombstone|2|%s|%s|%s|%s\n' "$request_id" "$retain_until" "$active_epoch" \
+    "$request_digest" >"$claim_stage/tombstone" || reject claim_reservation_failed 74
   printf 'audit-reservation|1|%s|%s|%s|%s\n' "$request_id" "$plan_id" "$action_id" "$node_id" \
     >"$claim_stage/audit.reservation" || reject claim_reservation_failed 74
-  render_journal "$claim_stage/journal" validating claim_reserved || reject claim_reservation_failed 74
-  /bin/chmod 0600 "$claim_stage/request" "$claim_stage/certificate" "$claim_stage/signature" \
-    "$claim_stage/tombstone" "$claim_stage/audit.reservation" "$claim_stage/journal" ||
+  /bin/dd if=/dev/zero of="$claim_stage/terminal.reserve" bs=1024 count=$((terminal_reserve_bytes / 1024)) \
+    >/dev/null 2>&1 || reject terminal_reservation_failed 74
+  claim_stage_failpoint after-reserve
+  journal_sequence=1
+  render_journal "$claim_stage/journal" validating claim_reserved "$journal_sequence" ||
     reject claim_reservation_failed 74
-  durable_sync "$claim_stage/journal"
-  durable_sync "$claim_stage"
+  /bin/chmod 0600 "$claim_stage/request" "$claim_stage/certificate" "$claim_stage/signature" \
+    "$claim_stage/tombstone" "$claim_stage/audit.reservation" "$claim_stage/terminal.reserve" \
+    "$claim_stage/journal" ||
+    reject claim_reservation_failed 74
+  durable_sync "$claim_stage/journal" || reject claim_reservation_failed 74
+  durable_sync "$claim_stage" || reject claim_reservation_failed 74
+  claim_stage_failpoint before-rename
   [ ! -e "$replay_root/$request_id" ] || reject replayed_request
   /bin/mv "$claim_stage" "$replay_root/$request_id" || reject claim_reservation_failed 74
+  claim_stage=
   durable_sync "$replay_root"
   claim_directory=$replay_root/$request_id
-  protected_directory "$claim_directory" && protected_file "$claim_directory/tombstone" 2048 &&
-    protected_file "$claim_directory/journal" 65536 || reject claim_reservation_failed 74
+  protected_directory "$claim_directory" && tombstone_valid "$claim_directory/tombstone" "$request_id" &&
+    canonical_journal_valid "$claim_directory/journal" &&
+    protected_file "$claim_directory/terminal.reserve" "$terminal_reserve_bytes" &&
+    [ "$(file_size "$claim_directory/terminal.reserve")" -eq "$terminal_reserve_bytes" ] ||
+    reject claim_reservation_failed 74
 }
 
-update_tombstone() {
-  tombstone_state=$1
-  tombstone_tmp=$claim_directory/.tombstone.$$
-  printf 'tombstone|1|%s|%s|%s|%s\n' "$request_id" "$retain_until" "$active_epoch" \
-    "$tombstone_state" >"$tombstone_tmp" && /bin/chmod 0600 "$tombstone_tmp" &&
-    durable_sync "$tombstone_tmp" && /bin/mv -f "$tombstone_tmp" "$claim_directory/tombstone" &&
-    durable_sync "$claim_directory"
-}
-
-write_journal() {
+write_journal_once() {
   journal_state=$1
   journal_reason=$2
   canonical_tmp=$claim_directory/.journal.$$
-  result_tmp=$journal_root/.$request_id.$$
-  render_journal "$canonical_tmp" "$journal_state" "$journal_reason" &&
-    /bin/chmod 0600 "$canonical_tmp" && durable_sync "$canonical_tmp" &&
+  render_journal "$canonical_tmp" "$journal_state" "$journal_reason" "$journal_sequence" &&
+    /bin/chmod 0600 "$canonical_tmp" && canonical_journal_valid "$canonical_tmp" &&
+    durable_sync "$canonical_tmp" &&
     /bin/mv -f "$canonical_tmp" "$claim_directory/journal" && durable_sync "$claim_directory" || return 1
-  /bin/cp "$claim_directory/journal" "$result_tmp" && /bin/chmod 0600 "$result_tmp" &&
-    [ "$(sha256_file "$result_tmp")" = "$(sha256_file "$claim_directory/journal")" ] &&
-    durable_sync "$result_tmp" && /bin/mv -f "$result_tmp" "$journal" && durable_sync "$journal_root" || return 1
-  case $journal_state in completed|partial|rejected|stale) update_tombstone "$journal_state" || return 1 ;; esac
+  repair_result_projection "$claim_directory/journal" "$journal"
 }
 
-readonly public_root=$root_prefix/var/lib/machine-utilities-public
+write_journal() {
+  local journal_state=$1 journal_reason=$2 terminal=false
+  if [ -n "$claim_directory" ] && canonical_journal_valid "$claim_directory/journal" 2>/dev/null; then
+    absorbing_state=$(journal_value "$claim_directory/journal" state) || return 1
+    case $absorbing_state in
+      completed|partial|rejected|stale)
+        [ "$absorbing_state" = "$journal_state" ] || return 1
+        repair_result_projection "$claim_directory/journal" "$journal"
+        return
+        ;;
+    esac
+  fi
+  journal_sequence=$((journal_sequence + 1))
+  case $journal_state in completed|partial|rejected|stale) terminal=true ;; esac
+  if ! write_journal_once "$journal_state" "$journal_reason"; then
+    [ "$terminal" = true ] && [ -f "$claim_directory/terminal.reserve" ] || return 1
+    /bin/rm -f "$claim_directory/terminal.reserve" && durable_sync "$claim_directory" || return 1
+    write_journal_once "$journal_state" "$journal_reason" || return 1
+  fi
+  if [ "$terminal" = true ] && [ -f "$claim_directory/terminal.reserve" ]; then
+    /bin/rm -f "$claim_directory/terminal.reserve" && durable_sync "$claim_directory" || return 1
+  fi
+}
+
+audit_event_valid() {
+  local candidate=$1 expected_request=$2
+  protected_file "$candidate" 16384 &&
+    /usr/bin/awk -F '|' -v request="$expected_request" '
+      BEGIN { key[1]="audit-event";key[2]="observed-at";key[3]="request-id";key[4]="plan-id"
+        key[5]="action-id";key[6]="originating-node-id";key[7]="request-sha256"
+        key[8]="auth-evidence-sha256";key[9]="action-evidence-sha256"
+        key[10]="precondition-sha256";key[11]="terminal-reserve-bytes";key[12]="end-audit" }
+      $0!~/^[ -~]*$/||length($0)>2048||NF!=2||$1!=key[NR]{exit 1}
+      NR==1{if($2!="2")exit 1}
+      NR==2||NR==11{if($2!~/^(0|[1-9][0-9]{0,19})$/)exit 1}
+      NR==3{if($2!=request)exit 1}
+      NR>=7&&NR<=10{if(length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1}
+      NR==12{if($2!="")exit 1}
+      END{if(NR!=12)exit 1}
+    ' "$candidate"
+}
+
+repair_audit_projection() (
+  local capacity=$1 projection_tmp existing_claim event observed event_request event_plan event_action
+  local event_node event_request_digest event_digest projection_status=0
+  projection_tmp=$audit_root/.events.$$
+  trap 'projection_status=$?; [ -z "$projection_tmp" ] || /bin/rm -f "$projection_tmp" 2>/dev/null || true; exit "$projection_status"' EXIT
+  : >"$projection_tmp" || return 1
+  for existing_claim in "$replay_root"/request-*; do
+    [ -e "$existing_claim" ] || continue
+    [[ ${existing_claim##*/} =~ ^request-[0-9a-f]{32}$ ]] && protected_directory "$existing_claim" || return 1
+    event=$existing_claim/audit.event
+    [ -e "$event" ] || continue
+    audit_event_valid "$event" "${existing_claim##*/}" || return 1
+    observed=$(record_value_from "$event" observed-at) || return 1
+    event_request=$(record_value_from "$event" request-id) || return 1
+    event_plan=$(record_value_from "$event" plan-id) || return 1
+    event_action=$(record_value_from "$event" action-id) || return 1
+    event_node=$(record_value_from "$event" originating-node-id) || return 1
+    event_request_digest=$(record_value_from "$event" request-sha256) || return 1
+    event_digest=$(sha256_file "$event") || return 1
+    printf 'audit|2|%s|%s|%s|%s|%s|%s|%s\n' "$observed" "$event_request" "$event_plan" \
+      "$event_action" "$event_node" "$event_request_digest" "$event_digest" >>"$projection_tmp" || return 1
+  done
+  [ "$(file_size "$projection_tmp")" -le "$capacity" ] || return 2
+  if [ -e "$audit_root/events.log" ]; then
+    [ ! -d "$audit_root/events.log" ] && [ ! -L "$audit_root/events.log" ] || return 1
+  fi
+  /bin/chmod 0600 "$projection_tmp" && durable_sync "$projection_tmp" &&
+    /bin/mv -f "$projection_tmp" "$audit_root/events.log" && durable_sync "$audit_root" || return 1
+  projection_tmp=
+)
+
 ensure_public_root() {
   if [ ! -e "$public_root" ]; then
     /bin/mkdir "$public_root" && /bin/chmod 0755 "$public_root" || return 1
@@ -1167,26 +2114,55 @@ publish_public() {
 claim_failure() {
   failure_reason=$1
   failure_code=${2:-65}
-  native_started=false
-  write_journal rejected "$failure_reason" || true
-  publish_public rejected "$failure_reason" last || true
+  if [ -n "$claim_directory" ] && canonical_journal_valid "$claim_directory/journal" 2>/dev/null; then
+    existing_terminal_state=$(journal_value "$claim_directory/journal" state) || existing_terminal_state=
+    case $existing_terminal_state in
+      completed|partial|rejected|stale)
+        repair_result_projection "$claim_directory/journal" "$journal" || true
+        existing_terminal_reason=$(journal_value "$claim_directory/journal" reason || true)
+        [ -z "$existing_terminal_reason" ] ||
+          publish_public "$existing_terminal_state" "$existing_terminal_reason" last || true
+        /bin/rm -f "$public_root/active" 2>/dev/null || true
+        /bin/cat "$claim_directory/journal"
+        return_code=$failure_code
+        release_admission || true
+        exit "$return_code"
+        ;;
+    esac
+  fi
+  case $effect_phase in
+    none|launch-blocked) failure_state=rejected ;;
+    possible|exited|verified) failure_state=partial ;;
+    *) failure_state=partial ;;
+  esac
+  if ! write_journal "$failure_state" "$failure_reason"; then
+    if [ -f "$claim_directory/journal" ]; then /bin/cat "$claim_directory/journal"
+    else result "$failure_state" "$failure_reason"
+    fi
+    exit 74
+  fi
+  publish_public "$failure_state" "$failure_reason" last || true
   /bin/rm -f "$public_root/active" 2>/dev/null || true
+  native_started=false
   release_admission || true
   if [ -f "$claim_directory/journal" ]; then /bin/cat "$claim_directory/journal"
-  else result rejected "$failure_reason"
+  else result "$failure_state" "$failure_reason"
   fi
   exit "$failure_code"
 }
 
 update_admission() {
   admission_state=$1
-  admission_native_pid=${2:--}
-  admission_native_pgid=${3:--}
-  admission_native_start=${4:--}
+  admission_effect=${2:-none}
+  admission_native_pid=${3:--}
+  admission_native_pgid=${4:--}
+  admission_native_start=${5:--}
+  admission_launch_digest=${6:--}
   admission_tmp=$lock_root/active/.admission.$$
-  printf 'admission|1|%s|%s|%s|%s|%s|%s|%s|%s\n' "$request_id" "$$" "$broker_start" \
+  printf 'admission|2|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$request_id" "$$" "$broker_start" \
     "$admission_native_pid" "$admission_native_pgid" "$admission_native_start" \
-    "$admission_boot" "$admission_state" >"$admission_tmp" && /bin/chmod 0600 "$admission_tmp" &&
+    "$admission_boot" "$admission_state" "$admission_effect" "$active_epoch" \
+    "$admission_launch_digest" >"$admission_tmp" && /bin/chmod 0600 "$admission_tmp" &&
     durable_sync "$admission_tmp" && /bin/mv -f "$admission_tmp" "$lock_root/active/admission" &&
     durable_sync "$lock_root/active"
 }
@@ -1195,73 +2171,155 @@ update_admission() {
 # closes the enrollment drain race, and the following directory rename is the
 # unified replay, journal, and audit reservation.
 acquire_admission
+fixture_pause after-admission || { release_admission || true; reject fixture_pause_failed 74; }
+if ! revalidate_execution_snapshot; then
+  release_admission || true
+  reject execution_snapshot_changed_after_admission
+fi
 create_claim
-update_admission claimed || claim_failure admission_record_failed 74
+update_admission claimed none || claim_failure admission_record_failed 74
 write_journal validating audit_pending || claim_failure journal_write_failed 74
 publish_public validating claim_reserved active || claim_failure public_record_write_failed 74
 
-audit_log=$audit_root/events.log
-if [ ! -e "$audit_log" ]; then
-  audit_stage=$audit_root/.events.$$
-  : >"$audit_stage" && /bin/chmod 0600 "$audit_stage" && /bin/mv "$audit_stage" "$audit_log" ||
-    claim_failure audit_write_failed 74
+audit_capacity_limit=$max_audit_bytes
+if [ "$fixture_mode" = true ] && [[ ${MACHINE_UTILITIES_U2_AUDIT_CAPACITY_BYTES:-} =~ ^[1-9][0-9]{0,9}$ ]]; then
+  audit_capacity_limit=$MACHINE_UTILITIES_U2_AUDIT_CAPACITY_BYTES
 fi
-protected_file "$audit_log" 10485760 || claim_failure audit_write_failed 74
-printf 'audit|1|%s|%s|%s|%s|%s|%s\n' "$now" "$request_id" "$plan_id" "$action_id" \
-  "$node_id" "$(sha256_file "$claim_directory/request")" >>"$audit_log" ||
+audit_event_tmp=$claim_directory/.audit.event.$$
+{
+  printf 'audit-event|2\nobserved-at|%s\nrequest-id|%s\nplan-id|%s\naction-id|%s\n' \
+    "$now" "$request_id" "$plan_id" "$action_id"
+  printf 'originating-node-id|%s\nrequest-sha256|%s\nauth-evidence-sha256|%s\n' \
+    "$node_id" "$request_digest" \
+    "$(printf '%s|%s|%s|%s\n' "$certificate_digest" "$signature_digest" \
+      "$requested_node_fingerprint" "$requested_certificate_serial" | sha256_stream)"
+  printf 'action-evidence-sha256|%s\nprecondition-sha256|%s\nterminal-reserve-bytes|%s\nend-audit|\n' \
+    "$action_evidence_digest" "$sealed_precondition_digest" "$terminal_reserve_bytes"
+} >"$audit_event_tmp" && /bin/chmod 0600 "$audit_event_tmp" &&
+  durable_sync "$audit_event_tmp" && /bin/mv -f "$audit_event_tmp" "$claim_directory/audit.event" &&
+  durable_sync "$claim_directory" || claim_failure audit_write_failed 74
+protected_file "$claim_directory/audit.event" 16384 || claim_failure audit_write_failed 74
+audit_projection_rc=0
+repair_audit_projection "$audit_capacity_limit" || audit_projection_rc=$?
+if [ "$audit_projection_rc" -ne 0 ]; then
+  [ "$audit_projection_rc" -eq 2 ] && claim_failure audit_capacity_exhausted 75
   claim_failure audit_write_failed 74
-durable_sync "$audit_log"
-
-compute_preflight || claim_failure apt_precondition_changed
-[ "$fresh_precondition_digest" = "$sealed_precondition_digest" ] &&
-  [ "$fresh_precondition_digest" = "$requested_precondition_digest" ] ||
-  claim_failure precondition_changed_after_claim
-
-write_journal executing native_launch_committed || claim_failure journal_write_failed 74
-publish_public executing native_launch_committed active || claim_failure public_record_write_failed 74
-
-native_arguments=(--quiet=2)
-case $action_id in
-  apt.update-metadata.v1) native_arguments+=(update) ;;
-  apt.autoremove.v1) native_arguments+=(--yes autoremove) ;;
-  apt.install-package-version.v1)
-    native_arguments+=(--yes --no-remove --no-install-recommends install "$artifact_path")
-    ;;
-  apt.upgrade-package.v1)
-    native_arguments+=(--yes --no-remove --only-upgrade install "$package_id=$exact_version")
-    ;;
-esac
-
-native_rc=0
-if [ "$fixture_mode" = true ]; then
-  "${clean_env[@]}" "$apt_get_path" "${native_arguments[@]}" &
-else
-  "${clean_env[@]}" "$setsid_path" --wait "$apt_get_path" "${native_arguments[@]}" &
 fi
+
+fixture_pause after-claim-audit || claim_failure fixture_pause_failed 74
+revalidate_execution_snapshot || claim_failure execution_snapshot_changed_after_claim
+
+gate_token=$(printf '%s|%s|%s|%s|%s\n' "$request_id" "$$" "$now" "$request_digest" "$admission_boot" |
+  sha256_stream) || claim_failure launch_gate_unavailable 74
+gate_digest=$(printf '%s\n' "$gate_token" | sha256_stream) || claim_failure launch_gate_unavailable 74
+launch_record_tmp=$claim_directory/.launch.record.$$
+{
+  printf 'launch-record|1\nrequest-id|%s\naction-id|%s\npolicy-token|%s\n' \
+    "$request_id" "$action_id" "$policy_token"
+  printf 'generation-target|%s\nenrollment-epoch|%s\nbroker-sha256|%s\n' \
+    "$active_target" "$active_epoch" "$actual_broker_digest"
+  printf 'policy-sha256|%s\nconstraints-sha256|%s\napt-context-sha256|%s\n' \
+    "$actual_policy_digest" "$actual_constraints_digest" "$sealed_apt_context_digest"
+  printf 'precondition-sha256|%s\naction-evidence-sha256|%s\nexact-version|%s\ngate-sha256|%s\nend-launch|\n' \
+    "$sealed_precondition_digest" "$action_evidence_digest" "$exact_version" "$gate_digest"
+} >"$launch_record_tmp" && /bin/chmod 0600 "$launch_record_tmp" &&
+  durable_sync "$launch_record_tmp" && /bin/mv -f "$launch_record_tmp" "$claim_directory/launch.record" &&
+  durable_sync "$claim_directory" || claim_failure launch_record_write_failed 74
+protected_file "$claim_directory/launch.record" 8192 || claim_failure launch_record_write_failed 74
+launch_record_digest=$(sha256_file "$claim_directory/launch.record") || claim_failure launch_record_write_failed 74
+
+launch_gate=$claim_directory/launch.gate
+/usr/bin/mkfifo -m 0600 "$launch_gate" || claim_failure launch_gate_unavailable 74
+exec 8<>"$launch_gate" || claim_failure launch_gate_unavailable 74
+launch_guard_open=true
+# The child opens its own read-only descriptor while its inherited guard keeps
+# the FIFO open. It then closes the guard, so parent death always produces EOF;
+# the child never retains a writer that can strand it before the effect gate.
+"$setsid_path" "$broker_path" --internal-launch-v1 "$request_id" \
+  9<"$launch_gate" 8>&- &
 native_pid=$!
 native_pgid=$native_pid
 native_started=true
-native_start=$(process_start_identity "$native_pid" 2>/dev/null || true)
-if ! digest "$native_start"; then native_start=-; fi
-update_admission executing "$native_pid" "$native_pgid" "$native_start" || true
+exec 9>"$launch_gate" || {
+  terminate_blocked_native || true
+  claim_failure launch_gate_unavailable 74
+}
+launch_writer_open=true
+exec 8>&-
+launch_guard_open=false
+native_start=-
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  native_start=$(process_start_identity "$native_pid" 2>/dev/null || true)
+  digest "$native_start" && break
+  /bin/kill -0 "$native_pid" 2>/dev/null || break
+  /bin/sleep 0.05
+done
+if ! digest "$native_start"; then
+  terminate_blocked_native || true
+  claim_failure native_identity_unavailable 74
+fi
+effect_phase=launch-blocked
+if ! update_admission launch-blocked launch-blocked "$native_pid" "$native_pgid" "$native_start" \
+    "$launch_record_digest"; then
+  terminate_blocked_native || true
+  claim_failure admission_record_failed 74
+fi
+if ! write_journal executing native_launch_blocked ||
+  ! publish_public executing native_launch_blocked active; then
+  terminate_blocked_native || true
+  claim_failure launch_block_record_failed 74
+fi
+fixture_pause launch-blocked || {
+  terminate_blocked_native || true
+  claim_failure fixture_pause_failed 74
+}
+if ! revalidate_execution_snapshot; then
+  terminate_blocked_native || true
+  claim_failure execution_snapshot_changed_before_effect
+fi
+fixture_pause before-effect-gate || {
+  terminate_blocked_native || true
+  claim_failure fixture_pause_failed 74
+}
+if ! revalidate_execution_snapshot; then
+  terminate_blocked_native || true
+  claim_failure execution_snapshot_changed_at_effect_gate
+fi
+effect_phase=possible
+update_admission executing possible "$native_pid" "$native_pgid" "$native_start" "$launch_record_digest" || {
+  terminate_blocked_native || true
+  claim_failure admission_record_failed 74
+}
+write_journal executing native_effect_possible || claim_failure journal_write_failed 74
+publish_public executing native_effect_possible active || claim_failure public_record_write_failed 74
+fixture_pause effect-possible || {
+  terminate_blocked_native || true
+  claim_failure fixture_pause_failed 74
+}
+launch_gate_released=true
+if ! printf '%s\n' "$gate_token" >&9; then
+  launch_gate_released=false
+  terminate_blocked_native || true
+  claim_failure launch_gate_release_failed 74
+fi
+cleanup_launch_gate || claim_failure launch_gate_cleanup_failed 74
+
+native_rc=0
 set +e
 wait "$native_pid"
 native_rc=$?
 set -e
-while group_live "$native_pgid"; do /bin/sleep 1; done
+while group_identity_live "$native_pgid" "$native_start"; do /bin/sleep 1; done
 native_started=false
-update_admission verifying "$native_pid" "$native_pgid" "$native_start" ||
+native_exit=$native_rc
+effect_phase=exited
+update_admission verifying exited "$native_pid" "$native_pgid" "$native_start" "$launch_record_digest" ||
   claim_failure admission_record_failed 74
 write_journal verifying native_operation_exited || claim_failure journal_write_failed 74
 publish_public verifying native_operation_exited active || claim_failure public_record_write_failed 74
 
 if [ "$native_rc" -ne 0 ]; then
-  write_journal partial native_operation_failed || true
-  publish_public partial native_operation_failed last || true
-  /bin/rm -f "$public_root/active" 2>/dev/null || true
-  release_admission || true
-  /bin/cat "$claim_directory/journal"
-  exit 70
+  claim_failure native_operation_failed 70
 fi
 
 post_reason=post_state_verified
@@ -1278,8 +2336,12 @@ case $action_id in
       if /usr/bin/grep -Eq '^(Inst|Remv)[[:space:]]' "$policy_group_tmp/autoremove.post"; then
         post_reason=autoremove_post_state_mismatch
       else
-        post_state_digest=$(installed_state_snapshot "$policy_group_tmp/installed.post") ||
+        installed_post_digest=$(installed_state_snapshot "$policy_group_tmp/installed.post") ||
           post_reason=autoremove_post_state_unavailable
+        if [ "$post_reason" = post_state_verified ]; then
+          post_state_digest=$(printf 'autoremove-post|2|%s|%s\n' "$autoremove_post_digest" \
+            "$installed_post_digest" | sha256_stream)
+        fi
       fi
     fi
     ;;
@@ -1287,21 +2349,22 @@ case $action_id in
     installed_after=$(installed_version "$package_id") || post_reason=package_post_state_unavailable
     [ "$post_reason" != post_state_verified ] || [ "$installed_after" = "$exact_version" ] ||
       post_reason=package_post_state_mismatch
+    [ "$post_reason" != post_state_verified ] ||
+      verify_dependency_closure "$policy_group_tmp/closure" || post_reason=dependency_closure_post_state_mismatch
     if [ "$post_reason" = post_state_verified ]; then
-      post_state_digest=$(printf 'package|%s|%s\n' "$package_id" "$installed_after" | sha256_stream)
+      post_state_digest=$(printf 'package-closure|2|%s|%s|%s\n' "$package_id" "$installed_after" \
+        "$closure_members_digest" | sha256_stream)
     fi
     ;;
 esac
 
 if [ "$post_reason" != post_state_verified ]; then
-  write_journal partial "$post_reason" || true
-  publish_public partial "$post_reason" last || true
-  /bin/rm -f "$public_root/active" 2>/dev/null || true
-  release_admission || true
-  /bin/cat "$claim_directory/journal"
-  exit 70
+  claim_failure "$post_reason" 70
 fi
 
+effect_phase=verified
+update_admission verifying verified "$native_pid" "$native_pgid" "$native_start" "$launch_record_digest" ||
+  claim_failure admission_record_failed 74
 write_journal completed post_state_verified || claim_failure journal_write_failed 74
 publish_public completed post_state_verified last || claim_failure public_record_write_failed 74
 /bin/rm -f "$public_root/active" || claim_failure public_record_write_failed 74

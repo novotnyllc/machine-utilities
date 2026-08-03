@@ -444,6 +444,12 @@ case ${1:-} in
   git)
     [ "$#" -eq 4 ] && [ "${2:-}" = -- ] && [ "${3:-}" = pull ] &&
       [ "${4:-}" = --ff-only ] || exit 64
+    # A successful pull fixture materializes the source tree just as the real
+    # chezmoi command does. Earlier partial-inventory coverage removes it.
+    source_path="$HOME/.local/share/chezmoi"
+    mkdir -p "$(dirname "$source_path")"
+    [ -d "$source_path/.git" ] ||
+      "$REAL_GIT" clone -q -- "$GIT_CLONE_FIXTURE" "$source_path" || exit
     : >"$CHEZMOI_PULL_MARKER"
     ;;
   *) exit 64 ;;
@@ -630,7 +636,7 @@ mkdir -p "$plugin_cache"
 cp -R "$script_dir/../." "$plugin_cache/"
 chmod -R go-w "$plugin_cache"
 case ${MACHINE_UTILITIES_TEST_SCOPE:-} in
-  u1-characterization|u1-contracts)
+  u1-characterization|u1-contracts|u4-contracts|u5-contracts)
     "$plugin_cache/scripts/update-integrity"
     cli="$plugin_cache/scripts/machine-utilities"
     ;;
@@ -639,6 +645,16 @@ printf '%s\n' 2.50.0 >"$BREW_STATE_FILE"
 printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 printf '%s\n' 2.0.0 >"$CLAUDE_STATE_FILE"
 printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
+
+[ "${MACHINE_UTILITIES_TEST_SCOPE:-}" != chezmoi-fixture ] || {
+  rm -rf "$HOME/.local/share/chezmoi"
+  "$tmp/bin/chezmoi" git -- pull --ff-only
+  "$REAL_GIT" -C "$HOME/.local/share/chezmoi" rev-parse --verify HEAD >/dev/null &&
+    [ -e "$CHEZMOI_PULL_MARKER" ] ||
+    fail "successful chezmoi pull fixture did not materialize its source state"
+  printf 'PASS: chezmoi pull fixture\n'
+  exit 0
+}
 
 test_u2_contracts() {
   broker="$script_dir/privilege-broker-posix"
@@ -759,6 +775,7 @@ test_u2_contracts() {
       "$u2_root/var/lib/machine-utilities-public/active" \
       "$u2_root/var/lib/machine-utilities-public/last" \
       "$u2_root/etc/machine-utilities/generations" \
+      "$u2_root/var/lib/machine-utilities/revocation.reserve" \
       "$u2_root/var/lib/machine-utilities/draining" \
       "$u2_root/var/lib/machine-utilities/rollback" \
       "$u2_root/var/lib/machine-utilities/quarantine" \
@@ -845,11 +862,13 @@ test_u2_contracts() {
     pause_fixture_survivor=false
     while IFS= read -r pause_process_line; do
       case $pause_process_line in
-        *enroll-privilege-posix*"$u2_root"*) pause_fixture_survivor=true ;;
+        *enroll-privilege-posix*"$u2_root"*|*privilege-broker-posix*"$u2_root"*)
+          pause_fixture_survivor=true
+          ;;
       esac
     done < <(ps -axo pid=,command=)
     [ "$pause_fixture_survivor" = false ] ||
-      fail "U2 paused enrollment process survived for the fixture root"
+      fail "U2 paused lifecycle process survived for the fixture root"
     rm -f "$pause_marker" "$pause_marker.continue" "$pause_marker.kill"
   }
 
@@ -857,22 +876,47 @@ test_u2_contracts() {
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-release-key"
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-fleet-ca"
   "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-node-key"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-node-b-key"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-node-renewed-key"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-rotated-fleet-ca"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-rotated-node-key"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-host-node-key"
   "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-a@fleet.example' -z 41 \
     -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
     -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
     "$tmp/u2-node-key.pub"
+  "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-b@fleet.example' -z 43 \
+    -n 'node-b@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
+    "$tmp/u2-node-b-key.pub"
+  "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-a@fleet.example' -z 44 \
+    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
+    "$tmp/u2-node-renewed-key.pub"
+  "$ssh_keygen" -q -s "$tmp/u2-rotated-fleet-ca" -I 'node-a@fleet.example' -z 45 \
+    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
+    "$tmp/u2-rotated-node-key.pub"
+  "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -h -I 'node-a@fleet.example' -z 42 \
+    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    "$tmp/u2-host-node-key.pub"
   awk 'NR==1{print "machine-utilities-release "$0}' "$tmp/u2-release-key.pub" \
     >"$u2_bootstrap/release-allowed-signers"
-  awk 'NR==1{print "node-a@fleet.example cert-authority "$0}' "$tmp/u2-fleet-ca.pub" \
-    >"$u2_build/allowed_signers"
+  {
+    awk 'NR==1{print "node-a@fleet.example cert-authority "$0}' "$tmp/u2-fleet-ca.pub"
+    awk 'NR==1{print "node-b@fleet.example cert-authority "$0}' "$tmp/u2-fleet-ca.pub"
+  } >"$u2_build/allowed_signers"
   cp "$tmp/u2-fleet-ca.pub" "$u2_build/fleet-ca.pub"
   : >"$u2_build/revoked.krl"
 
   cat >"$u2_root/usr/bin/apt-get" <<SH
 #!/bin/sh
 printf '%s|%s\n' "\$0" "\$*" >>'$apt_marker'
-case " \$* " in
-  *' --simulate '*) printf '%s\n' 'Inst fixture-package (1.2.3 fixture [fixture])' 'Conf fixture-package (1.2.3 fixture [fixture])' ;;
+case "\$*" in
+  '--quiet=2 --simulate autoremove')
+    [ -e '$apt_marker.autoremove-done' ] || printf '%s\n' 'Remv fixture-unused [1.0]' ;;
+  '--quiet=2 --yes autoremove') : >'$apt_marker.autoremove-done' ;;
+  *'--simulate'*) printf '%s\n' 'Inst fixture-package (1.2.3 fixture [fixture])' 'Conf fixture-package (1.2.3 fixture [fixture])' ;;
 esac
 exit 0
 SH
@@ -902,6 +946,10 @@ esac
 SH
   cat >"$u2_root/usr/bin/dpkg-query" <<'SH'
 #!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = -W ] && {
+  printf '%s\n' 'base-files|1.0|ii '
+  exit 0
+}
 exit 1
 SH
   cat >"$u2_root/usr/bin/dpkg-deb" <<'SH'
@@ -1823,6 +1871,18 @@ EOF
   [ -f "$u2_root/var/lib/machine-utilities-public/enrollment" ] &&
     [ -f "$u2_root/var/lib/machine-utilities-public/canary" ] ||
     fail "U2 enrollment did not create public status before the first request"
+  u2_revocation_reserve="$u2_root/var/lib/machine-utilities/revocation.reserve"
+  u2_reserve_size=$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")
+  u2_reserve_blocks=$(stat -f %b "$u2_revocation_reserve" 2>/dev/null || stat -c %b "$u2_revocation_reserve")
+  u2_reserve_device=$(stat -f %d "$u2_revocation_reserve" 2>/dev/null || stat -c %d "$u2_revocation_reserve")
+  u2_state_device=$(stat -f %d "$u2_root/var/lib/machine-utilities" 2>/dev/null || \
+    stat -c %d "$u2_root/var/lib/machine-utilities")
+  [ "$u2_reserve_size" -eq 4194304 ] && [ $((u2_reserve_blocks * 512)) -ge 1048576 ] &&
+    [ "$u2_reserve_device" = "$u2_state_device" ] ||
+    fail "U2 enrollment did not allocate a real same-filesystem revocation reserve"
+  [ "$(sed -n '1p' "$u2_generation/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] &&
+    [ "$(wc -l <"$u2_generation/ssh-keygen.sha256" | tr -d ' ')" = 1 ] ||
+    fail "U2 enrollment did not bind the absolute system ssh-keygen into the generation"
   [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
     [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
   [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
@@ -1855,11 +1915,6 @@ EOF
   u2_broker_digest=$(u2_sha256 "$broker")
   u2_constraints_digest=$(u2_sha256 "$u2_root/etc/machine-utilities/generations/1/policy.constraints")
   u2_context_digest=$(u2_sha256 "$u2_root/etc/machine-utilities/generations/1/context.canary")
-  u2_node_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-node-key-cert.pub" -E sha256 | awk 'NR==1{print $2}')
-  u2_valid_after=$(TZ=UTC "$ssh_keygen" -Lf "$tmp/u2-node-key-cert.pub" |
-    awk '/Valid: from/{gsub(/[-:]/,"",$3);print $3"Z"}')
-  u2_valid_before=$(TZ=UTC "$ssh_keygen" -Lf "$tmp/u2-node-key-cert.pub" |
-    awk '/Valid: from/{gsub(/[-:]/,"",$5);print $5"Z"}')
   u2_metadata_digest=$(printf '%s\n' 'metadata|1' | u2_sha256_stream)
   u2_precondition_digest=$(printf 'metadata|%s\n' "$u2_metadata_digest" | u2_sha256_stream)
   u2_make_envelope() {
@@ -1870,24 +1925,42 @@ EOF
     envelope_node=${5:-node-a}
     envelope_token=${6:--}
     envelope_manager=${7:-not-applicable}
+    envelope_protocol=${8:-1}
+    envelope_plan=${9:-plan-0123456789abcdef}
+    envelope_certificate=${10:-$tmp/u2-node-key-cert.pub}
+    envelope_precondition=${11:-$u2_precondition_digest}
+    envelope_epoch=${12:-1}
+    envelope_ca_fingerprint=${13:-${u2_request_ca_fingerprint:-$u2_ca_fingerprint}}
+    envelope_ca_generation=${14:-${u2_request_ca_generation:-1}}
+    envelope_node_fingerprint=$("$ssh_keygen" -lf "$envelope_certificate" -E sha256 | awk 'NR==1{print $2}')
+    envelope_serial=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" | awk '/Serial:/{print $2;exit}')
+    envelope_valid_after=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" |
+      awk '/Valid: from/{gsub(/[-:]/,"",$3);print $3"Z"}')
+    envelope_valid_before=$(TZ=UTC "$ssh_keygen" -Lf "$envelope_certificate" |
+      awk '/Valid: from/{gsub(/[-:]/,"",$5);print $5"Z"}')
     request_suffix=${envelope_request_id#request-}
     request_file="$tmp/u2-request-$request_suffix"
     signature_file="$request_file.sig"
     envelope_file="$tmp/u2-envelope-$request_suffix"
+    rm -f "$signature_file"
+    [ ! -e "$signature_file" ] || fail "U2 signature output collision could not be removed"
+    envelope_private=${envelope_certificate%-cert.pub}
+    [ "$envelope_private" != "$envelope_certificate" ] && [ -f "$envelope_private" ] ||
+      fail "U2 certificate did not resolve to its fixture-private sibling"
     cat >"$request_file" <<EOF
 request|1
 target-host-id|test-apt
 target-uid|$u2_uid
-plan-id|plan-0123456789abcdef
+plan-id|$envelope_plan
 request-id|$envelope_request_id
 action-id|$envelope_action
 policy-token|$envelope_token
-broker-protocol|1
-broker-version|1.0.0
+broker-protocol|$envelope_protocol
+broker-version|${u2_request_broker_version:-1.0.0}
 broker-sha256|$u2_broker_digest
 policy-sha256|$u2_policy_digest
 constraints-sha256|$u2_constraints_digest
-precondition-sha256|$u2_precondition_digest
+precondition-sha256|$envelope_precondition
 created-at|$envelope_created
 expires-at|$envelope_expiry
 transport|posix-ssh
@@ -1896,26 +1969,26 @@ required-context|posix-root-v1
 observed-execution-principal|root
 console-session-state|none
 platform-boundary|linux
-enrollment-epoch|1
+enrollment-epoch|$envelope_epoch
 context-canary-sha256|$u2_context_digest
 pinned-host-key-fingerprint|$u2_host_fingerprint
 node-id|$envelope_node
 fleet-domain|fleet.example
-fleet-ca-fingerprint|$u2_ca_fingerprint
-ca-generation|1
-node-key-fingerprint|$u2_node_fingerprint
-certificate-serial|41
-certificate-valid-after|$u2_valid_after
-certificate-valid-before|$u2_valid_before
+fleet-ca-fingerprint|$envelope_ca_fingerprint
+ca-generation|$envelope_ca_generation
+node-key-fingerprint|$envelope_node_fingerprint
+certificate-serial|$envelope_serial
+certificate-valid-after|$envelope_valid_after
+certificate-valid-before|$envelope_valid_before
 certificate-source-addresses|-
 manager-source-identity|$envelope_manager
 end-request|
 EOF
-    "$ssh_keygen" -Y sign -f "$tmp/u2-node-key-cert.pub" -n machine-utilities-request \
+    SSH_AUTH_SOCK='' "$ssh_keygen" -Y sign -f "$envelope_certificate" -n machine-utilities-request \
       "$request_file" >/dev/null
     {
       cat "$request_file"
-      printf 'certificate|%s\nsignature-begin\n' "$(sed -n '1p' "$tmp/u2-node-key-cert.pub")"
+      printf 'certificate|%s\nsignature-begin\n' "$(sed -n '1p' "$envelope_certificate")"
       cat "$signature_file"
       printf 'end-envelope\n'
     } >"$envelope_file"
@@ -1923,6 +1996,28 @@ EOF
   }
 
   u2_now=$(date -u +%s)
+  cp -p "$u2_revocation_reserve" "$tmp/u2-revocation-reserve-real"
+  rm -f "$u2_revocation_reserve"
+  /bin/dd if=/dev/zero of="$u2_revocation_reserve" bs=1048576 count=0 seek=4 \
+    >/dev/null 2>&1
+  chmod 600 "$u2_revocation_reserve"
+  u2_sparse_blocks=$(stat -f %b "$u2_revocation_reserve" 2>/dev/null || \
+    stat -c %b "$u2_revocation_reserve")
+  [ $((u2_sparse_blocks * 512)) -lt 1048576 ] || fail "U2 sparse reserve fixture was physically allocated"
+  u2_sparse_reserve=$(u2_make_envelope apt.update-metadata.v1 \
+    request-000000000000000000000000000000f1 "$u2_now" $((u2_now + 300)))
+  u2_expect_rejected revocation_reserve_drift "$u2_sparse_reserve" "$tmp/u2-sparse-reserve"
+  mv "$tmp/u2-revocation-reserve-real" "$u2_revocation_reserve"
+  [ ! -e "$apt_marker" ] || fail "U2 sparse emergency reserve reached native APT"
+
+  u2_ssh_attestation=$(u2_make_envelope apt.update-metadata.v1 \
+    request-000000000000000000000000000000f0 "$u2_now" $((u2_now + 300)))
+  cp -p "$u2_generation/ssh-keygen.sha256" "$tmp/u2-ssh-keygen-attestation"
+  printf '%064d\n' 0 >"$u2_generation/ssh-keygen.sha256"
+  u2_expect_rejected openssh_attestation_drift "$u2_ssh_attestation" "$tmp/u2-ssh-attestation-drift"
+  mv "$tmp/u2-ssh-keygen-attestation" "$u2_generation/ssh-keygen.sha256"
+  [ ! -e "$apt_marker" ] || fail "U2 ssh-keygen attestation drift reached native APT"
+
   u2_happy=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
   if ! APT_EXEC_MARKER="$apt_marker" MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
@@ -1933,8 +2028,12 @@ EOF
   grep -Fqx 'state|completed' "$tmp/u2-happy" || fail "U2 signed fixture did not complete"
   grep -Fqx 'reason|post_state_verified' "$tmp/u2-happy" ||
     fail "U2 fixture did not verify native post-state"
-  grep -Fqx 'derived-argv|/usr/bin/apt-get --quiet=2 update' "$tmp/u2-happy" ||
-    fail "U2 broker did not derive the exact refresh handler"
+  grep -Eq '^action-evidence-sha256\|[0-9a-f]{64}$' "$tmp/u2-happy" &&
+    grep -Fqx 'effect-phase|verified' "$tmp/u2-happy" ||
+    fail "U2 broker omitted fixed action or verified-effect evidence"
+  if grep -Eq 'derived-argv|/usr/|https://|BEGIN (SSH|PGP)|\[GNUPG:\]|VALIDSIG' "$tmp/u2-happy"; then
+    fail "U2 protected result leaked a path, argv, URL, certificate, signature, or verifier status"
+  fi
   grep -Fqx "$u2_root/usr/bin/apt-get|--quiet=2 update" "$apt_marker" ||
     fail "U2 fixture did not execute only the protected fake APT path"
   MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" MACHINE_UTILITIES_IDENTITY="$tmp/u2-no-identity" \
@@ -1954,7 +2053,368 @@ EOF
     "$u2_precondition_digest" ] || fail "U2 collector omitted fresh action precondition evidence"
   rm -f "$apt_marker"
 
-  u2_expect_rejected replayed_request "$u2_happy" "$tmp/u2-replay"
+  u2_canonical="$u2_root/var/lib/machine-utilities/replay/request-00000000000000000000000000000001/journal"
+  u2_projection="$u2_root/var/lib/machine-utilities/journal/request-00000000000000000000000000000001.result"
+  grep -Fqx 'journal|2' "$u2_canonical" &&
+    grep -Fqx 'effect-phase|verified' "$u2_canonical" ||
+    fail "U2 canonical journal did not retain the v2 verified terminal state"
+  u2_query=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
+  cp "$u2_query" "$tmp/u2-query-original-envelope"
+  u2_query="$tmp/u2-query-original-envelope"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query" >"$tmp/u2-query-v1" ||
+    fail "U2 authenticated v1 result query failed"
+  grep -Fqx 'state|completed' "$tmp/u2-query-v1" || fail "U2 v1 query lost the terminal result"
+
+  cp -p "$u2_canonical" "$tmp/u2-current-version-journal"
+  awk -F '|' -v OFS='|' '$1=="broker-version"{$2="0.9.0"}{print}' \
+    "$u2_canonical" >"$tmp/u2-previous-version-journal"
+  mv "$tmp/u2-previous-version-journal" "$u2_canonical"
+  chmod 600 "$u2_canonical"
+  u2_request_broker_version=0.9.0
+  u2_query_previous=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
+  unset u2_request_broker_version
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_previous" \
+    >"$tmp/u2-query-previous-version" ||
+    fail "U2 immediately previous broker-version result query failed"
+  grep -Fqx 'broker-version|0.9.0' "$tmp/u2-query-previous-version" ||
+    fail "U2 previous-version query did not return its canonical authority"
+  mv "$tmp/u2-current-version-journal" "$u2_canonical"
+  cp "$u2_canonical" "$u2_projection"
+  chmod 600 "$u2_projection"
+
+  u2_query_peer=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)) \
+    node-b - not-applicable 1 plan-0123456789abcdef "$tmp/u2-node-b-key-cert.pub")
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_peer" >"$tmp/u2-query-peer" ||
+    fail "U2 enrolled peer could not recover another node's result"
+  grep -Fqx 'originating-node-id|node-a' "$tmp/u2-query-peer" ||
+    fail "U2 peer query did not preserve the journaled originating identity"
+
+  u2_query_renewed=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)) \
+    node-a - not-applicable 1 plan-0123456789abcdef "$tmp/u2-node-renewed-key-cert.pub")
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_renewed" \
+    >"$tmp/u2-query-renewed" || fail "U2 renewed node certificate could not recover an old result"
+
+  cp -p "$u2_root/etc/machine-utilities/trust/fleet-ca.pub" "$tmp/u2-query-old-ca"
+  cp -p "$u2_root/etc/machine-utilities/trust/allowed_signers" "$tmp/u2-query-old-signers"
+  cp -p "$u2_generation/host.identity" "$tmp/u2-query-old-host-identity"
+  u2_rotated_ca_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-rotated-fleet-ca.pub" -E sha256 |
+    awk 'NR==1{print $2}')
+  cp "$tmp/u2-rotated-fleet-ca.pub" "$u2_root/etc/machine-utilities/trust/fleet-ca.pub"
+  awk 'NR==1{print "node-a@fleet.example cert-authority "$0}' "$tmp/u2-rotated-fleet-ca.pub" \
+    >"$u2_root/etc/machine-utilities/trust/allowed_signers"
+  awk -F '|' -v OFS='|' -v ca="$u2_rotated_ca_fingerprint" '{$7=ca;$8=2;print}' \
+    "$u2_generation/host.identity" >"$tmp/u2-query-rotated-host-identity"
+  mv "$tmp/u2-query-rotated-host-identity" "$u2_generation/host.identity"
+  chmod 644 "$u2_generation/host.identity" "$u2_root/etc/machine-utilities/trust/fleet-ca.pub" \
+    "$u2_root/etc/machine-utilities/trust/allowed_signers"
+  u2_request_ca_fingerprint=$u2_rotated_ca_fingerprint
+  u2_request_ca_generation=2
+  u2_query_rotated=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)) \
+    node-a - not-applicable 1 plan-0123456789abcdef "$tmp/u2-rotated-node-key-cert.pub")
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_rotated" \
+    >"$tmp/u2-query-rotated" || fail "U2 rotated-CA certificate could not recover an old result"
+  unset u2_request_ca_fingerprint u2_request_ca_generation
+  mv "$tmp/u2-query-old-ca" "$u2_root/etc/machine-utilities/trust/fleet-ca.pub"
+  mv "$tmp/u2-query-old-signers" "$u2_root/etc/machine-utilities/trust/allowed_signers"
+  mv "$tmp/u2-query-old-host-identity" "$u2_generation/host.identity"
+
+  printf '%s\n' 'forged-result-projection' >"$u2_projection"
+  chmod 600 "$u2_projection"
+  printf '%s\n' 'forged-public-projection' >"$u2_root/var/lib/machine-utilities-public/last"
+  chmod 644 "$u2_root/var/lib/machine-utilities-public/last"
+  u2_terminal_digest=$(u2_sha256 "$u2_canonical")
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query" >"$tmp/u2-query-repair" ||
+    fail "U2 query did not repair forged projections"
+  [ "$(u2_sha256 "$u2_canonical")" = "$u2_terminal_digest" ] &&
+    cmp -s "$u2_canonical" "$u2_projection" &&
+    grep -Fqx 'broker-public|1' "$u2_root/var/lib/machine-utilities-public/last" &&
+    grep -Fqx 'state|completed' "$u2_root/var/lib/machine-utilities-public/last" ||
+    fail "U2 projection repair changed or failed to reproduce terminal authority"
+  if grep -Eq '/usr/|https://|BEGIN (SSH|PGP)|\[GNUPG:\]|VALIDSIG' \
+      "$u2_root/var/lib/machine-utilities-public/last"; then
+    fail "U2 public projection leaked protected execution or authentication material"
+  fi
+
+  u2_boot_identity() {
+    if [ -r /proc/sys/kernel/random/boot_id ]; then sed -n '1p' /proc/sys/kernel/random/boot_id
+    else
+      /usr/sbin/sysctl -n kern.boottime | awk '
+        NR==1 {
+          if ($1!="{" || $2!="sec" || $3!="=" || $5!="usec" || $6!="=" || $8!="}") exit 1
+          sec=$4; sub(/,$/,"",sec); usec=$7
+          if (sec!~/^(0|[1-9][0-9]*)$/ || length(sec)>20 ||
+              usec!~/^(0|[1-9][0-9]*)$/ || length(usec)>6 || usec+0>999999) exit 1
+          print "boot|1|sec=" sec "|usec=" usec
+          found=1
+        }
+        END { if (NR!=1 || !found) exit 1 }
+      '
+    fi | u2_sha256_stream
+  }
+  u2_process_start_identity() {
+    inspected_pid=$1
+    if [ -r "/proc/$inspected_pid/stat" ]; then
+      sed 's/^.*) //' "/proc/$inspected_pid/stat" | awk '{print $20}'
+    else
+      TZ=UTC /bin/ps -o lstart= -p "$inspected_pid"
+    fi | u2_sha256_stream
+  }
+  if [ ! -r /proc/sys/kernel/random/boot_id ]; then
+    u2_boot_raw_utc=$(TZ=UTC /usr/sbin/sysctl -n kern.boottime)
+    u2_boot_raw_local=$(TZ=America/New_York /usr/sbin/sysctl -n kern.boottime)
+    [ "$u2_boot_raw_utc" != "$u2_boot_raw_local" ] ||
+      fail "U2 boot-identity fixture did not exercise timezone-dependent sysctl output"
+    [ "$(TZ=UTC u2_boot_identity)" = "$(TZ=America/New_York u2_boot_identity)" ] ||
+      fail "U2 canonical boot identity depended on the sysctl timezone suffix"
+  fi
+  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
+  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  /bin/sleep 300 &
+  u2_live_admission_pid=$!
+  u2_terminal_launch=$(awk -F '|' '$1=="launch-record-sha256"{print $2}' "$u2_canonical")
+  u2_live_admission_start=$(u2_process_start_identity "$u2_live_admission_pid")
+  [ "$(TZ=UTC u2_process_start_identity "$u2_live_admission_pid")" = \
+    "$(TZ=America/New_York u2_process_start_identity "$u2_live_admission_pid")" ] ||
+    fail "U2 process-start identity depended on the caller timezone"
+  printf 'admission|2|%s|%s|%s|%s|%s|%s|%s|verifying|verified|1|%s\n' \
+    request-00000000000000000000000000000001 "$u2_live_admission_pid" \
+    "$u2_live_admission_start" "$u2_live_admission_pid" "$u2_live_admission_pid" \
+    "$u2_live_admission_start" \
+    "$(u2_boot_identity)" "$u2_terminal_launch" \
+    >"$u2_root/var/lib/machine-utilities/lock/active/admission"
+  chmod 600 "$u2_root/var/lib/machine-utilities/lock/active/admission"
+  kill -0 "$u2_live_admission_pid" 2>/dev/null ||
+    fail "U2 live-admission fixture child was not live immediately before query"
+  [ "$(u2_process_start_identity "$u2_live_admission_pid")" = "$u2_live_admission_start" ] ||
+    fail "U2 live-admission fixture process-start identity changed before query"
+  cp "$u2_root/var/lib/machine-utilities/lock/active/admission" "$tmp/u2-live-admission.before"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+    "$broker" <"$u2_query" >"$tmp/u2-query-live-terminal" ||
+    fail "U2 query rejected completed authority during the release window"
+  [ "$(u2_sha256 "$u2_canonical")" = "$u2_terminal_digest" ] ||
+    fail "U2 live-admission reconciliation rewrote terminal authority"
+  grep -Fqx 'state|completed' "$tmp/u2-query-live-terminal" ||
+    fail "U2 live-admission query did not return completed authority"
+  if [ ! -f "$u2_root/var/lib/machine-utilities/lock/active/admission" ]; then
+    cat "$tmp/u2-live-admission.before" >&2
+    fail "U2 live-admission query removed a proven-live admission"
+  fi
+  kill "$u2_live_admission_pid" 2>/dev/null || true
+  wait "$u2_live_admission_pid" 2>/dev/null || true
+  rm -f "$u2_root/var/lib/machine-utilities/lock/active/admission"
+  [ ! -d "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+    rmdir "$u2_root/var/lib/machine-utilities/lock/active"
+
+  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
+  chmod 700 "$u2_root/var/lib/machine-utilities/lock/active"
+  /bin/sleep 300 &
+  u2_reused_group_pid=$!
+  u2_wrong_start=$(printf '%064d' 0)
+  printf 'admission|2|%s|%s|%s|%s|%s|%s|%s|verifying|verified|1|%s\n' \
+    request-00000000000000000000000000000001 "$u2_reused_group_pid" "$u2_wrong_start" \
+    "$u2_reused_group_pid" "$u2_reused_group_pid" "$u2_wrong_start" \
+    "$(u2_boot_identity)" "$u2_terminal_launch" \
+    >"$u2_root/var/lib/machine-utilities/lock/active/admission"
+  chmod 600 "$u2_root/var/lib/machine-utilities/lock/active/admission"
+  printf 'emergency|1|%s|%s|%s\n' request-00000000000000000000000000000001 \
+    "$u2_reused_group_pid" "$(u2_boot_identity)" \
+    >"$u2_root/var/lib/machine-utilities/emergency-terminate"
+  chmod 600 "$u2_root/var/lib/machine-utilities/emergency-terminate"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query" \
+    >"$tmp/u2-query-reused-group" || fail "U2 reused-group reconciliation rejected the canonical result"
+  kill -0 "$u2_reused_group_pid" 2>/dev/null ||
+    fail "U2 emergency reconciliation signaled a process with mismatched leader start identity"
+  [ ! -e "$u2_root/var/lib/machine-utilities/emergency-terminate" ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+    fail "U2 mismatched leader identity remained live in admission state"
+  kill "$u2_reused_group_pid" 2>/dev/null || true
+  wait "$u2_reused_group_pid" 2>/dev/null || true
+
+  u2_query_v0=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)) \
+    node-a - not-applicable 0)
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_query_v0" >"$tmp/u2-query-v0" ||
+    fail "U2 protocol-0 compatibility query failed"
+  grep -Fqx 'state|completed' "$tmp/u2-query-v0" || fail "U2 protocol-0 query lost canonical state"
+  u2_query_wrong_plan=$(u2_make_envelope broker.query-result.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)) \
+    node-a - not-applicable 1 plan-fedcba9876543210)
+  u2_expect_rejected result_binding_mismatch "$u2_query_wrong_plan" "$tmp/u2-query-wrong-plan"
+
+  u2_v0_mutation=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000009 "$u2_now" $((u2_now + 300)) \
+    node-a - not-applicable 0)
+  u2_expect_rejected unsupported_broker_protocol "$u2_v0_mutation" "$tmp/u2-v0-mutation"
+  [ ! -e "$apt_marker" ] || fail "U2 protocol-0 mutation reached native APT"
+
+  u2_host_certificate=$(u2_make_envelope apt.update-metadata.v1 \
+    request-0000000000000000000000000000000a "$u2_now" $((u2_now + 300)) \
+    node-a - not-applicable 1 plan-0123456789abcdef "$tmp/u2-host-node-key-cert.pub")
+  u2_host_certificate_type=$(/usr/bin/ssh-keygen -Lf "$tmp/u2-host-node-key-cert.pub" |
+    awk '/^[[:space:]]*Type:/ {sub(/^[[:space:]]*/,"");print;count++}
+      END{if(count!=1)exit 1}')
+  [ "$u2_host_certificate_type" = 'Type: ssh-ed25519-cert-v01@openssh.com host certificate' ] ||
+    fail "U2 host-certificate fixture did not prove its certificate type"
+  u2_expect_rejected signature_verification_failed "$u2_host_certificate" "$tmp/u2-host-certificate"
+  [ ! -e "$apt_marker" ] || fail "U2 host certificate reached native APT"
+
+  printf '%s\n' 'torn-audit-fragment' >>"$u2_root/var/lib/machine-utilities/audit/events.log"
+  u2_audit_repair=$(u2_make_envelope apt.update-metadata.v1 \
+    request-0000000000000000000000000000000b "$u2_now" $((u2_now + 300)))
+  APT_EXEC_MARKER="$apt_marker" MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+    "$broker" <"$u2_audit_repair" >"$tmp/u2-audit-repair" ||
+    fail "U2 immutable audit projection repair rejected valid work"
+  ! grep -Fq 'torn-audit-fragment' "$u2_root/var/lib/machine-utilities/audit/events.log" &&
+    grep -Fqx 'state|completed' "$tmp/u2-audit-repair" ||
+    fail "U2 audit projection retained a torn append or lost terminal state"
+  rm -f "$apt_marker"
+
+  u2_capacity=$(u2_make_envelope apt.update-metadata.v1 \
+    request-0000000000000000000000000000000c "$u2_now" $((u2_now + 300)))
+  if MACHINE_UTILITIES_U2_CLAIM_CAPACITY=1 MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+      "$broker" <"$u2_capacity" >"$tmp/u2-capacity" 2>/dev/null; then
+    fail "U2 bounded replay capacity admitted work without a claim slot"
+  fi
+  grep -Fqx 'reason|claim_capacity_exhausted' "$tmp/u2-capacity" ||
+    fail "U2 claim-capacity exhaustion was not explicit"
+  [ ! -e "$apt_marker" ] || fail "U2 capacity exhaustion reached native APT"
+
+  u2_audit_capacity=$(u2_make_envelope apt.update-metadata.v1 \
+    request-0000000000000000000000000000000d "$u2_now" $((u2_now + 300)))
+  if MACHINE_UTILITIES_U2_AUDIT_CAPACITY_BYTES=1 MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+      "$broker" <"$u2_audit_capacity" >"$tmp/u2-audit-capacity" 2>/dev/null; then
+    fail "U2 bounded audit capacity admitted work without projection space"
+  fi
+  grep -Fqx 'reason|audit_capacity_exhausted' "$tmp/u2-audit-capacity" ||
+    fail "U2 audit-capacity exhaustion was not explicit"
+  grep -Fqx 'state|rejected' "$tmp/u2-audit-capacity" && [ ! -e "$apt_marker" ] ||
+    fail "U2 audit-capacity exhaustion lacked a pre-effect terminal record"
+  if find "$u2_root/var/lib/machine-utilities/audit" -mindepth 1 -maxdepth 1 \
+      -name '.events.*' -print | grep -q .; then
+    fail "U2 audit-capacity exhaustion left a projection temporary"
+  fi
+
+  u2_claim_fail_index=0
+  for u2_claim_failpoint in before-mkdir after-mkdir after-copy after-reserve before-rename; do
+    u2_claim_fail_index=$((u2_claim_fail_index + 1))
+    u2_claim_request=$(printf 'request-f%031x' "$u2_claim_fail_index")
+    u2_claim_envelope=$(u2_make_envelope apt.update-metadata.v1 "$u2_claim_request" \
+      "$u2_now" $((u2_now + 300)))
+    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+        MACHINE_UTILITIES_U2_CLAIM_FAIL_AT="$u2_claim_failpoint" \
+        "$broker" <"$u2_claim_envelope" >"$tmp/u2-claim-$u2_claim_failpoint" 2>/dev/null; then
+      fail "U2 injected claim failure completed: $u2_claim_failpoint"
+    fi
+    grep -Fqx 'reason|claim_reservation_failed' "$tmp/u2-claim-$u2_claim_failpoint" &&
+      [ ! -e "$u2_root/var/lib/machine-utilities/replay/$u2_claim_request" ] &&
+      [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+      fail "U2 claim failure did not release its admission: $u2_claim_failpoint"
+    if find "$u2_root/var/lib/machine-utilities/replay" -mindepth 1 -maxdepth 1 \
+        -name '.claim-*' -print | grep -q .; then
+      fail "U2 claim failure left pre-rename staging: $u2_claim_failpoint"
+    fi
+  done
+  [ ! -e "$apt_marker" ] || fail "U2 injected claim failure reached native APT"
+
+  u2_term_request=request-000000000000000000000000000000e5
+  u2_term_envelope=$(u2_make_envelope apt.update-metadata.v1 "$u2_term_request" \
+    "$u2_now" $((u2_now + 300)))
+  u2_pause_marker="$tmp/u2-broker-parent-term"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" MACHINE_UTILITIES_U2_PAUSE_AT=launch-blocked \
+    MACHINE_UTILITIES_U2_PAUSE_MARKER="$u2_pause_marker" \
+    "$broker" <"$u2_term_envelope" >"$tmp/u2-broker-parent-term-result" 2>&1 &
+  u2_pause_job=$!
+  u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-broker-parent-term-result"
+  u2_gate_child=$(awk -F '|' 'NR==1&&$1=="admission"&&$2=="2"{print $6}' \
+    "$u2_root/var/lib/machine-utilities/lock/active/admission")
+  kill -TERM "$u2_pause_job"
+  if wait "$u2_pause_job"; then fail "U2 TERM-interrupted broker reported success"; fi
+  kill -0 "$u2_gate_child" 2>/dev/null && fail "U2 TERM-interrupted broker stranded its gate child"
+  u2_term_claim="$u2_root/var/lib/machine-utilities/replay/$u2_term_request"
+  grep -Fqx 'reason|parent_interrupted_before_native_effect' "$tmp/u2-broker-parent-term-result" &&
+    [ ! -e "$u2_term_claim/launch.gate" ] && [ ! -e "$u2_term_claim/terminal.reserve" ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+    fail "U2 TERM interruption left a gate, reserve, or admission"
+  rm -f "$u2_pause_marker" "$u2_pause_marker.continue" "$u2_pause_marker.kill"
+
+  u2_kill_request=request-000000000000000000000000000000e6
+  u2_kill_envelope=$(u2_make_envelope apt.update-metadata.v1 "$u2_kill_request" \
+    "$u2_now" $((u2_now + 300)))
+  u2_pause_marker="$tmp/u2-broker-parent-kill"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" MACHINE_UTILITIES_U2_PAUSE_AT=launch-blocked \
+    MACHINE_UTILITIES_U2_PAUSE_MARKER="$u2_pause_marker" \
+    "$broker" <"$u2_kill_envelope" >"$tmp/u2-broker-parent-kill-result" 2>&1 &
+  u2_pause_job=$!
+  u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-broker-parent-kill-result"
+  u2_gate_child=$(awk -F '|' 'NR==1&&$1=="admission"&&$2=="2"{print $6}' \
+    "$u2_root/var/lib/machine-utilities/lock/active/admission")
+  kill -KILL "$u2_pause_job"
+  wait "$u2_pause_job" 2>/dev/null || true
+  u2_gate_wait=0
+  while kill -0 "$u2_gate_child" 2>/dev/null && [ "$u2_gate_wait" -lt 50 ]; do
+    sleep 0.1
+    u2_gate_wait=$((u2_gate_wait + 1))
+  done
+  kill -0 "$u2_gate_child" 2>/dev/null && fail "U2 killed parent stranded a self-writing gate child"
+  rm -f "$u2_pause_marker" "$u2_pause_marker.continue" "$u2_pause_marker.kill"
+  u2_kill_query=$(u2_make_envelope broker.query-result.v1 "$u2_kill_request" \
+    "$u2_now" $((u2_now + 300)))
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$u2_kill_query" \
+    >"$tmp/u2-broker-parent-kill-query" || fail "U2 query could not recover a killed pre-effect parent"
+  u2_kill_claim="$u2_root/var/lib/machine-utilities/replay/$u2_kill_request"
+  grep -Fqx 'state|stale' "$tmp/u2-broker-parent-kill-query" &&
+    [ ! -e "$u2_kill_claim/launch.gate" ] && [ ! -e "$u2_kill_claim/terminal.reserve" ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities/lock/active" ] ||
+    fail "U2 killed-parent recovery left a gate, reserve, or admission"
+
+  u2_policy_active="$u2_generation/policy.actions"
+  u2_constraints_active="$u2_generation/policy.constraints"
+  cp -p "$u2_policy_active" "$tmp/u2-autoremove-policy"
+  cp -p "$u2_constraints_active" "$tmp/u2-autoremove-constraints"
+  u2_saved_policy_digest=$u2_policy_digest
+  u2_saved_constraints_digest=$u2_constraints_digest
+  u2_saved_precondition_digest=$u2_precondition_digest
+  sed 's/^action|apt\.autoremove\.v1|posix-root-v1|disabled|none|-$/action|apt.autoremove.v1|posix-root-v1|enabled|none|-/' \
+    "$u2_policy_active" >"$tmp/u2-autoremove-enabled"
+  mv "$tmp/u2-autoremove-enabled" "$u2_policy_active"
+  chmod 644 "$u2_policy_active"
+  u2_policy_digest=$(u2_sha256 "$u2_policy_active")
+  awk -F '|' -v OFS='|' -v digest="$u2_policy_digest" 'NR==1{$4="policy-sha256=" digest}{print}' \
+    "$u2_constraints_active" >"$tmp/u2-autoremove-bound-constraints"
+  mv "$tmp/u2-autoremove-bound-constraints" "$u2_constraints_active"
+  chmod 644 "$u2_constraints_active"
+  u2_constraints_digest=$(u2_sha256 "$u2_constraints_active")
+  u2_autoremove_pre_digest=$(printf '%s\n' 'Remv fixture-unused [1.0]' | u2_sha256_stream)
+  u2_autoremove_state_digest=$(printf '%s\n' 'base-files|1.0|ii ' | u2_sha256_stream)
+  u2_precondition_digest=$(printf 'autoremove|%s|%s\n' "$u2_autoremove_pre_digest" \
+    "$u2_autoremove_state_digest" | u2_sha256_stream)
+  rm -f "$apt_marker" "$apt_marker.autoremove-done"
+  u2_autoremove=$(u2_make_envelope apt.autoremove.v1 \
+    request-000000000000000000000000000000e7 "$u2_now" $((u2_now + 300)))
+  APT_EXEC_MARKER="$apt_marker" MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+    "$broker" <"$u2_autoremove" >"$tmp/u2-autoremove" || {
+      cat "$tmp/u2-autoremove" >&2
+      fail "U2 enabled autoremove did not complete"
+    }
+  grep -Fqx "$u2_root/usr/bin/apt-get|--quiet=2 --yes autoremove" "$apt_marker" &&
+    ! grep -Fq -- '--no-remove autoremove' "$apt_marker" &&
+    grep -Fqx 'state|completed' "$tmp/u2-autoremove" ||
+    fail "U2 autoremove retained the contradictory --no-remove option"
+  mv "$tmp/u2-autoremove-policy" "$u2_policy_active"
+  mv "$tmp/u2-autoremove-constraints" "$u2_constraints_active"
+  u2_policy_digest=$u2_saved_policy_digest
+  u2_constraints_digest=$u2_saved_constraints_digest
+  u2_precondition_digest=$u2_saved_precondition_digest
+  rm -f "$apt_marker" "$apt_marker.autoremove-done"
+
+  u2_replay_envelope=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
+  u2_expect_rejected replayed_request "$u2_replay_envelope" "$tmp/u2-replay"
   u2_unknown=$(u2_make_envelope apt.unknown.v1 request-00000000000000000000000000000002 \
     "$u2_now" $((u2_now + 300)))
   u2_expect_rejected unknown_action "$u2_unknown" "$tmp/u2-unknown-action"
@@ -1971,20 +2431,26 @@ EOF
   u2_expect_rejected host_identity_mismatch "$tmp/u2-changed-bytes" "$tmp/u2-changed-result"
 
   u2_policy_active="$u2_root/etc/machine-utilities/generations/1/policy.actions"
-  cp "$u2_policy_active" "$tmp/u2-policy-backup"
+  u2_policy_active_mode=$(test_file_mode "$u2_policy_active")
+  cp -p "$u2_policy_active" "$tmp/u2-policy-backup"
   printf '%s\n' '# drift' >>"$u2_policy_active"
   u2_policy_drift=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000006 "$u2_now" $((u2_now + 300)))
   u2_expect_rejected policy_or_context_drift "$u2_policy_drift" "$tmp/u2-policy-drift"
   mv "$tmp/u2-policy-backup" "$u2_policy_active"
+  [ "$(test_file_mode "$u2_policy_active")" = "$u2_policy_active_mode" ] ||
+    fail "U2 policy-drift fixture did not restore exact metadata"
 
   u2_apt_active="$u2_root/etc/machine-utilities/generations/1/apt.conf"
-  cp "$u2_apt_active" "$tmp/u2-apt-backup"
+  u2_apt_active_mode=$(test_file_mode "$u2_apt_active")
+  cp -p "$u2_apt_active" "$tmp/u2-apt-backup"
   printf '%s\n' 'APT::Update::Pre-Invoke { "touch /tmp/forbidden"; };' >>"$u2_apt_active"
   u2_hook=$(u2_make_envelope apt.update-metadata.v1 \
     request-00000000000000000000000000000007 "$u2_now" $((u2_now + 300)))
   u2_expect_rejected apt_configuration_hook_drift "$u2_hook" "$tmp/u2-hook-drift"
   mv "$tmp/u2-apt-backup" "$u2_apt_active"
+  [ "$(test_file_mode "$u2_apt_active")" = "$u2_apt_active_mode" ] ||
+    fail "U2 APT-hook fixture did not restore exact metadata"
 
   mv "$u2_root/var/lib/machine-utilities/audit/events.log" "$tmp/u2-audit-log"
   mkdir "$u2_root/var/lib/machine-utilities/audit/events.log"
@@ -1993,10 +2459,14 @@ EOF
   u2_expect_rejected audit_write_failed "$u2_audit" "$tmp/u2-audit-failure"
   mv "$u2_root/var/lib/machine-utilities/audit/events.log" "$tmp/u2-blocked-audit"
   mv "$tmp/u2-audit-log" "$u2_root/var/lib/machine-utilities/audit/events.log"
+  if find "$u2_root/var/lib/machine-utilities/audit" -mindepth 1 -maxdepth 1 \
+      -name '.events.*' -print | grep -q .; then
+    fail "U2 failed audit projection left a temporary"
+  fi
 
   u2_build2="$tmp/u2-bundle-2"
   u2_generation2="$u2_root/etc/machine-utilities/generations/2"
-  cp -R "$u2_bundle" "$u2_build2"
+  cp -Rp "$u2_bundle" "$u2_build2"
   rm -f "$u2_build2/bootstrap.manifest" "$u2_build2/bootstrap.manifest.sig"
   printf 'constraints|1|generation=2|policy-sha256=%s\n' "$u2_policy_digest" \
     >"$u2_build2/policy.constraints"
@@ -2036,14 +2506,19 @@ EOF
   printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' \
     "$u2_manifest2_digest" >"$u2_bootstrap/receipts/$u2_manifest2_digest"
   chmod -R go-w "$u2_root"
-  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle2" \
-    >"$tmp/u2-preview2"
+  printf '%064d\n' 0 >"$u2_generation/ssh-keygen.sha256"
+  if ! MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle2" \
+      >"$tmp/u2-preview2"; then
+    cat "$tmp/u2-preview2" >&2
+    fail "U2 generation-2 upgrade preview was rejected"
+  fi
   grep -Fqx 'from-epoch|1' "$tmp/u2-preview2" && grep -Fqx 'to-epoch|2' "$tmp/u2-preview2" ||
     fail "U2 upgrade preview did not describe the generation transition"
   u2_confirmation2_digest=$(awk -F '|' '$1=="confirmation-sha256"{print $2}' "$tmp/u2-preview2")
 
   u2_under_lock_before=$(u2_enrollment_state_digest)
-  cp "$u2_bundle2/policy.actions" "$tmp/u2-candidate-policy-before-lock-race"
+  u2_candidate_policy_mode=$(test_file_mode "$u2_bundle2/policy.actions")
+  cp -p "$u2_bundle2/policy.actions" "$tmp/u2-candidate-policy-before-lock-race"
   u2_pause_marker="$tmp/u2-candidate-lock-race"
   MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
     MACHINE_UTILITIES_U2_PAUSE_AT=lifecycle-lock-held \
@@ -2058,11 +2533,14 @@ EOF
     fail "U2 install accepted candidate bytes changed while waiting under lock"
   fi
   mv "$tmp/u2-candidate-policy-before-lock-race" "$u2_bundle2/policy.actions"
+  [ "$(test_file_mode "$u2_bundle2/policy.actions")" = "$u2_candidate_policy_mode" ] ||
+    fail "U2 candidate race fixture did not restore exact metadata"
   grep -Fqx 'reason|under_lock_authenticated_bootstrap_failed' "$tmp/u2-candidate-lock-race-result" &&
     [ "$(u2_enrollment_state_digest)" = "$u2_under_lock_before" ] ||
     fail "U2 under-lock candidate revalidation mutated enrolled state"
 
-  cp "$u2_generation/policy.actions" "$tmp/u2-live-policy-before-lock-race"
+  u2_live_policy_mode=$(test_file_mode "$u2_generation/policy.actions")
+  cp -p "$u2_generation/policy.actions" "$tmp/u2-live-policy-before-lock-race"
   u2_pause_marker="$tmp/u2-live-lock-race"
   MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
     MACHINE_UTILITIES_U2_PAUSE_AT=lifecycle-lock-held \
@@ -2080,6 +2558,8 @@ EOF
     [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] ||
     fail "U2 under-lock confirmation recompute did not fail before mutation"
   mv "$tmp/u2-live-policy-before-lock-race" "$u2_generation/policy.actions"
+  [ "$(test_file_mode "$u2_generation/policy.actions")" = "$u2_live_policy_mode" ] ||
+    fail "U2 live-state race fixture did not restore exact metadata"
   [ "$(u2_enrollment_state_digest)" = "$u2_under_lock_before" ] ||
     fail "U2 under-lock current-state race was not exactly recoverable"
 
@@ -2137,11 +2617,64 @@ EOF
   [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/2 ] &&
     [ -d "$u2_generation2" ] && [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] ||
     fail "U2 resumable upgrade did not activate generation 2"
+  [ "$(sed -n '1p' "$u2_generation2/ssh-keygen.sha256")" = "$(u2_sha256 /usr/bin/ssh-keygen)" ] ||
+    fail "U2 authenticated upgrade did not repair the OpenSSH attestation"
   MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" MACHINE_UTILITIES_IDENTITY="$tmp/u2-no-identity" \
     "$collector" "$tmp/config.json" test-apt u2-upgraded-readiness none >"$tmp/u2-upgraded-readiness.jsonl"
   [ "$(jq -r 'select(.kind=="privilege_broker") | [.data.lifecycle_status,.data.enrollment_epoch] | @tsv' \
     "$tmp/u2-upgraded-readiness.jsonl")" = "$(printf 'ready\t2')" ] ||
     fail "U2 collector did not validate the upgraded generation"
+
+  printf '%064d\n' 0 >"$u2_generation2/ssh-keygen.sha256"
+  u2_pause_marker="$tmp/u2-revocation-reserve-pause"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+    MACHINE_UTILITIES_U2_PAUSE_AT=revocation-reserve-released \
+    MACHINE_UTILITIES_U2_PAUSE_MARKER="$u2_pause_marker" \
+    "$enrollment" revoke "$u2_bundle2" "$u2_manifest2_digest" 2 \
+    >"$tmp/u2-revocation-reserve-result" 2>&1 &
+  u2_pause_job=$!
+  u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" "$tmp/u2-revocation-reserve-result"
+  [ ! -e "$u2_revocation_reserve" ] &&
+    [ "$(awk -F '|' '$1=="operation"{print $2}' \
+      "$u2_root/var/lib/machine-utilities-lifecycle.lock/owner")" = revoke ] ||
+    fail "U2 revocation did not release its same-filesystem reserve under the lifecycle lock"
+  u2_pause_owner=$(awk -F '[|=]' 'NR==1&&$1=="pause"&&$2=="1"&&$3=="point"&&$5=="pid"{print $6}' \
+    "$u2_pause_marker")
+  kill -TERM "$u2_pause_owner"
+  wait "$u2_pause_job" 2>/dev/null || true
+  rm -f "$u2_pause_marker" "$u2_pause_marker.continue" "$u2_pause_marker.kill"
+  [ "$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")" -eq 4194304 ] &&
+    [ $((($(stat -f %b "$u2_revocation_reserve" 2>/dev/null || stat -c %b "$u2_revocation_reserve")) * 512)) -ge 1048576 ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
+    [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/2 ] ||
+    fail "U2 interrupted pre-intent revocation did not restore its emergency reserve and enrollment"
+
+  u2_pause_marker="$tmp/u2-revocation-reserve-prepared-pause"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+    MACHINE_UTILITIES_U2_FAILPOINT=after-drain \
+    MACHINE_UTILITIES_U2_PAUSE_AT=revocation-reserve-prepared \
+    MACHINE_UTILITIES_U2_PAUSE_MARKER="$u2_pause_marker" \
+    "$enrollment" revoke "$u2_bundle2" "$u2_manifest2_digest" 2 \
+    >"$tmp/u2-revocation-reserve-prepared-result" 2>&1 &
+  u2_pause_job=$!
+  u2_wait_for_pause "$u2_pause_marker" "$u2_pause_job" \
+    "$tmp/u2-revocation-reserve-prepared-result"
+  [ -f "$u2_root/var/lib/machine-utilities/.revocation.reserve.pending" ] &&
+    [ ! -e "$u2_revocation_reserve" ] ||
+    fail "U2 reserve restoration did not stage before its atomic rename"
+  u2_kill_paused "$u2_pause_marker" "$u2_pause_job"
+  if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" MACHINE_UTILITIES_U2_FAILPOINT=after-drain \
+      "$enrollment" revoke "$u2_bundle2" "$u2_manifest2_digest" 2 \
+      >"$tmp/u2-revocation-reserve-prepared-recovery" 2>/dev/null; then
+    fail "U2 reserve-temp recovery unexpectedly passed its forced failpoint"
+  fi
+  [ ! -e "$u2_root/var/lib/machine-utilities/.revocation.reserve.pending" ] &&
+    [ "$(stat -f %z "$u2_revocation_reserve" 2>/dev/null || stat -c %s "$u2_revocation_reserve")" -eq 4194304 ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.lock" ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities-lifecycle.recovery" ] &&
+    [ ! -e "$u2_root/var/lib/machine-utilities/draining" ] &&
+    [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/2 ] ||
+    fail "U2 killed reserve-temp restoration did not recover atomically"
 
   u2_revoke_crash_before=$(u2_enrollment_state_digest)
   u2_pause_marker="$tmp/u2-revoke-lock-pause"
@@ -2245,8 +2778,14 @@ EOF
     fail "U2 revocation left a privileged grant, generation, or trust root"
   [ -d "$u2_root/var/lib/machine-utilities/quarantine/revoked-2-$u2_manifest2_digest" ] ||
     fail "U2 revocation did not retain its protected quarantine"
+  [ ! -e "$u2_revocation_reserve" ] || fail "U2 completed revocation retained its emergency reserve"
   [ -f "$u2_root/var/lib/machine-utilities/journal/request-00000000000000000000000000000001.result" ] ||
     fail "U2 revocation discarded protected result evidence"
+  if find "$u2_root/var/lib/machine-utilities" \
+      \( -name '.claim-*' -o -name '.revocation.reserve.*' -o -name 'launch.gate' -o -name 'terminal.reserve' \) \
+      -print | grep -q .; then
+    fail "U2 final residue scan found claim staging, reserve staging, launch gates, or terminal reserves"
+  fi
   MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" MACHINE_UTILITIES_IDENTITY="$tmp/u2-no-identity" \
     "$collector" "$tmp/config.json" test-apt u2-revoked-readiness none >"$tmp/u2-revoked-readiness.jsonl"
   [ "$(jq -r 'select(.kind=="privilege_broker") | .data.lifecycle_status' \
@@ -2309,8 +2848,14 @@ SH
   chmod +x "$tmp/home/.codex/plugins/cache/characterization/machine-utilities/1.0.0/scripts/machine-utilities"
   jq -n --arg digest "$u1_worker_digest" '{
     schema:"machine-utilities.plan",schema_version:2,
-    plan_id:"plan-0000000000000000",target:"test-ssh",domain:"agents",
+    created_at:"2026-01-01T00:00:00Z",plan_id:"plan-0000000000000000",
+    plan_digest:{algorithm:"sha256",value:("0" * 64)},target:"test-ssh",domain:"agents",
+    operations:[{type:"agent-update",kind:"agent_runtime",id:"codex",argv:["codex","update"]}],
+    required_section:"agents",planning_snapshot_id:"u1-characterization",
+    planning_observed_at:"2026-01-01T00:00:00Z",
+    configuration_digest:{algorithm:"sha256",value:("0" * 64)},
     worker_configuration_digest:{algorithm:"sha256",value:$digest},
+    precondition_digest:{algorithm:"sha256",value:("0" * 64)},
     required_executor:{marketplace:"characterization",version:"1.0.0"}
   }' >"$tmp/u1-partial-plan.json"
   chmod 600 "$tmp/u1-partial-plan.json"
@@ -2409,7 +2954,8 @@ test_u1_contracts() {
     } |
     .machines["test-windows"].privilege_broker = {
       automation_transport:{mode:"windows-sftp",host:"windows.example.invalid",port:22,
-        request_user:"machine-utilities-request",pinned_host_key_fingerprint:$fingerprint,
+        request_user:"MachineUtilitiesRequest",pinned_host_key_fingerprint:$fingerprint,
+        request_sid:"S-1-5-21-1-2-3-2001",
         management_networks:["192.0.2.0/24"]}
     } |
     .machines["test-wsl"] = {platform:"wsl",transport:"local",expected_hostname:$hostname,
@@ -2543,6 +3089,45 @@ test_u1_contracts() {
       if ($null -ne (Test-PrivilegeConstraints $policyLines $constraintLines ("0" * 64))) { exit 1 }
     ' ||
       fail "U1 PowerShell parser accepted two different canonical records for one action token"
+
+    u1_readiness_digest=$(printf 'a%.0s' {1..64})
+    {
+      printf '%s\n' \
+        'windows-broker-readiness|1' \
+        'lifecycle|needs_native_canary' \
+        'broker-version|1.0.0' \
+        'broker-protocol|1' \
+        "broker-sha256|$u1_readiness_digest" \
+        'generation|1' \
+        "generation-sha256|$u1_readiness_digest" \
+        "policy-sha256|$u1_readiness_digest" \
+        "constraints-sha256|$u1_readiness_digest" \
+        "winget-context-sha256|$u1_readiness_digest" \
+        'context-canary-sha256|-' \
+        'clock-skew-bound-seconds|300' \
+        'request-account-state|disabled' \
+        'request-sid|S-1-5-21-1-2-3-2001' \
+        'request-principal|MachineUtilitiesRequest' \
+        'system-task-ready|true' \
+        'profile-task-ready|true' \
+        'transport-ready|false' \
+        'native-canary-ready|false' \
+        'end-readiness|'
+    } >"$tmp/u1-windows-readiness"
+    U1_COLLECTOR="$script_dir/collect-windows.ps1" U1_READINESS="$tmp/u1-windows-readiness" \
+      "$pwsh_command" -NoLogo -NoProfile -Command '
+      $tokens=$null; $errors=$null
+      $ast=[Management.Automation.Language.Parser]::ParseFile($env:U1_COLLECTOR,[ref]$tokens,[ref]$errors)
+      foreach($name in @("Get-CanonicalAsciiLines","Read-WindowsBrokerReadiness")) {
+        $function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+          $node.Name -eq $name},$true)
+        if ($null -eq $function) { exit 1 }
+        Invoke-Expression $function.Extent.Text
+      }
+      function Test-WindowsPublicProjectionFile([string]$Path) { return $true }
+      $readiness=Read-WindowsBrokerReadiness $env:U1_READINESS
+      if ($null -eq $readiness -or [int]$readiness."broker-protocol" -ne 1) { exit 1 }
+    ' || fail "U1 Windows readiness did not publish canonical broker protocol 1"
   fi
 
   target_valid_after=$(jq -r '.certificate_valid_after' "$tmp/identity-b.json")
@@ -2570,6 +3155,9 @@ test_u1_contracts() {
       .data.observed_action_contexts=[{action_id:"apt.update-metadata.v1",context_id:"posix-root-v1",
         constraint_kind:"none",constraint_digest:"-",constraint_generation:1,policy_tokens:[],
         manager_source_identity:"not-applicable"}] |
+      .data.observed_preconditions=[{action_id:"apt.update-metadata.v1",policy_token:"-",
+        digest:{algorithm:"sha256",value:("f" * 64)},
+        evidence:{kind:"fixture",digest:{algorithm:"sha256",value:("e" * 64)}}}] |
       .data.node_identity={node_id:"target-b",fleet_domain:"fleet.example",node_key_fingerprint:$target_fp,
         fleet_ca_fingerprint:$ca_fp,ca_generation:1,certificate_serial:"2",
         certificate_valid_after:$after,certificate_valid_before:$before,
@@ -2615,7 +3203,15 @@ test_u1_contracts() {
         action_id:"apt.install-package-version.v1",context_id:"posix-root-v1",
         constraint_kind:"package-source-version-closure-set-sha256",constraint_digest:$group,
         constraint_generation:1,policy_tokens:["token-a","token-b"],manager_source_identity:$group
-      }]
+      }] |
+      .data.observed_preconditions=[
+        {action_id:"apt.install-package-version.v1",policy_token:"token-a",
+          digest:{algorithm:"sha256",value:("f" * 64)},
+          evidence:{kind:"fixture",digest:{algorithm:"sha256",value:("e" * 64)}}},
+        {action_id:"apt.install-package-version.v1",policy_token:"token-b",
+          digest:{algorithm:"sha256",value:("f" * 64)},
+          evidence:{kind:"fixture",digest:{algorithm:"sha256",value:("e" * 64)}}}
+      ]
     else . end
   ' "$tmp/u1-ready.jsonl" >"$tmp/u1-constrained-ready.jsonl"
   jq -n --arg expiry "$expires_at" '{domain:"updates",target:"test-apt",
@@ -2676,12 +3272,16 @@ test_u1_contracts() {
     windows_policy_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/policy.actions" | awk '{print $1}')
     printf 'constraints|1|generation=1|policy-sha256=%s\n' "$windows_policy_digest" \
       >"$tmp/programdata/MachineUtilities/active/policy.constraints"
+    printf '%s\n' 'protected-winget-context' >"$tmp/programdata/MachineUtilities/active/winget.context"
     printf '%s\n' 'unattested-context' >"$tmp/programdata/MachineUtilities/active/context.canary"
     windows_broker_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/broker.ps1" | awk '{print $1}')
+    windows_winget_context_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/winget.context" | awk '{print $1}')
     windows_context_digest=$(shasum -a 256 "$tmp/programdata/MachineUtilities/active/context.canary" | awk '{print $1}')
     jq --arg broker "$windows_broker_digest" --arg policy "$windows_policy_digest" \
-      --arg context "$windows_context_digest" '.enrollment_receipts["test-windows"]={
-        enrollment_epoch:1,broker_digest:$broker,policy_digest:$policy,context_canary_digest:$context
+      --arg winget_context "$windows_winget_context_digest" --arg context "$windows_context_digest" \
+      '.enrollment_receipts["test-windows"]={
+        enrollment_epoch:1,broker_digest:$broker,policy_digest:$policy,
+        winget_context_digest:$winget_context,context_canary_digest:$context
       }' "$tmp/identity-b.json" >"$tmp/identity-b-with-receipt.json"
     chmod 600 "$tmp/identity-b-with-receipt.json"
     HOME="$tmp/home" TZ=UTC ProgramData="$tmp/programdata" \
@@ -2691,7 +3291,7 @@ test_u1_contracts() {
       -Sections packages >"$tmp/u1-windows.jsonl"
     "$cli" validate "$tmp/u1-windows.jsonl"
     [ "$(jq -r 'select(.kind == "privilege_broker") |
-      [.data.platform_adapter,.data.lifecycle_status] | @tsv' "$tmp/u1-windows.jsonl")" = "$(printf 'windows-scheduled-task-v1\tdrifted')" ] ||
+      [.data.platform_adapter,.data.lifecycle_status] | @tsv' "$tmp/u1-windows.jsonl")" = "$(printf 'windows-scheduled-task-v1\tneeds_enrollment')" ] ||
       fail "U1 Windows readiness shape diverged"
     [ "$(jq -r 'select(.kind == "privilege_broker") |
       .data.node_identity_ready == true and .data.adapter_mechanism_ready == false and
@@ -2724,6 +3324,1713 @@ test_u1_contracts() {
 [ "${MACHINE_UTILITIES_TEST_SCOPE:-}" != u1-contracts ] || {
   test_u1_contracts
   printf 'PASS: U1 contracts\n'
+  exit 0
+}
+
+test_u4_contracts() {
+  # U4 builds on the signed U1 fixture but adds only the protected fields that
+  # a live U2 collector publishes. It never enrolls or invokes the real sudo
+  # broker: the native-elevation path remains an explicit canary.
+  test_u1_contracts
+  u4_expiry=$(jq -nr 'now + 600 | todateiso8601')
+  u4_uid=$(id -u)
+  u4_snapshot_id=$(jq -r 'select(.kind == "snapshot") | .snapshot_id' "$tmp/u1-ready.jsonl")
+  u4_observed_at=$(jq -r 'select(.kind == "snapshot") | .observed_at' "$tmp/u1-ready.jsonl")
+  jq --argjson uid "$u4_uid" '
+    if .kind == "privilege_broker" then
+      .data.protected_identity={host_id:"test-apt",uid:$uid,request_principal:"machine-utilities",
+        fleet_domain:"fleet.example",fleet_ca_fingerprint:.data.originating_node_identity.fleet_ca_fingerprint,
+        ca_generation:1,pinned_host_key_fingerprint:.data.pinned_host_key_fingerprint,
+        endpoint_principals:["machine-utilities-posix","machine-utilities-windows"]} |
+      .data.observed_preconditions=[{action_id:"apt.update-metadata.v1",policy_token:"-",
+        digest:{algorithm:"sha256",value:("f" * 64)},
+        evidence:{kind:"fixture",digest:{algorithm:"sha256",value:("e" * 64)}}}]
+    else . end
+  ' "$tmp/u1-ready.jsonl" >"$tmp/u4-ready-base.jsonl"
+  jq -cn --arg schema machine-utilities.inventory --argjson schema_version 1 \
+    --arg snapshot_id "$u4_snapshot_id" --arg host_id test-apt --arg observed_at "$u4_observed_at" \
+    --arg hostname "$(hostname)" --arg user "$(id -un)" '
+    {schema:$schema,schema_version:$schema_version,snapshot_id:$snapshot_id,host_id:$host_id,
+      kind:"host",id:"local",observed_at:$observed_at,status:"present",confidence:"high",
+      data:{hostname:$hostname,user:$user},evidence:[],errors:[]}
+  ' >"$tmp/u4-host.jsonl"
+  jq -sc 'sort_by(.host_id,.kind,.id)[]' "$tmp/u4-ready-base.jsonl" "$tmp/u4-host.jsonl" >"$tmp/u4-ready.jsonl"
+  "$cli" validate "$tmp/u4-ready.jsonl"
+  jq -n --arg expiry "$u4_expiry" '{domain:"updates",target:"test-apt",operations:[
+    {type:"package-metadata-refresh",kind:"package",id:"apt:example",argv:["brew","update"]},
+    {type:"semantic-action",kind:"privileged_action",id:"apt.update-metadata.v1",
+      privilege_request:{action_id:"apt.update-metadata.v1",policy_token:null,
+        request_id:"request-2123456789abcdef0123456789abcdef",expires_at:$expiry}}
+  ]}' >"$tmp/u4-draft.json"
+  "$cli" seal-plan "$tmp/u4-draft.json" "$tmp/u4-ready.jsonl" "$tmp/u4-plan.json"
+  [ "$(jq -r --argjson uid "$u4_uid" '
+    .schema_version == 4 and
+    (.operations[1] | (has("argv") | not) and (has("privilege_request") | not) and
+      .privilege.request.target_uid == ($uid | tostring) and
+      .privilege.precondition.digest.value == ("f" * 64))
+  ' "$tmp/u4-plan.json")" = true ] || fail "U4 did not seal only derived POSIX identity and protected precondition evidence"
+  if grep -Eq 'target_(uid|sid)' "$tmp/u4-draft.json"; then
+    fail "U4 fixture unexpectedly retained a caller identity binding"
+  fi
+  jq --arg snapshot_id u4-fresh --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.snapshot_id=$snapshot_id | .observed_at=$observed_at' "$tmp/u4-ready.jsonl" >"$tmp/u4-fresh.jsonl"
+  "$cli" verify-preconditions "$tmp/u4-plan.json" "$tmp/u4-fresh.jsonl" >/dev/null
+
+  u4_schema3_posix_expiry=$(jq -nr 'now + 600 | todateiso8601')
+  jq -n --arg expiry "$u4_schema3_posix_expiry" '{domain:"updates",target:"test-apt",operations:[
+    {type:"semantic-action",kind:"privileged_action",id:"apt.update-metadata.v1"}
+  ],privilege_request:{action_id:"apt.update-metadata.v1",policy_token:null,
+    request_id:"request-3123456789abcdef0123456789abcdef",expires_at:$expiry}}' \
+    >"$tmp/u4-schema3-posix-draft.json"
+  "$cli" seal-plan "$tmp/u4-schema3-posix-draft.json" "$tmp/u4-ready.jsonl" \
+    "$tmp/u4-schema3-posix-plan.json"
+  [ "$(jq -r '.precondition_digest.value == ("f" * 64) and
+    .privilege.precondition.digest.value == ("f" * 64)' "$tmp/u4-schema3-posix-plan.json")" = true ] ||
+    fail "U4 schema-3 POSIX sealing did not retain the action-specific precondition"
+  (
+    # shellcheck source=/dev/null
+    awk '/^command=/{exit} {print}' "$cli" >"$tmp/u4-machine-functions.sh"
+    . "$tmp/u4-machine-functions.sh"
+    u4_schema3_posix_expected=$(printf 'f%.0s' {1..64})
+    invoke_fixed_posix_broker() {
+      u4_schema3_posix_envelope=$1
+      u4_schema3_posix_output=$2
+      if [ "$(awk -F '|' '$1 == "action-id" { print $2; exit }' "$u4_schema3_posix_envelope")" = \
+          apt.update-metadata.v1 ]; then
+        awk -F '|' '$1 == "precondition-sha256" { print $2; exit }' \
+          "$u4_schema3_posix_envelope" >"$tmp/u4-schema3-posix-envelope-precondition"
+      fi
+      printf '%s\n' transport-interrupted >"$u4_schema3_posix_output"
+      return 70
+    }
+    normalize_privileged_plan_for_broker_execution "$tmp/u4-schema3-posix-plan.json" \
+      "$tmp/u4-fresh.jsonl" "$tmp/u4-schema3-posix-executable.json"
+    mkdir "$tmp/u4-schema3-posix-work"
+    set +e
+    execute_sealed_posix_broker_operation "$tmp/u4-schema3-posix-executable.json" 0 \
+      "$tmp/u4-schema3-posix-work" "$tmp/u4-schema3-posix-outcome"
+    u4_schema3_posix_execute_rc=$?
+    set -e
+    [ "$u4_schema3_posix_execute_rc" -eq 70 ] &&
+      [ "$(cat "$tmp/u4-schema3-posix-envelope-precondition")" = "$u4_schema3_posix_expected" ] ||
+      fail "U4 schema-3 POSIX execution did not send the sealed action precondition"
+  )
+
+  jq '.operations[1].privilege_request.caller_uid="999"' "$tmp/u4-draft.json" >"$tmp/u4-caller-uid.json"
+  if "$cli" seal-plan "$tmp/u4-caller-uid.json" "$tmp/u4-ready.jsonl" "$tmp/u4-caller-uid-plan.json" >/dev/null 2>&1; then
+    fail "U4 accepted caller-supplied UID"
+  fi
+  jq '.operations[1].privilege_request.caller_sid="S-1-5-18"' "$tmp/u4-draft.json" >"$tmp/u4-caller-sid.json"
+  if "$cli" seal-plan "$tmp/u4-caller-sid.json" "$tmp/u4-ready.jsonl" "$tmp/u4-caller-sid-plan.json" >/dev/null 2>&1; then
+    fail "U4 accepted caller-supplied SID"
+  fi
+  jq '.operations[1].argv=["sudo","apt-get","update"]' "$tmp/u4-draft.json" >"$tmp/u4-command.json"
+  if "$cli" seal-plan "$tmp/u4-command.json" "$tmp/u4-ready.jsonl" "$tmp/u4-command-plan.json" >/dev/null 2>&1; then
+    fail "U4 accepted a command-bearing privileged request"
+  fi
+  jq '.operations[0].argv=["/usr/bin/apt-get","update"]' "$tmp/u4-draft.json" >"$tmp/u4-direct-apt.json"
+  if "$cli" seal-plan "$tmp/u4-direct-apt.json" "$tmp/u4-ready.jsonl" "$tmp/u4-direct-apt-plan.json" >/dev/null 2>&1; then
+    fail "U4 accepted a direct APT ordinary operation"
+  fi
+  jq '.operations[1].id=.operations[0].id' "$tmp/u4-draft.json" >"$tmp/u4-duplicate-operation.json"
+  if "$cli" seal-plan "$tmp/u4-duplicate-operation.json" "$tmp/u4-ready.jsonl" "$tmp/u4-duplicate-operation-plan.json" >/dev/null 2>&1; then
+    fail "U4 accepted duplicate operation IDs"
+  fi
+  jq '.operations[1].id="apt.install-package-version.v1" | .operations[1].privilege_request.action_id="apt.install-package-version.v1"' \
+    "$tmp/u4-draft.json" >"$tmp/u4-unobserved-action.json"
+  if "$cli" seal-plan "$tmp/u4-unobserved-action.json" "$tmp/u4-ready.jsonl" "$tmp/u4-unobserved-action-plan.json" >/dev/null 2>&1; then
+    fail "U4 sealed an action without protected observed precondition evidence"
+  fi
+
+  jq 'if .kind == "privilege_broker" then .data.observed_policy_digest.value=("0" * 64) else . end' \
+    "$tmp/u4-fresh.jsonl" >"$tmp/u4-policy-drift.jsonl"
+  if "$cli" verify-preconditions "$tmp/u4-plan.json" "$tmp/u4-policy-drift.jsonl" >/dev/null 2>&1; then
+    fail "U4 accepted broker policy drift after sealing"
+  fi
+  jq 'if .kind == "privilege_broker" then .data.broker_protocol.observed=0 else . end' \
+    "$tmp/u4-ready.jsonl" >"$tmp/u4-previous-ready.jsonl"
+  "$cli" seal-plan "$tmp/u4-draft.json" "$tmp/u4-previous-ready.jsonl" "$tmp/u4-previous-plan.json"
+  jq --arg snapshot_id u4-previous-fresh --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.snapshot_id=$snapshot_id | .observed_at=$observed_at' "$tmp/u4-previous-ready.jsonl" >"$tmp/u4-previous-fresh.jsonl"
+  set +e
+  "$cli" verify-preconditions "$tmp/u4-previous-plan.json" "$tmp/u4-previous-fresh.jsonl" \
+    >"$tmp/u4-previous-verify.json" 2>"$tmp/u4-previous-verify.stderr"
+  u4_previous_rc=$?
+  set -e
+  [ "$u4_previous_rc" -eq 69 ] && grep -Fqx 'machine-utilities: needs_broker_upgrade' "$tmp/u4-previous-verify.stderr" ||
+    fail "U4 did not reject a previous-only mutation protocol as needs_broker_upgrade"
+
+  # A broker result query must be freshly authenticated even when it is bound
+  # to a mutation whose original admission timestamp is now stale. This is a
+  # client-only fixture: it replaces the fixed broker function only inside a
+  # sourced test subshell, never invokes sudo, and verifies the SSH signature
+  # before returning a canonical retained terminal journal.
+  u4_query_now=$(/bin/date -u +%s)
+  u4_original_created=$((u4_query_now - 301))
+  u4_original_expires=$((u4_query_now + 600))
+  jq --argjson created "$u4_original_created" --argjson expires "$u4_original_expires" '
+    .created_at = ($created | strftime("%Y-%m-%dT%H:%M:%SZ")) |
+    .operations[1].privilege.request.created_at = ($created | strftime("%Y-%m-%dT%H:%M:%SZ")) |
+    .operations[1].privilege.request.expires_at = ($expires | strftime("%Y-%m-%dT%H:%M:%SZ")) |
+    .operations[1].privilege.enrollment.certificate_valid_after = (($created - 60) | strftime("%Y-%m-%dT%H:%M:%SZ")) |
+    del(.plan_id,.plan_digest)
+  ' "$tmp/u4-plan.json" >"$tmp/u4-recovery-base.json"
+  u4_recovery_digest=$(jq -cS . "$tmp/u4-recovery-base.json" | shasum -a 256 | awk '{print $1}')
+  u4_recovery_plan_id="plan-${u4_recovery_digest:0:16}"
+  jq -S --arg plan_id "$u4_recovery_plan_id" --arg plan_digest "$u4_recovery_digest" \
+    '. + {plan_id:$plan_id,plan_digest:{algorithm:"sha256",value:$plan_digest}}' \
+    "$tmp/u4-recovery-base.json" >"$tmp/u4-recovery-plan.json"
+  (
+    awk '/^command=/{exit} {print}' "$cli" >"$tmp/u4-machine-functions.sh"
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    u4_recovery_request_id=$(jq -r '.operations[1].privilege.request.id' "$tmp/u4-recovery-plan.json")
+    u4_recovery_target=$(jq -r '.target' "$tmp/u4-recovery-plan.json")
+    u4_recovery_uid=$(jq -r '.operations[1].privilege.request.target_uid' "$tmp/u4-recovery-plan.json")
+    u4_recovery_principal=$(jq -r '.operations[1].privilege.request.principal' "$tmp/u4-recovery-plan.json")
+    u4_recovery_broker_version=$(jq -r '.operations[1].privilege.broker.version' "$tmp/u4-recovery-plan.json")
+    u4_recovery_broker_digest=$(jq -r '.operations[1].privilege.broker.digest.value' "$tmp/u4-recovery-plan.json")
+    u4_recovery_policy_digest=$(jq -r '.operations[1].privilege.policy.digest.value' "$tmp/u4-recovery-plan.json")
+    u4_recovery_constraints_digest=$(jq -r '.operations[1].privilege.policy.constraints_digest.value' "$tmp/u4-recovery-plan.json")
+    u4_recovery_precondition_digest=$(jq -r '.operations[1].privilege.precondition.digest.value' "$tmp/u4-recovery-plan.json")
+    u4_recovery_context_digest=$(jq -r '.operations[1].privilege.context.canary_digest.value' "$tmp/u4-recovery-plan.json")
+    u4_recovery_host_fingerprint=$(jq -r '.operations[1].privilege.enrollment.pinned_host_key_fingerprint' "$tmp/u4-recovery-plan.json")
+    u4_recovery_node_id=$(jq -r '.operations[1].privilege.request.originating_node_id' "$tmp/u4-recovery-plan.json")
+    u4_recovery_domain=$(jq -r '.operations[1].privilege.enrollment.fleet_domain' "$tmp/u4-recovery-plan.json")
+    u4_recovery_ca_fingerprint=$(jq -r '.operations[1].privilege.enrollment.fleet_ca_fingerprint' "$tmp/u4-recovery-plan.json")
+    u4_recovery_ca_generation=$(jq -r '.operations[1].privilege.enrollment.ca_generation' "$tmp/u4-recovery-plan.json")
+    u4_recovery_node_fingerprint=$(jq -r '.operations[1].privilege.request.node_key_fingerprint' "$tmp/u4-recovery-plan.json")
+    u4_recovery_certificate_serial=$(jq -r '.operations[1].privilege.request.certificate_serial' "$tmp/u4-recovery-plan.json")
+    u4_recovery_certificate_after=$(jq -r '.operations[1].privilege.enrollment.certificate_valid_after | fromdateiso8601 | strftime("%Y%m%dT%H%M%SZ")' "$tmp/u4-recovery-plan.json")
+    u4_recovery_certificate_before=$(jq -r '.operations[1].privilege.enrollment.certificate_valid_before | fromdateiso8601 | strftime("%Y%m%dT%H%M%SZ")' "$tmp/u4-recovery-plan.json")
+    u4_recovery_placeholder=$(printf 'a%.0s' {1..64})
+    u4_query_calls=$tmp/u4-query-calls
+    : >"$u4_query_calls"
+    u4_expected_journal_value() {
+      awk -F '|' -v key="$1" '$1 == key { print $2; exit }' \
+        "$tmp/u4-recovery-work/journal-expectations-1"
+    }
+    u4_write_terminal_journal() {
+      u4_journal_output=$1
+      {
+        printf '%s\n' 'journal|2' 'sequence|1' 'state|completed' 'reason|post_state_verified' \
+          'effect-phase|verified' "retain-until|$((u4_original_expires + 300))"
+        printf '%s\n' "request-id|$u4_recovery_request_id" "plan-id|$u4_recovery_plan_id" \
+          'action-id|apt.update-metadata.v1' 'broker-protocol|1' \
+          "target-host-id|$u4_recovery_target" "target-uid|$u4_recovery_uid" \
+          "broker-version|$u4_recovery_broker_version" "broker-sha256|$u4_recovery_broker_digest" \
+          "policy-sha256|$u4_recovery_policy_digest" "constraints-sha256|$u4_recovery_constraints_digest" \
+          "precondition-sha256|$u4_recovery_precondition_digest" "created-at|$u4_original_created" \
+          "expires-at|$u4_original_expires" 'transport|posix-ssh' \
+          "request-principal|$u4_recovery_principal" 'required-context|posix-root-v1' \
+          'observed-execution-principal|root' 'console-session-state|none' 'platform-boundary|linux' \
+          'enrollment-epoch|1' "context-canary-sha256|$u4_recovery_context_digest" \
+          "pinned-host-key-fingerprint|$u4_recovery_host_fingerprint" \
+          "originating-node-id|$u4_recovery_node_id" "fleet-domain|$u4_recovery_domain" \
+          "fleet-ca-fingerprint|$u4_recovery_ca_fingerprint" "ca-generation|$u4_recovery_ca_generation" \
+          "node-key-fingerprint|$u4_recovery_node_fingerprint" \
+          "certificate-serial|$u4_recovery_certificate_serial" \
+          "certificate-valid-after|$u4_recovery_certificate_after" \
+          "certificate-valid-before|$u4_recovery_certificate_before" \
+          "source-addresses-sha256|$(u4_expected_journal_value source-addresses-sha256)" \
+          'manager-source-identity|not-applicable' \
+          "request-sha256|$(u4_expected_journal_value request-sha256)" \
+          "certificate-sha256|$(u4_expected_journal_value certificate-sha256)" \
+          "signature-sha256|$(u4_expected_journal_value signature-sha256)" \
+          "action-evidence-sha256|$u4_recovery_placeholder" \
+          "launch-record-sha256|$u4_recovery_placeholder" 'native-pid|123' 'native-pgid|123' \
+          "native-process-start|$u4_recovery_placeholder" "native-boot|$u4_recovery_placeholder" 'native-exit|0' \
+          "metadata-sha256|$u4_recovery_placeholder" "pre-state-sha256|$u4_recovery_placeholder" \
+          "post-state-sha256|$u4_recovery_placeholder" 'artifact-sha256|-' 'closure-sha256|-' \
+          'closure-members-sha256|-' 'end-journal|'
+      } >"$u4_journal_output"
+    }
+    invoke_fixed_posix_broker() {
+      u4_envelope=$1
+      u4_broker_output=$2
+      u4_envelope_action=$(awk -F '|' '$1 == "action-id" { print $2; exit }' "$u4_envelope")
+      case $u4_envelope_action in
+        apt.update-metadata.v1)
+          u4_original_envelope_created=$(awk -F '|' '$1 == "created-at" { print $2; exit }' "$u4_envelope")
+          [ $(( $(/bin/date -u +%s) - u4_original_envelope_created )) -gt 300 ] || return 70
+          printf '%s\n' 'transport-interrupted' >"$u4_broker_output"
+          return 70
+          ;;
+        broker.query-result.v1)
+          u4_query_created=$(awk -F '|' '$1 == "created-at" { print $2; exit }' "$u4_envelope")
+          u4_query_expires=$(awk -F '|' '$1 == "expires-at" { print $2; exit }' "$u4_envelope")
+          u4_query_checked_at=$(/bin/date -u +%s)
+          [ "$u4_query_created" -ge $((u4_query_checked_at - 5)) ] &&
+            [ "$u4_query_expires" -gt "$u4_query_checked_at" ] &&
+            [ $((u4_query_expires - u4_query_created)) -le 300 ] || return 70
+          awk -F '|' -v request="$u4_recovery_request_id" -v plan="$u4_recovery_plan_id" \
+            -v host="$u4_recovery_target" -v uid="$u4_recovery_uid" -v principal="$u4_recovery_principal" '
+            $1 == "request-id" { seen[$1]++; ok[$1]=($2 == request) }
+            $1 == "plan-id" { seen[$1]++; ok[$1]=($2 == plan) }
+            $1 == "target-host-id" { seen[$1]++; ok[$1]=($2 == host) }
+            $1 == "target-uid" { seen[$1]++; ok[$1]=($2 == uid) }
+            $1 == "request-principal" { seen[$1]++; ok[$1]=($2 == principal) }
+            END { for (key in ok) if (seen[key] != 1 || !ok[key]) exit 1
+              exit !(seen["request-id"] && seen["plan-id"] && seen["target-host-id"] && seen["target-uid"] && seen["request-principal"]) }
+          ' "$u4_envelope" || return 70
+          awk '/^certificate\|/{exit} {print}' "$u4_envelope" >"$tmp/u4-recovery-query-request"
+          awk '/^signature-begin$/{inside=1; next} /^end-envelope$/{exit} inside {print}' \
+            "$u4_envelope" >"$tmp/u4-recovery-query-signature"
+          awk -v identity="$u4_recovery_node_id@$u4_recovery_domain" \
+            'NR == 1 { print identity " cert-authority " $1 " " $2 }' "$tmp/fleet-ca.pub" \
+            >"$tmp/u4-recovery-allowed-signers"
+          /usr/bin/ssh-keygen -Y verify -f "$tmp/u4-recovery-allowed-signers" \
+            -I "$u4_recovery_node_id@$u4_recovery_domain" -n machine-utilities-request \
+            -s "$tmp/u4-recovery-query-signature" <"$tmp/u4-recovery-query-request" >/dev/null || return 70
+          printf '%s\n' query >>"$u4_query_calls"
+          u4_write_terminal_journal "$u4_broker_output"
+          ;;
+        *) return 70 ;;
+      esac
+    }
+    mkdir "$tmp/u4-recovery-work"
+    execute_sealed_posix_broker_operation "$tmp/u4-recovery-plan.json" 1 "$tmp/u4-recovery-work" \
+      "$tmp/u4-recovery-outcome"
+    IFS='|' read -r u4_recovered_state u4_recovered_reason u4_recovered_kind \
+      u4_recovered_digest u4_recovered_projection <"$tmp/u4-recovery-outcome"
+    u4_recovered_expected_digest=$(sha256_file "$tmp/u4-recovery-work/broker-query-1")
+    [ "$(wc -l <"$u4_query_calls" | tr -d ' ')" -eq 1 ] && [ "$u4_recovered_state" = completed ] &&
+      [ "$u4_recovered_reason" = post_state_verified ] &&
+      [ "$u4_recovered_kind" = posix-journal-sha256 ] &&
+      [ "$u4_recovered_digest" = "$u4_recovered_expected_digest" ] &&
+      [ "$u4_recovered_projection" = "$u4_recovered_expected_digest" ] ||
+      fail "U4 did not recover a retained terminal journal with a fresh signed query"
+    for u4_journal_line in $(seq 2 54); do
+      awk -F '|' -v line="$u4_journal_line" 'NR == line { $0=$1 "|" } { print }' \
+        "$tmp/u4-recovery-work/broker-query-1" >"$tmp/u4-mutated-journal"
+      if posix_broker_terminal_result "$tmp/u4-mutated-journal" "$u4_recovery_request_id" \
+          "$u4_recovery_plan_id" apt.update-metadata.v1 false 1 \
+          "$tmp/u4-recovery-work/journal-expectations-1" >/dev/null 2>&1; then
+        fail "U4 accepted a terminal journal with field $u4_journal_line removed"
+      fi
+    done
+    sed '$s/|$/|unexpected/' "$tmp/u4-recovery-work/broker-query-1" >"$tmp/u4-mutated-journal"
+    if posix_broker_terminal_result "$tmp/u4-mutated-journal" "$u4_recovery_request_id" \
+        "$u4_recovery_plan_id" apt.update-metadata.v1 false 1 \
+        "$tmp/u4-recovery-work/journal-expectations-1" >/dev/null 2>&1; then
+      fail "U4 accepted a terminal journal with a non-canonical end marker"
+    fi
+  )
+
+  # Result queries authenticate with the caller's current overlay certificate,
+  # while terminal matching stays bound to the original mutation journal.
+  mkdir "$tmp/identity-a-renewed"
+  cp "$tmp/identity-a/node-key" "$tmp/identity-a/node-key.pub" \
+    "$tmp/identity-a/known-hosts" "$tmp/identity-a-renewed/"
+  "$ssh_keygen" -q -s "$tmp/fleet-ca" -I 'origin-a@fleet.example' -z 101 \
+    -n 'origin-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -O source-address=192.0.2.0/24 -O no-agent-forwarding -O no-port-forwarding -O no-pty \
+    -O no-user-rc -O no-X11-forwarding "$tmp/identity-a-renewed/node-key.pub"
+  chmod 600 "$tmp/identity-a-renewed/node-key" "$tmp/identity-a-renewed/node-key-cert.pub" \
+    "$tmp/identity-a-renewed/known-hosts"
+  make_identity_fixture "$tmp/identity-a-renewed" origin-a 101 "$tmp/identity-a-renewed.json"
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    u4_assert_current_query_identity() {
+      u4_query_identity_file=$1
+      u4_query_expected_node=$2
+      u4_query_expected_serial=$3
+      u4_query_output=$4
+      MACHINE_UTILITIES_IDENTITY="$u4_query_identity_file" \
+        make_posix_broker_envelope "$tmp/u4-recovery-plan.json" 1 broker.query-result.v1 \
+          "$u4_query_output"
+      u4_query_expected_domain=$(jq -r '.fleet_domain' "$u4_query_identity_file")
+      u4_query_expected_fingerprint=$(jq -r '.node_key_fingerprint' "$u4_query_identity_file")
+      [ "$(awk -F '|' '$1 == "node-id" { print $2; exit }' "$u4_query_output")" = \
+          "$u4_query_expected_node" ] &&
+        [ "$(awk -F '|' '$1 == "certificate-serial" { print $2; exit }' "$u4_query_output")" = \
+          "$u4_query_expected_serial" ] &&
+        [ "$(awk -F '|' '$1 == "node-key-fingerprint" { print $2; exit }' "$u4_query_output")" = \
+          "$u4_query_expected_fingerprint" ] &&
+        [ "$(awk -F '|' '$1 == "action-id" { print $2; exit }' "$u4_query_output")" = \
+          broker.query-result.v1 ] ||
+        fail "U4 result query did not use the current $u4_query_expected_node overlay identity"
+      awk '/^certificate\|/{exit} {print}' "$u4_query_output" >"$tmp/u4-current-query-request"
+      awk '/^signature-begin$/{inside=1; next} /^end-envelope$/{exit} inside {print}' \
+        "$u4_query_output" >"$tmp/u4-current-query-signature"
+      awk -v identity="$u4_query_expected_node@$u4_query_expected_domain" \
+        'NR == 1 { print identity " cert-authority " $1 " " $2 }' "$tmp/fleet-ca.pub" \
+        >"$tmp/u4-current-query-allowed-signers"
+      /usr/bin/ssh-keygen -Y verify -f "$tmp/u4-current-query-allowed-signers" \
+        -I "$u4_query_expected_node@$u4_query_expected_domain" -n machine-utilities-request \
+        -s "$tmp/u4-current-query-signature" <"$tmp/u4-current-query-request" >/dev/null ||
+        fail "U4 result query signature did not verify as the current overlay identity"
+    }
+    u4_assert_current_query_identity "$tmp/identity-b.json" target-b 2 \
+      "$tmp/u4-peer-query-envelope"
+    [ "$(awk -F '|' '$1 == "originating-node-id" { print $2; exit }' \
+        "$tmp/u4-recovery-work/journal-expectations-1")" = origin-a ] ||
+      fail "U4 peer result query replaced the original mutation journal identity"
+    u4_assert_current_query_identity "$tmp/identity-a-renewed.json" origin-a 101 \
+      "$tmp/u4-renewed-query-envelope"
+    [ "$(awk -F '|' '$1 == "certificate-serial" { print $2; exit }' \
+        "$tmp/u4-recovery-work/journal-expectations-1")" = 1 ] ||
+      fail "U4 renewed result query replaced the original mutation certificate serial"
+  )
+
+  # The same descriptor drives all four APT actions. Tokenless actions bind
+  # `-`; protected install/upgrade actions bind one exact enrolled token and
+  # never admit source, dependency, or argv controls from the caller.
+  u4_action_number=0
+  for u4_action_spec in \
+    'apt.autoremove.v1|none|none' \
+    'apt.install-package-version.v1|package-source-version-closure-set-sha256|protected' \
+    'apt.update-metadata.v1|none|none' \
+    'apt.upgrade-package.v1|package-source-channel-set-sha256|protected'; do
+    IFS='|' read -r u4_action u4_constraint_kind u4_token_kind <<EOF
+$u4_action_spec
+EOF
+    u4_action_number=$((u4_action_number + 1))
+    u4_request_id=$(printf 'request-%032x' "$u4_action_number")
+    if [ "$u4_token_kind" = protected ]; then
+      u4_policy_token="token-$u4_action_number"
+      u4_constraint_digest=$(printf 'a%.0s' {1..64})
+      u4_manager_identity=$u4_constraint_digest
+      u4_policy_tokens=$(jq -cn --arg token "$u4_policy_token" '[$token]')
+    else
+      u4_policy_token=null
+      u4_constraint_digest=-
+      u4_manager_identity=not-applicable
+      u4_policy_tokens='[]'
+    fi
+    jq --arg action "$u4_action" --arg kind "$u4_constraint_kind" \
+      --arg constraint "$u4_constraint_digest" --arg manager "$u4_manager_identity" \
+      --arg policy_token "$(if [ "$u4_token_kind" = protected ]; then printf '%s' "$u4_policy_token"; else printf '%s' -; fi)" \
+      --argjson tokens "$u4_policy_tokens" '
+      if .kind == "privilege_broker" then
+        .data.observed_action_contexts=[{action_id:$action,context_id:"posix-root-v1",
+          constraint_kind:$kind,constraint_digest:$constraint,constraint_generation:1,
+          policy_tokens:$tokens,manager_source_identity:$manager}] |
+        .data.observed_preconditions=[{action_id:$action,policy_token:$policy_token,
+          digest:{algorithm:"sha256",value:("f" * 64)},
+          evidence:{kind:"fixture",digest:{algorithm:"sha256",value:("e" * 64)}}}]
+      else . end
+    ' "$tmp/u4-ready.jsonl" >"$tmp/u4-action-ready-$u4_action_number.jsonl"
+    jq -n --arg expiry "$u4_expiry" --arg action "$u4_action" --arg request "$u4_request_id" \
+      --arg token "$u4_policy_token" --arg token_kind "$u4_token_kind" '{
+      domain:"updates",target:"test-apt",operations:[
+        {type:"package-metadata-refresh",kind:"package",id:"apt:example",argv:["brew","update"]},
+        {type:"semantic-action",kind:"privileged_action",id:$action,
+          privilege_request:{action_id:$action,policy_token:(if $token_kind == "protected" then $token else null end),
+            request_id:$request,expires_at:$expiry}}
+      ]}' >"$tmp/u4-action-draft-$u4_action_number.json"
+    "$cli" seal-plan "$tmp/u4-action-draft-$u4_action_number.json" \
+      "$tmp/u4-action-ready-$u4_action_number.jsonl" "$tmp/u4-action-plan-$u4_action_number.json"
+    [ "$(jq -r --arg action "$u4_action" --arg token "$u4_policy_token" --arg token_kind "$u4_token_kind" '
+      .operations[1].id == $action and
+      (if $token_kind == "protected" then .operations[1].privilege.action.policy_token == $token
+       else .operations[1].privilege.action.policy_token == null end) and
+      (.operations[1] | has("argv") | not)' "$tmp/u4-action-plan-$u4_action_number.json")" = true ] ||
+      fail "U4 did not seal the shared descriptor for $u4_action"
+    jq '.operations[1].privilege_request.source="caller"' "$tmp/u4-action-draft-$u4_action_number.json" \
+      >"$tmp/u4-action-source-$u4_action_number.json"
+    if "$cli" seal-plan "$tmp/u4-action-source-$u4_action_number.json" \
+        "$tmp/u4-action-ready-$u4_action_number.jsonl" "$tmp/u4-action-source-plan-$u4_action_number.json" \
+        >/dev/null 2>&1; then
+      fail "U4 accepted caller source controls for $u4_action"
+    fi
+  done
+
+  # Every standalone schema-3 catalog action enters the same fixed broker
+  # executor. The trusted internal Windows projection adds current protected
+  # SID/source-address/context plus the action-specific broker precondition;
+  # it never invents caller command controls.
+  jq '
+    if .kind == "privilege_broker" then
+      .data.protected_identity={host_id:.host_id,sid:"S-1-5-21-1-2-3-1001",
+        request_principal:"MachineUtilitiesRequest"} |
+      .data.observed_winget_context_digest={algorithm:"sha256",value:("9" * 64)}
+    else . end
+  ' "$tmp/u4-ready.jsonl" >"$tmp/u4-schema3-windows-ready.jsonl"
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    u4_schema3_fixture_root=$tmp
+    : >"$u4_schema3_fixture_root/u4-schema3-dispatches"
+    apply_privileged_plan_command() {
+      jq -r '.operations[0].id' "$1" >>"$u4_schema3_fixture_root/u4-schema3-dispatches"
+    }
+    u4_schema3_number=0
+    for u4_schema3_spec in \
+      'apt.autoremove.v1|updates|packages|posix-root-v1|none|none' \
+      'apt.install-package-version.v1|updates|packages|posix-root-v1|package-source-version-closure-set-sha256|protected' \
+      'apt.update-metadata.v1|updates|packages|posix-root-v1|none|none' \
+      'apt.upgrade-package.v1|updates|packages|posix-root-v1|package-source-channel-set-sha256|protected' \
+      'winget.install-machine-package.v1|updates|packages|windows-system-v1|winget-package-version-set-sha256|protected' \
+      'winget.inventory-machine.v1|updates|packages|windows-system-v1|none|none' \
+      'winget.upgrade-machine-package.v1|updates|packages|windows-system-v1|winget-package-channel-set-sha256|protected' \
+      'profile.apply-managed-bundle.v1|agents|agents|windows-user-s4u-v1|profile-bundle-set-sha256|protected' \
+      'profile.inventory-managed-state.v1|agents|agents|windows-user-s4u-v1|profile-bundle-set-sha256|protected'; do
+      IFS='|' read -r u4_schema3_action u4_schema3_domain u4_schema3_section \
+        u4_schema3_context u4_schema3_constraint u4_schema3_token <<EOF
+$u4_schema3_spec
+EOF
+      u4_schema3_number=$((u4_schema3_number + 1))
+      case $u4_schema3_context in
+        posix-root-v1)
+          u4_schema3_adapter=posix-sudo-v1
+          u4_schema3_principal=root
+          u4_schema3_boundary=linux
+          u4_schema3_transport=posix-ssh
+          u4_schema3_request_principal=machine-utilities
+          u4_schema3_target=test-apt
+          u4_schema3_snapshot=$tmp/u4-ready.jsonl
+          ;;
+        windows-system-v1)
+          u4_schema3_adapter=windows-scheduled-task-v1
+          u4_schema3_principal=LocalSystem
+          u4_schema3_boundary=windows
+          u4_schema3_transport=windows-sftp
+          u4_schema3_request_principal=MachineUtilitiesRequest
+          u4_schema3_target=test-windows
+          u4_schema3_snapshot=$tmp/u4-schema3-windows-ready.jsonl
+          ;;
+        windows-user-s4u-v1)
+          u4_schema3_adapter=windows-scheduled-task-v1
+          u4_schema3_principal=enrolled-s4u-user
+          u4_schema3_boundary=windows
+          u4_schema3_transport=windows-sftp
+          u4_schema3_request_principal=MachineUtilitiesRequest
+          u4_schema3_target=test-windows
+          u4_schema3_snapshot=$tmp/u4-schema3-windows-ready.jsonl
+          ;;
+      esac
+      if [ "$u4_schema3_token" = protected ]; then
+        u4_schema3_policy_token=fixture-token
+        u4_schema3_constraint_digest=$(printf 'a%.0s' {1..64})
+        u4_schema3_manager=$u4_schema3_constraint_digest
+      else
+        u4_schema3_policy_token=null
+        u4_schema3_constraint_digest=-
+        u4_schema3_manager=not-applicable
+      fi
+      if [ "$u4_schema3_boundary" = windows ]; then
+        u4_schema3_action_precondition=$(printf '7%.0s' {1..64})
+      else
+        u4_schema3_action_precondition=
+      fi
+      jq --arg action "$u4_schema3_action" --arg domain "$u4_schema3_domain" \
+        --arg section "$u4_schema3_section" --arg context "$u4_schema3_context" \
+        --arg constraint "$u4_schema3_constraint" --arg constraint_digest "$u4_schema3_constraint_digest" \
+        --arg policy_token "$u4_schema3_policy_token" --arg adapter "$u4_schema3_adapter" \
+        --arg principal "$u4_schema3_principal" --arg boundary "$u4_schema3_boundary" \
+        --arg transport "$u4_schema3_transport" --arg request_principal "$u4_schema3_request_principal" \
+        --arg manager "$u4_schema3_manager" --arg target "$u4_schema3_target" \
+        --arg precondition "$u4_schema3_action_precondition" '
+        .domain=$domain | .required_section=$section | .target=$target |
+        .operations[0].id=$action | .privilege.action.id=$action |
+        .privilege.action.policy_token=(if $policy_token == "null" then null else $policy_token end) |
+        .privilege.policy.constraint_kind=$constraint |
+        .privilege.policy.constraint_digest=$constraint_digest |
+        .privilege.broker.adapter=$adapter |
+        .privilege.context.required=$context |
+        .privilege.context.observed_execution_principal=$principal |
+        .privilege.context.platform_boundary=$boundary |
+        .privilege.context.manager_source_identity=$manager |
+        .privilege.request.transport=$transport |
+        .privilege.request.principal=$request_principal |
+        if $precondition == "" then . else
+          .precondition_digest.value=$precondition |
+          .privilege.precondition.digest.value=$precondition
+        end |
+        del(.plan_id,.plan_digest)
+      ' "$tmp/u1-privileged-plan.json" >"$tmp/u4-schema3-base-$u4_schema3_number.json"
+      u4_schema3_digest=$(jq -cS . "$tmp/u4-schema3-base-$u4_schema3_number.json" | sha256_stream)
+      u4_schema3_plan_id="plan-$(printf '%s' "$u4_schema3_digest" | cut -c 1-16)"
+      jq -S --arg plan_id "$u4_schema3_plan_id" --arg digest "$u4_schema3_digest" \
+        '. + {plan_id:$plan_id,plan_digest:{algorithm:"sha256",value:$digest}}' \
+        "$tmp/u4-schema3-base-$u4_schema3_number.json" >"$tmp/u4-schema3-$u4_schema3_number.json"
+      validate_privileged_plan_file "$tmp/u4-schema3-$u4_schema3_number.json" ||
+        fail "U4 did not retain a valid standalone schema-3 contract for $u4_schema3_action"
+      if [ "$u4_schema3_boundary" = windows ]; then
+        u4_schema3_observed_token=$u4_schema3_policy_token
+        [ "$u4_schema3_observed_token" != null ] || u4_schema3_observed_token=-
+        jq --arg action "$u4_schema3_action" --arg token "$u4_schema3_observed_token" \
+          --arg digest "$u4_schema3_action_precondition" '
+          if .kind == "privilege_broker" then
+            .data.observed_preconditions=[{action_id:$action,policy_token:$token,
+              digest:{algorithm:"sha256",value:$digest}}]
+          else . end
+        ' "$u4_schema3_snapshot" >"$tmp/u4-schema3-current-ready.jsonl"
+        u4_schema3_snapshot=$tmp/u4-schema3-current-ready.jsonl
+      fi
+      normalize_privileged_plan_for_broker_execution "$tmp/u4-schema3-$u4_schema3_number.json" \
+        "$u4_schema3_snapshot" "$tmp/u4-schema3-executable-$u4_schema3_number.json"
+      jq -e --arg action "$u4_schema3_action" --arg context "$u4_schema3_context" '
+        .schema_version == 4 and (.operations | length) == 1 and
+        (has("privilege") | not) and .operations[0].id == $action and
+        .operations[0].privilege.context.required == $context and
+        (.operations[0] | has("argv") | not) and
+        ([.. | objects | has("command") or has("dependency_controls") or has("source_controls")] | any | not) and
+        (if ($context | startswith("windows-")) then
+          .operations[0].privilege.request.target_uid == "-" and
+          .operations[0].privilege.request.request_sid == "S-1-5-21-1-2-3-1001" and
+          .operations[0].privilege.context.platform_context_digest.value == ("9" * 64) and
+          .operations[0].privilege.precondition.digest.value == ("7" * 64)
+        else
+          (.operations[0].privilege.request.target_uid | test("^(0|[1-9][0-9]*)$")) and
+          .operations[0].privilege.request.request_sid == "-" and
+          .operations[0].privilege.context.platform_context_digest == null
+        end)
+      ' "$tmp/u4-schema3-executable-$u4_schema3_number.json" >/dev/null ||
+        fail "U4 schema-3 normalization widened $u4_schema3_action"
+      apply_plan_command "$tmp/u4-schema3-$u4_schema3_number.json" "$u4_schema3_plan_id" \
+        "$tmp/u4-schema3-result-$u4_schema3_number.jsonl" false
+    done
+    [ "$(wc -l <"$u4_schema3_fixture_root/u4-schema3-dispatches" | tr -d ' ')" -eq 9 ] ||
+      fail "U4 did not route every standalone catalog action to the fixed schema-3 executor"
+  )
+
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    for u4_protocol in 0 1; do
+      for u4_control in readiness result_query drain revocation; do
+        privilege_protocol_supports_control "$u4_protocol" "$u4_control" ||
+          fail "U4 protocol $u4_protocol lost $u4_control compatibility"
+      done
+    done
+    privilege_protocol_supports_action 1 apt.update-metadata.v1 ||
+      fail "U4 current protocol lost a shared action"
+    if privilege_protocol_supports_action 0 apt.update-metadata.v1; then
+      fail "U4 previous read-only protocol admitted a mutation"
+    fi
+    [ "$(privilege_lifecycle_next_step 1 draining running false | jq -r '.next')" = \
+      wait_for_terminal_then_revoke_adapter_grant ] ||
+      fail "U4 normal revocation did not retain result lookup through terminalization"
+    [ "$(privilege_lifecycle_next_step 0 revoking running true | jq -r '.evidence')" = stale_or_partial ] ||
+      fail "U4 emergency revocation discarded partial/stale evidence"
+  )
+
+  # The portable profile builder emits the worker's exact length-prefixed,
+  # uncompressed manifest/payload form and excludes filesystem aliases.
+  mkdir "$tmp/u4-profile-source"
+  printf '%s\n' '{"model":"gpt-5.6"}' >"$tmp/u4-profile-source/codex.json"
+  printf '%s\n' 'service_tier = "priority"' >"$tmp/u4-profile-source/codex.toml"
+  jq -n '{schema:"machine-utilities.profile-bundle-spec",schema_version:1,
+    request_id:"request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    action_id:"profile.apply-managed-bundle.v1",policy_token:"profile-token",
+    target_sid:"S-1-5-21-1-2-3-2001",profile_root_id:("b" * 64),entries:[
+      {path:".codex/settings.json",handler:"json-scalar",artifact:"codex-settings",manager:"codex",
+        logical_identity:"codex-settings",operation:"write",source:"codex.json",
+        expected_presence:"absent",expected_sha256:"-",expected_manager:"-"},
+      {path:".codex/config.toml",handler:"toml-scalar",artifact:"codex-settings",manager:"codex",
+        logical_identity:"codex-settings",operation:"write",source:"codex.toml",
+        expected_presence:"absent",expected_sha256:"-",expected_manager:"-"}
+    ]}' >"$tmp/u4-profile-spec.json"
+  MACHINE_UTILITIES_CALLER=codex "$cli" profile-bundle "$tmp/u4-profile-spec.json" \
+    "$tmp/u4-profile-source" "$tmp/u4-codex.bundle"
+  MACHINE_UTILITIES_CALLER=claude "$cli" profile-bundle "$tmp/u4-profile-spec.json" \
+    "$tmp/u4-profile-source" "$tmp/u4-claude.bundle"
+  cmp -s "$tmp/u4-codex.bundle" "$tmp/u4-claude.bundle" ||
+    fail "U4 profile bundle bytes varied by caller"
+  jq '.extra="forbidden"' "$tmp/u4-profile-spec.json" >"$tmp/u4-profile-extra-spec.json"
+  if "$cli" profile-bundle "$tmp/u4-profile-extra-spec.json" "$tmp/u4-profile-source" \
+      "$tmp/u4-profile-extra-spec.bundle" >/dev/null 2>&1; then
+    fail "U4 profile builder accepted an unknown top-level control"
+  fi
+  jq '.entries[0].extra="forbidden"' "$tmp/u4-profile-spec.json" \
+    >"$tmp/u4-profile-extra-entry.json"
+  if "$cli" profile-bundle "$tmp/u4-profile-extra-entry.json" "$tmp/u4-profile-source" \
+      "$tmp/u4-profile-extra-entry.bundle" >/dev/null 2>&1; then
+    fail "U4 profile builder accepted an unknown per-entry control"
+  fi
+  u4_manifest_length=$(od -An -t u1 -N 8 "$tmp/u4-codex.bundle" |
+    awk '{ for (i=1; i<=NF; i++) value=(value*256)+$i } END { printf "%.0f", value }')
+  u4_payload_length=$(od -An -t u1 -j 8 -N 8 "$tmp/u4-codex.bundle" |
+    awk '{ for (i=1; i<=NF; i++) value=(value*256)+$i } END { printf "%.0f", value }')
+  dd if="$tmp/u4-codex.bundle" of="$tmp/u4-profile-manifest" bs=1 skip=16 \
+    count="$u4_manifest_length" 2>/dev/null
+  [ "$u4_payload_length" -eq $(( $(wc -c <"$tmp/u4-profile-source/codex.toml") +
+    $(wc -c <"$tmp/u4-profile-source/codex.json") )) ] &&
+    grep -Fqx "payload-length|$u4_payload_length" "$tmp/u4-profile-manifest" &&
+    [ "$(grep -c '^entry|' "$tmp/u4-profile-manifest")" -eq 2 ] ||
+    fail "U4 profile bundle did not publish canonical uncompressed lengths"
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    /bin/dd if=/dev/zero of="$tmp/u4-windows-payload-boundary" bs=1048576 count=0 seek=64 \
+      2>/dev/null
+    u4_sparse_blocks=$(stat -f %b "$tmp/u4-windows-payload-boundary" 2>/dev/null || \
+      stat -c %b "$tmp/u4-windows-payload-boundary")
+    [ $((u4_sparse_blocks * 512)) -lt 1048576 ] ||
+      fail "U4 Windows payload boundary fixture was physically allocated"
+    u4_boundary_length=$(wc -c <"$tmp/u4-windows-payload-boundary" | tr -d ' ')
+    assert_windows_broker_payload_length "$u4_boundary_length"
+    printf x >>"$tmp/u4-windows-payload-boundary"
+    if assert_windows_broker_payload_length \
+        "$(wc -c <"$tmp/u4-windows-payload-boundary" | tr -d ' ')" >/dev/null 2>&1; then
+      fail "U4 accepted a Windows payload one byte over the protected transport limit"
+    fi
+  )
+  ln -s codex.json "$tmp/u4-profile-source/codex-link.json"
+  jq '.entries[0].source="codex-link.json"' "$tmp/u4-profile-spec.json" >"$tmp/u4-profile-symlink.json"
+  if "$cli" profile-bundle "$tmp/u4-profile-symlink.json" "$tmp/u4-profile-source" \
+      "$tmp/u4-profile-symlink.bundle" >/dev/null 2>&1; then
+    fail "U4 profile builder followed a source symlink"
+  fi
+  ln "$tmp/u4-profile-source/codex.json" "$tmp/u4-profile-source/codex-hard.json"
+  jq '.entries[0].source="codex-hard.json"' "$tmp/u4-profile-spec.json" >"$tmp/u4-profile-hardlink.json"
+  if "$cli" profile-bundle "$tmp/u4-profile-hardlink.json" "$tmp/u4-profile-source" \
+      "$tmp/u4-profile-hardlink.bundle" >/dev/null 2>&1; then
+    fail "U4 profile builder accepted a multiply-linked source"
+  fi
+  jq '.entries += [(.entries[0] | .path=".CODEX/settings.json")]' "$tmp/u4-profile-spec.json" \
+    >"$tmp/u4-profile-case-collision.json"
+  if "$cli" profile-bundle "$tmp/u4-profile-case-collision.json" "$tmp/u4-profile-source" \
+      "$tmp/u4-profile-case-collision.bundle" >/dev/null 2>&1; then
+    fail "U4 profile builder accepted a case-colliding destination"
+  fi
+  dd if="$tmp/u4-codex.bundle" of="$tmp/u4-profile-payload" bs=1 \
+    skip=$((16 + u4_manifest_length)) count="$u4_payload_length" 2>/dev/null
+  u4_profile_entry_map=$(printf 'c%.0s' {1..64})
+  jq -n --arg entry_map "$u4_profile_entry_map" '{
+    id:"profile.apply-managed-bundle.v1",
+    privilege:{
+      action:{policy_token:"profile-token"},
+      request:{id:"request-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        request_sid:"S-1-5-21-1-2-3-1001"},
+      policy:{digest:{algorithm:"sha256",value:("c" * 64)},
+        constraints_digest:{algorithm:"sha256",value:("e" * 64)},constraint_generation:1,
+        constraint_digest:$entry_map},
+      enrollment:{epoch:1},context:{manager_source_identity:$entry_map}
+    }
+  }' >"$tmp/u4-profile-operation.json"
+  jq -n --arg entry_map "$u4_profile_entry_map" '{
+    policy_token:"profile-token",target_sid:"S-1-5-21-1-2-3-2001",
+    profile_root_id:("b" * 64),entry_map_digest:$entry_map,
+    marketplace_set_digest:("d" * 64),delete_mode:"managed-only",max_entries:2,max_bytes:1048576
+  }' >"$tmp/u4-profile-authorization.json"
+  jq --arg entry_map "$u4_profile_entry_map" '
+    if .kind == "privilege_broker" then
+      .status="present" | .data.lifecycle_status="ready" |
+      .data.protected_identity={host_id:.host_id,sid:"S-1-5-21-1-2-3-1001",
+        request_principal:"MachineUtilitiesRequest"} |
+      .data.observed_action_contexts=[{
+        action_id:"profile.apply-managed-bundle.v1",context_id:"windows-user-s4u-v1",
+        constraint_kind:"profile-bundle-set-sha256",constraint_digest:$entry_map,
+        constraint_generation:1,policy_tokens:["profile-token"],manager_source_identity:$entry_map,
+        profile_constraints:[{policy_token:"profile-token",target_sid:"S-1-5-21-1-2-3-2001",
+          profile_root_id:("b" * 64),entry_map_digest:$entry_map,
+          marketplace_set_digest:("d" * 64),delete_mode:"managed-only",max_entries:2,max_bytes:1048576}]
+      }]
+    else . end
+  ' "$tmp/u4-ready.jsonl" >"$tmp/u4-profile-ready.jsonl"
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    profile_authorization_from_snapshot "$tmp/u4-profile-ready.jsonl" \
+      "$tmp/u4-profile-operation.json" "$tmp/u4-profile-derived-authorization.json"
+    cmp -s "$tmp/u4-profile-derived-authorization.json" "$tmp/u4-profile-authorization.json" ||
+      fail "U4 did not preserve the distinct request SID and protected S4U target authorization"
+    validate_profile_bundle_for_operation "$tmp/u4-codex.bundle" \
+      "$tmp/u4-profile-operation.json" "$tmp/u4-profile-derived-authorization.json" ||
+      fail "U4 rejected a canonical profile bundle against its protected entry map"
+    jq '.privilege.request.request_sid="S-1-5-21-1-2-3-2001"' \
+      "$tmp/u4-profile-operation.json" >"$tmp/u4-profile-same-sid-operation.json"
+    if profile_authorization_from_snapshot "$tmp/u4-profile-ready.jsonl" \
+        "$tmp/u4-profile-same-sid-operation.json" "$tmp/u4-profile-same-sid-authorization.json" \
+        >/dev/null 2>&1; then
+      fail "U4 accepted one SID as both the SFTP request identity and S4U target identity"
+    fi
+    for u4_profile_projection_case in $(seq 1 10); do
+      jq --argjson case "$u4_profile_projection_case" '
+        if .kind == "privilege_broker" then
+          .data.observed_action_contexts[0].profile_constraints as $profiles |
+          if $case == 1 then .data.observed_action_contexts[0].profile_constraints[0].policy_token=""
+          elif $case == 2 then .data.observed_action_contexts[0].profile_constraints[0].target_sid="not-a-sid"
+          elif $case == 3 then .data.observed_action_contexts[0].profile_constraints[0].profile_root_id="bad"
+          elif $case == 4 then .data.observed_action_contexts[0].profile_constraints[0].entry_map_digest="bad"
+          elif $case == 5 then .data.observed_action_contexts[0].profile_constraints[0].marketplace_set_digest="bad"
+          elif $case == 6 then .data.observed_action_contexts[0].profile_constraints[0].delete_mode="all"
+          elif $case == 7 then .data.observed_action_contexts[0].profile_constraints[0].max_entries=0
+          elif $case == 8 then .data.observed_action_contexts[0].profile_constraints[0].max_bytes=0
+          elif $case == 9 then .data.observed_action_contexts[0].profile_constraints[0].extra="forbidden"
+          else .data.observed_action_contexts[0].profile_constraints += [$profiles[0]] end
+        else . end
+      ' "$tmp/u4-profile-ready.jsonl" >"$tmp/u4-profile-projection-tampered.jsonl"
+      if profile_authorization_from_snapshot "$tmp/u4-profile-projection-tampered.jsonl" \
+          "$tmp/u4-profile-operation.json" "$tmp/u4-profile-tampered-authorization.json" \
+          >/dev/null 2>&1; then
+        fail "U4 accepted malformed protected profile projection case $u4_profile_projection_case"
+      fi
+    done
+    u4_rebuild_profile_bundle() {
+      u4_bundle_manifest=$1
+      u4_bundle_output=$2
+      u4_bundle_manifest_length=$(wc -c <"$u4_bundle_manifest" | tr -d ' ')
+      {
+        write_u64_be "$u4_bundle_manifest_length"
+        write_u64_be "$u4_payload_length"
+        cat "$u4_bundle_manifest" "$tmp/u4-profile-payload"
+      } >"$u4_bundle_output"
+    }
+    for u4_profile_header_line in $(seq 2 9); do
+      awk -F '|' -v line="$u4_profile_header_line" 'NR == line { $0=$1 "|" } { print }' \
+        "$tmp/u4-profile-manifest" >"$tmp/u4-profile-mutated-manifest"
+      u4_rebuild_profile_bundle "$tmp/u4-profile-mutated-manifest" \
+        "$tmp/u4-profile-mutated.bundle"
+      if validate_profile_bundle_for_operation "$tmp/u4-profile-mutated.bundle" \
+          "$tmp/u4-profile-operation.json" "$tmp/u4-profile-authorization.json" \
+          >/dev/null 2>&1; then
+        fail "U4 accepted a profile bundle with header field $u4_profile_header_line removed"
+      fi
+    done
+    for u4_profile_entry_field in $(seq 1 14); do
+      awk -F '|' -v OFS='|' -v field="$u4_profile_entry_field" \
+        'NR == 10 { $field="" } { print }' "$tmp/u4-profile-manifest" \
+        >"$tmp/u4-profile-mutated-manifest"
+      u4_rebuild_profile_bundle "$tmp/u4-profile-mutated-manifest" \
+        "$tmp/u4-profile-mutated.bundle"
+      if validate_profile_bundle_for_operation "$tmp/u4-profile-mutated.bundle" \
+          "$tmp/u4-profile-operation.json" "$tmp/u4-profile-authorization.json" \
+          >/dev/null 2>&1; then
+        fail "U4 accepted a profile bundle with entry field $u4_profile_entry_field removed"
+      fi
+    done
+  )
+
+  # A protected plan is classified before any legacy SSH/SCP call.
+  mkdir "$tmp/u4-fake-transport"
+  for u4_transport_command in ssh scp; do
+    printf '#!/bin/sh\nprintf invoked >"%s"\nexit 99\n' "$tmp/u4-legacy-transport-invoked" \
+      >"$tmp/u4-fake-transport/$u4_transport_command"
+    chmod +x "$tmp/u4-fake-transport/$u4_transport_command"
+  done
+  if PATH="$tmp/u4-fake-transport:$PATH" "$cli" apply-ssh-plan "$tmp/u4-plan.json" \
+      "$(jq -r '.plan_id' "$tmp/u4-plan.json")" "$tmp/u4-legacy-result.jsonl" \
+      >"$tmp/u4-legacy.stdout" 2>"$tmp/u4-legacy.stderr"; then
+    fail "U4 routed schema 4 through the legacy SSH workspace"
+  fi
+  [ ! -e "$tmp/u4-legacy-transport-invoked" ] &&
+    grep -Fq 'legacy SSH accepts only ordinary schema 2 plans' "$tmp/u4-legacy.stderr" ||
+    fail "U4 protected-plan classifier ran after legacy transport"
+  jq '.operations[0].policy_token="forbidden"' "$tmp/u1-unprivileged-plan.json" \
+    >"$tmp/u4-schema2-protected.json"
+  chmod 600 "$tmp/u4-schema2-protected.json"
+  if PATH="$tmp/u4-fake-transport:$PATH" "$cli" apply-ssh-plan "$tmp/u4-schema2-protected.json" \
+      "$(jq -r '.plan_id' "$tmp/u4-schema2-protected.json")" "$tmp/u4-schema2-protected-result.jsonl" \
+      >/dev/null 2>&1; then
+    fail "U4 legacy SSH accepted protected fields injected into schema 2"
+  fi
+  [ ! -e "$tmp/u4-legacy-transport-invoked" ] ||
+    fail "U4 schema-2 protected-field rejection reached transport"
+
+  # A mocked Windows SFTP route observes exactly four preallocated uploads,
+  # commit last, an empty machine payload, and one sanitized result download.
+  jq '
+    .target="test-windows" |
+    .operations[1].id="winget.inventory-machine.v1" |
+    .operations[1].privilege.action={id:"winget.inventory-machine.v1",policy_token:null} |
+    .operations[1].privilege.broker.adapter="windows-scheduled-task-v1" |
+    .operations[1].privilege.policy.constraint_kind="none" |
+    .operations[1].privilege.policy.constraint_digest="-" |
+    .operations[1].privilege.context.required="windows-system-v1" |
+    .operations[1].privilege.context.observed_execution_principal="LocalSystem" |
+    .operations[1].privilege.context.platform_boundary="windows" |
+    .operations[1].privilege.context.manager_source_identity="not-applicable" |
+    .operations[1].privilege.context.platform_context_digest={algorithm:"sha256",value:("9" * 64)} |
+    .operations[1].privilege.request.transport="windows-sftp" |
+    .operations[1].privilege.request.principal="MachineUtilitiesRequest" |
+    .operations[1].privilege.request.target_uid="-" |
+    .operations[1].privilege.request.request_sid="S-1-5-21-1-2-3-2001" |
+    del(.plan_id,.plan_digest)
+  ' "$tmp/u4-plan.json" >"$tmp/u4-windows-base.json"
+  u4_windows_digest=$(jq -cS . "$tmp/u4-windows-base.json" | shasum -a 256 | awk '{print $1}')
+  u4_windows_plan_id="plan-${u4_windows_digest:0:16}"
+  jq -S --arg plan_id "$u4_windows_plan_id" --arg digest "$u4_windows_digest" \
+    '. + {plan_id:$plan_id,plan_digest:{algorithm:"sha256",value:$digest}}' \
+    "$tmp/u4-windows-base.json" >"$tmp/u4-windows-plan.json"
+  mkdir "$tmp/u4-windows-slot"
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    u4_windows_fixture_root=$tmp
+    u4_windows_plan_path=$tmp/u4-windows-plan.json
+    make_windows_broker_slot "$tmp/u4-windows-plan.json" 1 - "$tmp/u4-windows-slot"
+    [ ! -s "$tmp/u4-windows-slot/payload" ] || fail "U4 machine request carried payload bytes"
+    invoke_windows_sftp_batch() { cp "$7" "$tmp/u4-windows-submit.batch"; }
+    windows_sftp_submit_slot test-windows "$tmp/u4-windows-slot"
+    awk -F '"' '{ print $4 }' "$tmp/u4-windows-submit.batch" >"$tmp/u4-windows-remotes"
+    printf '%s\n' '/ingress/slot/request' '/ingress/slot/request.sig' \
+      '/ingress/slot/payload' '/ingress/slot/commit' >"$tmp/u4-windows-expected-remotes"
+    [ "$(wc -l <"$tmp/u4-windows-submit.batch" | tr -d ' ')" -eq 4 ] &&
+      cmp -s "$tmp/u4-windows-remotes" "$tmp/u4-windows-expected-remotes" &&
+      ! grep -Eiq '(^|[[:space:]])(mkdir|ls|exec|scp|shell)([[:space:]]|$)' \
+        "$tmp/u4-windows-submit.batch" ||
+      fail "U4 Windows SFTP submission did not use the four canonical slot paths with commit last"
+    invoke_windows_sftp_batch() {
+      u4_poll_local=$(awk -F '"' 'NR == 1 { print $4 }' "$7")
+      {
+        printf '%s\n' 'windows-broker-public|1' 'state|completed' 'reason|post_state_verified'
+        printf 'request-id|%s\n' "$(jq -r '.operations[1].privilege.request.id' "$u4_windows_plan_path")"
+        printf 'plan-id|%s\n' "$u4_windows_plan_id"
+        printf '%s\n' 'action-id|winget.inventory-machine.v1' 'enrollment-epoch|1'
+        printf 'protected-result-sha256|%s\n' "$(printf '8%.0s' {1..64})"
+        printf '%s\n' 'end-public|'
+      } >"$u4_poll_local"
+      cp "$u4_poll_local" "$u4_windows_fixture_root/u4-windows-public-result"
+      cp "$7" "$u4_windows_fixture_root/u4-windows-poll.batch"
+    }
+    windows_sftp_poll_result test-windows "$tmp/u4-windows-plan.json" 1 "$tmp/u4-windows-outcome"
+    IFS='|' read -r u4_windows_state u4_windows_reason u4_windows_kind \
+      u4_windows_protected_digest u4_windows_projection_digest <"$tmp/u4-windows-outcome"
+    [ "$u4_windows_state" = completed ] && [ "$u4_windows_reason" = post_state_verified ] &&
+      [ "$u4_windows_kind" = windows-protected-result-sha256 ] &&
+      [ "$u4_windows_protected_digest" = "$(printf '8%.0s' {1..64})" ] &&
+      [ "$u4_windows_projection_digest" = "$(sha256_file "$tmp/u4-windows-public-result")" ] &&
+      [ "$(wc -l <"$tmp/u4-windows-poll.batch" | tr -d ' ')" -eq 1 ] &&
+      grep -Fq "/results/$(jq -r '.operations[1].privilege.request.id' "$u4_windows_plan_path").result" \
+        "$tmp/u4-windows-poll.batch" &&
+      ! grep -Eq '(^|[[:space:]])put([[:space:]]|$)' "$tmp/u4-windows-poll.batch" ||
+      fail "U4 Windows result polling was not one canonical result-only lookup"
+    : >"$tmp/u4-windows-operation-record.jsonl"
+    write_mixed_apply_operation_record "$tmp/u4-windows-operation-record.jsonl" \
+      "$tmp/u4-windows-plan.json" 1 u4-result-snapshot test-windows \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" completed "$u4_windows_reason" "$u4_windows_state" \
+      "$u4_windows_kind" "$u4_windows_protected_digest" "$u4_windows_projection_digest"
+    jq -e --arg protected "$u4_windows_protected_digest" \
+      --arg projection "$u4_windows_projection_digest" '
+      .data.authoritative_result_evidence.kind == "windows-protected-result-sha256" and
+      .data.authoritative_result_evidence.digest.value == $protected and
+      .data.authoritative_result_evidence.public_projection_digest.value == $projection and
+      any(.evidence[]; .source == "protected-terminal" and .digest.value == $protected and
+        .public_projection_digest.value == $projection)
+    ' "$tmp/u4-windows-operation-record.jsonl" >/dev/null ||
+      fail "U4 operation record discarded protected Windows terminal evidence"
+    for u4_public_line in $(seq 2 8); do
+      awk -F '|' -v line="$u4_public_line" 'NR == line { $0=$1 "|" } { print }' \
+        "$tmp/u4-windows-public-result" >"$tmp/u4-windows-mutated-result"
+      if windows_public_terminal_result "$tmp/u4-windows-mutated-result" \
+          "$(jq -r '.operations[1].privilege.request.id' "$u4_windows_plan_path")" \
+          "$u4_windows_plan_id" winget.inventory-machine.v1 1 >/dev/null 2>&1; then
+        fail "U4 accepted a Windows terminal result with field $u4_public_line removed"
+      fi
+    done
+    {
+      sed '$d' "$tmp/u4-windows-public-result"
+      printf '%s\n' 'unexpected|secret' 'end-public|'
+    } >"$tmp/u4-windows-leaky-result"
+    if windows_public_terminal_result "$tmp/u4-windows-leaky-result" \
+        "$(jq -r '.operations[1].privilege.request.id' "$tmp/u4-windows-plan.json")" \
+        "$u4_windows_plan_id" winget.inventory-machine.v1 1 >/dev/null 2>&1; then
+      fail "U4 accepted an extended/leaky Windows public result"
+    fi
+
+    # Result lookup is bounded to five fixed reads. It never resubmits the
+    # request slot, and expiry is distinct from a broker-authored terminal.
+    : >"$u4_windows_fixture_root/u4-windows-poll-calls"
+    invoke_windows_sftp_batch() {
+      printf x >>"$u4_windows_fixture_root/u4-windows-poll-calls"
+      cp "$7" "$u4_windows_fixture_root/u4-windows-miss.batch"
+      return 1
+    }
+    windows_poll_sleep() { :; }
+    set +e
+    windows_sftp_poll_result test-windows "$tmp/u4-windows-plan.json" 1 \
+      "$tmp/u4-windows-miss-outcome"
+    u4_windows_miss_rc=$?
+    set -e
+    [ "$u4_windows_miss_rc" -eq 70 ] &&
+      [ "$(wc -c <"$tmp/u4-windows-poll-calls" | tr -d ' ')" -eq 5 ] &&
+      [ "$(cat "$tmp/u4-windows-miss-outcome")" = \
+        'partial|windows_result_queued_or_transport_unavailable|-|-|-' ] &&
+      grep -Fq "/results/$(jq -r '.operations[1].privilege.request.id' "$u4_windows_plan_path").result" \
+        "$tmp/u4-windows-miss.batch" &&
+      ! grep -Eq '(^|[[:space:]])put([[:space:]]|$)' "$tmp/u4-windows-miss.batch" ||
+      fail "U4 Windows result polling was not bounded to five result-only reads"
+    rm -f "$u4_windows_fixture_root/u4-windows-expiry-invoked"
+    windows_poll_clock() { printf '%s\n' 9999999999; }
+    invoke_windows_sftp_batch() {
+      : >"$u4_windows_fixture_root/u4-windows-expiry-invoked"
+      return 1
+    }
+    set +e
+    windows_sftp_poll_result test-windows "$tmp/u4-windows-plan.json" 1 \
+      "$tmp/u4-windows-expired-outcome"
+    u4_windows_expired_rc=$?
+    set -e
+    [ "$u4_windows_expired_rc" -eq 70 ] && [ ! -e "$tmp/u4-windows-expiry-invoked" ] &&
+      [ "$(cat "$tmp/u4-windows-expired-outcome")" = \
+        'stale|windows_result_expired_without_terminal|-|-|-' ] ||
+      fail "U4 Windows result expiry did not terminate before transport"
+    invoke_windows_sftp_batch() {
+      u4_lookup_local=$(awk -F '"' 'NR == 1 { print $4 }' "$7")
+      {
+        printf '%s\n' 'windows-broker-public|1' 'state|completed' 'reason|post_state_verified'
+        printf 'request-id|%s\n' "$(jq -r '.operations[1].privilege.request.id' "$u4_windows_plan_path")"
+        printf 'plan-id|%s\n' "$u4_windows_plan_id"
+        printf '%s\n' 'action-id|winget.inventory-machine.v1' 'enrollment-epoch|1'
+        printf 'protected-result-sha256|%s\n' "$(printf '8%.0s' {1..64})"
+        printf '%s\n' 'end-public|'
+      } >"$u4_lookup_local"
+      cp "$7" "$u4_windows_fixture_root/u4-windows-expired-lookup.batch"
+    }
+    lookup_privilege_result_command "$tmp/u4-windows-plan.json" 1 \
+      "$tmp/u4-windows-expired-lookup-outcome"
+    [ "$(cut -d '|' -f 1 "$tmp/u4-windows-expired-lookup-outcome")" = completed ] &&
+      [ "$(wc -l <"$tmp/u4-windows-expired-lookup.batch" | tr -d ' ')" -eq 1 ] &&
+      grep -Eq '^get "/results/request-[0-9a-f]{32}[.]result" "[^"]+"$' \
+        "$tmp/u4-windows-expired-lookup.batch" &&
+      ! grep -Eq '(^|[[:space:]])put([[:space:]]|$)' "$tmp/u4-windows-expired-lookup.batch" ||
+      fail "U4 expired Windows result lookup did not remain a bounded result-only poll"
+  )
+
+  (
+    # shellcheck source=/dev/null
+    . "$tmp/u4-machine-functions.sh"
+    write_posix_dispatch_request ordinary-plan "$tmp/u1-ssh-worker-config.json" \
+      "$tmp/u1-partial-plan.json" "$tmp/u4-posix-dispatch"
+    [ "$(sed -n '1p' "$tmp/u4-posix-dispatch")" = 'posix-dispatch|1' ] &&
+      grep -Fqx 'mode|ordinary-plan' "$tmp/u4-posix-dispatch" ||
+      fail "U4 did not emit the fixed bounded POSIX dispatcher framing"
+  )
+  if SSH_ORIGINAL_COMMAND=whoami "$cli" dispatch-posix-request <"$tmp/u4-posix-dispatch" \
+      >/dev/null 2>"$tmp/u4-posix-dispatch.stderr"; then
+    fail "U4 fixed POSIX dispatcher accepted SSH_ORIGINAL_COMMAND"
+  fi
+  grep -Fq 'rejects SSH_ORIGINAL_COMMAND' "$tmp/u4-posix-dispatch.stderr" ||
+    fail "U4 POSIX dispatcher did not classify the original command before payload processing"
+
+  set +e
+  "$cli" apply-plan "$tmp/u4-plan.json" "$(jq -r '.plan_id' "$tmp/u4-plan.json")" "$tmp/u4-no-canary-result.jsonl" >/dev/null
+  u4_apply_rc=$?
+  set -e
+  [ "$u4_apply_rc" -eq 70 ] || fail "U4 readiness failure was not an authoritative partial apply"
+  "$cli" validate "$tmp/u4-no-canary-result.jsonl"
+  u4_operation_statuses=$(jq -c -s '[.[] | select(.kind == "operation" and (.id | startswith("apply:"))) | .data.operation_status] | sort' "$tmp/u4-no-canary-result.jsonl")
+  [ "$u4_operation_statuses" = '["failed","partial","skipped"]' ] ||
+    fail "U4 did not emit indexed failed/skipped operation records"
+  grep -Fq '/usr/bin/sudo -n /usr/libexec/machine-utilities/posix-broker' "$plugin_cache/scripts/machine-utilities" &&
+    grep -Fq 'broker.query-result.v1' "$plugin_cache/scripts/machine-utilities" ||
+    fail "U4 did not retain a fixed broker-only submit/query path"
+}
+
+[ "${MACHINE_UTILITIES_TEST_SCOPE:-}" != u4-contracts ] || {
+  test_u4_contracts
+  printf 'PASS: U4 contracts\n'
+  exit 0
+}
+
+test_u5_contracts() {
+  jq '
+    .machines["test-apt"].transport="ssh" |
+    .machines["test-apt"].ssh_alias="hostile-ordinary-ssh-alias" |
+    .machines["test-apt"].privilege_broker.automation_transport={
+      mode:"posix-ssh",host:"linux.example.invalid",port:22,
+      request_user:"machine-utilities",
+      pinned_host_key_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      management_networks:["192.0.2.0/24"]
+    } |
+    .machines["test-windows"].privilege_broker.automation_transport={
+      mode:"windows-sftp",host:"windows.example.invalid",port:22,
+      request_user:"MachineUtilitiesRequest",
+      request_sid:"S-1-5-21-1-2-3-2001",
+      pinned_host_key_fingerprint:"SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      management_networks:["192.0.2.0/24"]
+    } |
+    .machines["test-wsl"]={platform:"wsl",transport:"local",
+      expected_hostname:.machines["test-apt"].expected_hostname,
+      expected_user:.machines["test-apt"].expected_user,groups:["development"],
+      package_managers:["apt"],dev_root:"~/dev"}
+  ' "$tmp/config.json" >"$tmp/u5-config.json"
+  chmod 600 "$tmp/u5-config.json"
+  jq 'del(.machines["test-windows"].privilege_broker.automation_transport.request_sid)' \
+    "$tmp/u5-config.json" >"$tmp/u5-config-without-request-sid.json"
+  chmod 600 "$tmp/u5-config-without-request-sid.json"
+  if MACHINE_UTILITIES_CONFIG="$tmp/u5-config-without-request-sid.json" \
+      "$cli" validate-config >/dev/null 2>&1; then
+    fail "U5 Windows SFTP configuration accepted a missing ceremony-derived request SID"
+  fi
+
+  MACHINE_UTILITIES_CONFIG="$tmp/u5-config.json" \
+    "$cli" prepare-privilege-enrollment test-apt "$tmp/u5-linux-enrollment.json"
+  jq -e '
+    .schema == "machine-utilities.privilege-enrollment-preparation" and
+    .state == "needs_human_enrollment" and .reason == "local_passworded_sudo_required" and
+    .activation_performed == false and
+    (.fixed_entrypoints | map(.path) | index("scripts/enroll-privilege-posix") != null) and
+    (.fixed_entrypoints | map(.path) | index("scripts/enroll-ssh-posix") != null) and
+    (.credential_handling | contains("never_requests_or_relays"))
+  ' "$tmp/u5-linux-enrollment.json" >/dev/null ||
+    fail "U5 Linux enrollment preparation crossed or omitted the human boundary"
+
+  MACHINE_UTILITIES_CONFIG="$tmp/u5-config.json" \
+    "$cli" prepare-privilege-enrollment test-windows "$tmp/u5-windows-enrollment.json"
+  jq -e '
+    .platform == "windows" and .route == "windows-sftp" and
+    .state == "needs_human_enrollment" and .activation_performed == false and
+    (.fixed_entrypoints | map(.path) | index("scripts/enroll-privilege-windows.ps1") != null) and
+    (.fixed_entrypoints | map(.path) | index("scripts/enroll-windows-sftp.ps1") != null) and
+    .configured_request_sid == "S-1-5-21-1-2-3-2001" and
+    .request_sid_source == "authenticated_signed_controller_intent_or_receipt_only" and
+    (.required_public_artifacts | index("windows-winget-provider.lock") != null)
+  ' "$tmp/u5-windows-enrollment.json" >/dev/null ||
+    fail "U5 Windows enrollment preparation omitted WinGet, SFTP, or UAC guidance"
+
+  set +e
+  MACHINE_UTILITIES_CONFIG="$tmp/u5-config.json" \
+    "$cli" prepare-privilege-enrollment test-wsl "$tmp/u5-wsl-enrollment.json"
+  u5_wsl_rc=$?
+  set -e
+  [ "$u5_wsl_rc" -eq 69 ] &&
+    [ "$(jq -r '.reason' "$tmp/u5-wsl-enrollment.json")" = unsupported_security_boundary ] ||
+    fail "U5 WSL enrollment preparation did not fail as unsupported_security_boundary"
+
+  MACHINE_UTILITIES_CONFIG="$tmp/u5-config.json" \
+    "$cli" preview-privilege-upgrade test-apt "$tmp/u5-upgrade.json"
+  MACHINE_UTILITIES_CONFIG="$tmp/u5-config.json" \
+    "$cli" preview-privilege-revocation test-windows "$tmp/u5-revocation.json"
+  jq -e '.activation_performed == false and .allow_submit == false and
+    .allow_result_query == true and (.credential_handling | contains("never_requests_or_relays"))' \
+    "$tmp/u5-upgrade.json" "$tmp/u5-revocation.json" >/dev/null ||
+    fail "U5 lifecycle previews authorized a mutation or credential relay"
+  jq -e '.normal_sequence == ["drain","reject_new_submissions","recover_terminal_result",
+    "revoke_adapter_grant","remove_transport_authorization"]' "$tmp/u5-revocation.json" >/dev/null ||
+    fail "U5 revocation preview omitted drain and result recovery"
+
+  "$plugin_cache/scripts/prepare-ssh-identity" preview fleet.example u5-node \
+    machine-utilities-posix,machine-utilities-windows 192.0.2.0/24 \
+    >"$tmp/u5-identity-preview"
+  grep -Fq 'operation|prepare' "$tmp/u5-identity-preview" &&
+    grep -Fq 'private-key-storage|owner-only-nonsynced-local-state' "$tmp/u5-identity-preview" &&
+    sed -n '/^prepare_privilege_identity_command()/,/^)/p' "$cli" |
+      grep -Fq '"$script_dir/prepare-ssh-identity" prepare' ||
+    fail "U5 identity preparation was not a thin public-only fixed-helper wrapper"
+
+  set +e
+  "$cli" not-a-command >"$tmp/u5-usage.stdout" 2>"$tmp/u5-usage.stderr"
+  u5_usage_rc=$?
+  set -e
+  [ "$u5_usage_rc" -eq 64 ] || fail "U5 CLI usage did not reject an unknown command"
+  for u5_command in privilege-status prepare-privilege-identity prepare-privilege-enrollment \
+      verify-privilege-plan submit-privilege-plan lookup-privilege-result \
+      preview-privilege-upgrade preview-privilege-revocation; do
+    grep -Fq "machine-utilities $u5_command" "$tmp/u5-usage.stderr" ||
+      fail "U5 CLI usage omitted $u5_command"
+  done
+  jq -n '{schema_version:2}' >"$tmp/u5-ordinary-plan.json"
+  chmod 600 "$tmp/u5-ordinary-plan.json"
+  if "$cli" verify-privilege-plan "$tmp/u5-ordinary-plan.json" "$tmp/missing-snapshot" \
+      >/dev/null 2>&1; then
+    fail "U5 privilege verifier accepted an ordinary plan"
+  fi
+  if "$cli" submit-privilege-plan "$tmp/u5-ordinary-plan.json" plan-0000000000000000 \
+      "$tmp/u5-ordinary-result" >/dev/null 2>&1; then
+    fail "U5 privilege submitter accepted an ordinary plan"
+  fi
+  sed -n '/^lookup_privilege_result_command()/,/^)/p' "$cli" >"$tmp/u5-result-lookup-body"
+  grep -Fq 'broker.query-result.v1' "$tmp/u5-result-lookup-body" &&
+    grep -Fq 'windows_sftp_poll_result' "$tmp/u5-result-lookup-body" &&
+    ! grep -Fq 'windows_sftp_submit_slot' "$tmp/u5-result-lookup-body" ||
+    fail "U5 result lookup did not remain a result-only wrapper"
+
+  # A protected POSIX broker route is not an ordinary SSH lane. The fixture
+  # deliberately supplies an hostile SSH alias and agent, but observes only
+  # the pinned route tuple, a no-config/no-agent client, and a framed stdin
+  # request. The target UID is intentionally unlike the controller UID.
+  (
+    # shellcheck source=/dev/null
+    awk '/^command=/{exit} {print}' "$cli" >"$tmp/u5-machine-functions.sh"
+    . "$tmp/u5-machine-functions.sh"
+    u5_fixture_root=$tmp
+    u5_ssh_root="$tmp/u5-fixed-ssh"
+    mkdir -p "$u5_ssh_root/bin"
+    cat >"$u5_ssh_root/bin/ssh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cat >"$root/stdin"
+{
+  printf 'ssh-auth-sock-present|%s\n' "${SSH_AUTH_SOCK+x}"
+  printf 'ssh-auth-sock-value|%s\n' "${SSH_AUTH_SOCK-}"
+  printf 'home|%s\n' "${HOME-}"
+  for arg in "$@"; do printf 'arg|%s\n' "$arg"; done
+} >"$root/invocation"
+payload="$root/payload"
+if grep -Fqx 'mode|readiness' "$root/stdin"; then
+  snapshot=$(awk -F '|' '$1 == "snapshot-id" { print $2; exit }' "$root/stdin")
+  [ -n "$snapshot" ]
+  printf '%s\n' \
+    "{\"schema\":\"machine-utilities.inventory\",\"schema_version\":1,\"snapshot_id\":\"$snapshot\",\"host_id\":\"test-apt\",\"kind\":\"privilege_broker\",\"id\":\"readiness\",\"observed_at\":\"2026-08-03T00:00:00Z\",\"status\":\"present\",\"confidence\":\"high\",\"data\":{\"lifecycle_status\":\"ready\",\"transport\":\"posix-ssh\",\"transport_ready\":false,\"node_identity_ready\":false,\"originating_node_identity\":null,\"broker_ready\":true,\"action_context_ready\":true,\"adapter_mechanism_ready\":true,\"protected_identity\":{\"host_id\":\"test-apt\",\"uid\":4242,\"request_principal\":\"machine-utilities\",\"pinned_host_key_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"fleet_ca_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"ca_generation\":1},\"pinned_host_key_fingerprint\":\"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"request_principal\":\"machine-utilities\"},\"evidence\":[],\"errors\":[]}" >"$payload"
+else
+  printf '%s\n' 'remote-broker-result' >"$payload"
+fi
+if command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum "$payload" | awk '{print $1}')
+else digest=$(shasum -a 256 "$payload" | awk '{print $1}'); fi
+printf '%s\n' 'posix-dispatch-result|1' "mode|$(awk -F '|' '$1 == "mode" { print $2; exit }' "$root/stdin")" \
+  'status|completed' 'exit-code|0' "payload-length|$(wc -c <"$payload" | tr -d ' ')" \
+  "payload-sha256|$digest" 'end-header|'
+cat "$payload"
+SH
+    chmod +x "$u5_ssh_root/bin/ssh"
+    cat >"$tmp/u5-origin.json" <<'JSON'
+{"schema":"machine-utilities.originating-node-identity","schema_version":1,"fleet_domain":"fleet.example","node_id":"origin-a","node_key_fingerprint":"SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","fleet_ca_fingerprint":"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ca_generation":1,"certificate_serial":"1","certificate_valid_after":"2025-01-01T00:00:00Z","certificate_valid_before":"2099-01-01T00:00:00Z","certificate_principals":["machine-utilities-posix"],"certificate_source_addresses":["192.0.2.0/24"]}
+JSON
+    printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureCertificate fixture' >"$tmp/u5-cert.pub"
+    jq -n --arg certificate "$tmp/u5-cert.pub" '{
+      certificate_path:$certificate,node_id:"origin-a",fleet_domain:"fleet.example",
+      fleet_ca_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",ca_generation:1,
+      node_key_fingerprint:"SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      certificate_serial:"1",certificate_valid_after:"2025-01-01T00:00:00Z",
+      certificate_valid_before:"2099-01-01T00:00:00Z",certificate_source_addresses:["192.0.2.0/24"]
+    }' >"$tmp/u5-identity.json"
+    chmod 600 "$tmp/u5-origin.json" "$tmp/u5-cert.pub" "$tmp/u5-identity.json"
+    cat >"$tmp/u5-ssh-keygen" <<'SH'
+#!/bin/sh
+if [ "${1:-}" = -Y ] && [ "${2:-}" = sign ]; then
+  last=
+  for argument in "$@"; do last=$argument; done
+  printf '%s\n' 'fixture-signature' >"$last.sig"
+fi
+SH
+    chmod +x "$tmp/u5-ssh-keygen"
+    validate_node_identity_file() { :; }
+    public_node_identity() { cat "$u5_fixture_root/u5-origin.json"; }
+    system_ssh_path() { printf '%s\n' "$u5_ssh_root/bin/ssh"; }
+    system_ssh_keygen_path() { printf '%s\n' "$u5_fixture_root/u5-ssh-keygen"; }
+    export MACHINE_UTILITIES_CONFIG="$tmp/u5-config.json"
+    export MACHINE_UTILITIES_IDENTITY="$tmp/u5-identity.json"
+    export HOME="$tmp/u5-hostile-home"
+    export SSH_AUTH_SOCK="$tmp/u5-hostile-agent"
+
+    # The forced remote entrypoint accepts only the bounded readiness request:
+    # no command argument, no original command, no workerless request.
+    prepare_posix_readiness_worker_config test-apt "$tmp/u5-dispatch-worker.json"
+    write_posix_readiness_request test-apt readiness-20260803T000000Z-1 "$tmp/u5-dispatch-request"
+    write_posix_dispatch_request readiness "$tmp/u5-dispatch-worker.json" \
+      "$tmp/u5-dispatch-request" "$tmp/u5-dispatch-frame"
+    "$cli" dispatch-posix-request <"$tmp/u5-dispatch-frame" >"$tmp/u5-dispatch-response"
+    u5_dispatch_metadata=$(read_posix_dispatch_result readiness "$tmp/u5-dispatch-response" \
+      "$tmp/u5-dispatch-records.jsonl")
+    [ "$u5_dispatch_metadata" = 'completed|0' ] &&
+      jq -e -s '[.[] | select(.kind == "privilege_broker" and .id == "readiness")] | length == 1' \
+        "$tmp/u5-dispatch-records.jsonl" >/dev/null ||
+      fail "U5 fixed dispatcher did not run the bounded readiness collector"
+    if SSH_ORIGINAL_COMMAND=hostile "$cli" dispatch-posix-request <"$tmp/u5-dispatch-frame" \
+        >/dev/null 2>&1; then
+      fail "U5 fixed dispatcher accepted an SSH original command for readiness"
+    fi
+    write_posix_dispatch_request broker-envelope - "$tmp/u5-dispatch-request" "$tmp/u5-workerless-frame"
+    sed 's/^mode|broker-envelope$/mode|readiness/' "$tmp/u5-workerless-frame" \
+      >"$tmp/u5-workerless-readiness-frame"
+    if "$cli" dispatch-posix-request <"$tmp/u5-workerless-readiness-frame" >/dev/null 2>&1; then
+      fail "U5 fixed dispatcher accepted a workerless readiness request"
+    fi
+
+    printf '%s\n' 'request|1' 'target-host-id|test-apt' 'target-uid|4242' >"$tmp/u5-envelope"
+    invoke_posix_broker_for_target test-apt "$tmp/u5-envelope" "$tmp/u5-broker-output"
+    [ "$(cat "$tmp/u5-broker-output")" = remote-broker-result ] &&
+      grep -Fqx 'mode|broker-envelope' "$u5_ssh_root/stdin" &&
+      grep -Fqx 'worker-length|0' "$u5_ssh_root/stdin" &&
+      grep -Fqx 'target-uid|4242' "$u5_ssh_root/stdin" &&
+      grep -Fqx 'ssh-auth-sock-present|x' "$u5_ssh_root/invocation" &&
+      grep -Fqx 'ssh-auth-sock-value|' "$u5_ssh_root/invocation" &&
+      grep -Fqx 'home|/nonexistent' "$u5_ssh_root/invocation" &&
+      grep -Fqx 'arg|-F' "$u5_ssh_root/invocation" &&
+      grep -Fqx 'arg|/dev/null' "$u5_ssh_root/invocation" &&
+      grep -Fqx 'arg|linux.example.invalid' "$u5_ssh_root/invocation" &&
+      ! grep -Fq 'hostile-ordinary-ssh-alias' "$u5_ssh_root/invocation" ||
+      fail "U5 protected POSIX submit used ambient SSH configuration or local routing"
+
+    u5_digest=$(printf 'a%.0s' {1..64})
+    jq -n --arg digest "$u5_digest" '{
+      plan_id:"plan-u5-remote",target:"test-apt",operations:[{
+        type:"semantic-action",id:"apt.update-metadata.v1",privilege:{
+          context:{required:"posix-root-v1",manager_source_identity:"not-applicable",canary_digest:{value:$digest}},
+          request:{id:"request-u5-remote",target_uid:"4242",created_at:"2026-08-03T00:00:00Z",expires_at:"2099-01-01T00:00:00Z",originating_node_id:"origin-a",principal:"machine-utilities",certificate_source_addresses:["192.0.2.0/24"]},
+          action:{policy_token:null},broker:{protocol_version:1,version:"1",digest:{value:$digest}},
+          policy:{digest:{value:$digest},constraints_digest:{value:$digest}},
+          enrollment:{fleet_domain:"fleet.example",fleet_ca_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",ca_generation:1,certificate_valid_after:"2025-01-01T00:00:00Z",certificate_valid_before:"2099-01-01T00:00:00Z",epoch:1,pinned_host_key_fingerprint:"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+        }
+      }]
+    }' >"$tmp/u5-remote-plan.json"
+    make_posix_broker_envelope "$tmp/u5-remote-plan.json" 0 apt.update-metadata.v1 "$tmp/u5-submit-envelope"
+    make_posix_broker_envelope "$tmp/u5-remote-plan.json" 0 broker.query-result.v1 "$tmp/u5-query-envelope"
+    [ "$(awk -F '|' '$1 == "target-uid" { print $2; exit }' "$tmp/u5-submit-envelope")" = 4242 ] &&
+      [ "$(awk -F '|' '$1 == "target-uid" { print $2; exit }' "$tmp/u5-query-envelope")" = 4242 ] ||
+      fail "U5 replaced the remote protected UID with the controller UID"
+    invoke_posix_broker_for_target test-apt "$tmp/u5-query-envelope" "$tmp/u5-query-output"
+    grep -Fqx 'action-id|broker.query-result.v1' "$u5_ssh_root/stdin" &&
+      grep -Fqx 'target-uid|4242' "$u5_ssh_root/stdin" ||
+      fail "U5 recovery query did not use the dedicated remote broker lane"
+
+    posix_dispatch_readiness_records test-apt "$tmp/u5-remote-readiness.jsonl"
+    jq -e '.data.transport_ready == true and .data.node_identity_ready == true and
+      .data.transport_receipt_status == "forced-dispatcher-readiness" and
+      .data.protected_identity.uid == 4242 and .data.originating_node_identity.node_id == "origin-a"' \
+      "$tmp/u5-remote-readiness.jsonl" >/dev/null &&
+      grep -Fqx 'mode|readiness' "$u5_ssh_root/stdin" &&
+      ! grep -Fq 'hostile-ordinary-ssh-alias' "$u5_ssh_root/invocation" ||
+      fail "U5 remote readiness was not a locally-bound forced dispatcher projection"
+
+    # Windows readiness is a new signed broker control over the fixed SFTP
+    # route. The response fixture is intentionally the only source of broker,
+    # action, profile, and observed-precondition data.
+    u5_readiness_a=$(printf 'a%.0s' {1..64})
+    u5_readiness_b=$(printf 'b%.0s' {1..64})
+    u5_readiness_c=$(printf 'c%.0s' {1..64})
+    u5_readiness_d=$(printf 'd%.0s' {1..64})
+    u5_readiness_e=$(printf 'e%.0s' {1..64})
+    u5_readiness_f=$(printf 'f%.0s' {1..64})
+    u5_operation_readiness_digest=$u5_readiness_c
+    windows_poll_clock() { printf '%s\n' 2000000000; }
+    windows_poll_sleep() { :; }
+    invoke_windows_sftp_batch() (
+      batch=$7
+      if grep -Fq 'put "' "$batch"; then
+        request_path=$(awk -F '"' 'NR == 1 { print $2 }' "$batch")
+        request_action=$(awk -F '|' '$1 == "action-id" { print $2; exit }' "$request_path")
+        if [ "$request_action" = broker.readiness.v1 ]; then
+          cp "$batch" "$u5_fixture_root/u5-windows-submit.batch"
+          cp "$request_path" "$u5_fixture_root/u5-windows-readiness-request"
+          cp "$(dirname "$request_path")/commit" "$u5_fixture_root/u5-windows-readiness-commit"
+        else
+          cp "$batch" "$u5_fixture_root/u5-windows-operation-submit.batch"
+          cp "$request_path" "$u5_fixture_root/u5-windows-operation-request"
+        fi
+        return 0
+      fi
+      cp "$batch" "$u5_fixture_root/u5-windows-poll.batch"
+      remote_path=$(awk -F '"' 'NR == 1 { print $2 }' "$batch")
+      destination=$(awk -F '"' 'NR == 1 { print $4 }' "$batch")
+      case $remote_path in
+        /results/request-[0-9a-f]*.result)
+          [ -f "$u5_fixture_root/u5-windows-operation-request" ] || return 70
+          operation_request=$u5_fixture_root/u5-windows-operation-request
+          printf '%s\n' 'windows-broker-public|1' 'state|completed' 'reason|inventory_verified' \
+            "request-id|$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$operation_request")" \
+            "plan-id|$(awk -F '|' '$1 == "plan-id" { print $2; exit }' "$operation_request")" \
+            "action-id|$(awk -F '|' '$1 == "action-id" { print $2; exit }' "$operation_request")" \
+            "enrollment-epoch|$(awk -F '|' '$1 == "enrollment-epoch" { print $2; exit }' "$operation_request")" \
+            "protected-result-sha256|$u5_readiness_f" 'end-public|' >"$destination"
+          return 0
+          ;;
+        /results/request-[0-9a-f]*.readiness) ;;
+        *) return 70 ;;
+      esac
+      readiness_request=${remote_path#/results/}
+      readiness_request=${readiness_request%.readiness}
+      readiness_observed=$(windows_poll_clock)
+      readiness_expires=$((readiness_observed + 300))
+      cat >"$destination" <<EOF
+windows-broker-readiness-result|1
+request-id|$readiness_request
+state|ready
+reason|fresh_probes_verified
+broker-protocol|1
+broker-version|1.0.0
+broker-sha256|$u5_readiness_a
+policy-version|1
+policy-sha256|$u5_readiness_b
+constraint-version|1
+constraints-sha256|$u5_readiness_c
+generation|7
+generation-sha256|$u5_readiness_d
+winget-context-version|1
+winget-context-sha256|$u5_readiness_e
+provider-lock-sha256|$u5_readiness_f
+request-sid|S-1-5-21-1-2-3-2001
+request-principal|MachineUtilitiesRequest
+system-task-ready|true
+profile-task-ready|true
+transport-ready|true
+native-canary-ready|true
+observed-at|$readiness_observed
+expires-at|$readiness_expires
+action-count|3
+action|profile.apply-managed-bundle.v1|windows-user-s4u-v1|profile-token|$u5_readiness_a
+action|profile.inventory-managed-state.v1|windows-user-s4u-v1|profile-token|$u5_readiness_a
+action|winget.inventory-machine.v1|windows-system-v1|-|$u5_operation_readiness_digest
+profile-constraint-count|1
+profile-constraint|profile-token|S-1-5-21-1-2-3-3001|$u5_readiness_d|$u5_readiness_e|$u5_readiness_f|managed-only|100|1048576|$u5_readiness_a
+end-readiness|
+EOF
+      cp "$destination" "$u5_fixture_root/u5-windows-readiness-result"
+    )
+
+    privilege_status_command test-windows "$tmp/u5-windows-status.jsonl"
+    validate_file "$tmp/u5-windows-status.jsonl"
+    jq -e -s '
+      ([.[] | select(.kind == "privilege_broker" and .id == "readiness")] | length) == 1 and
+      (first(.[] | select(.kind == "privilege_broker" and .id == "readiness")) as $r |
+        $r.status == "present" and $r.data.lifecycle_status == "ready" and
+        $r.data.transport == "windows-sftp" and $r.data.transport_ready == true and
+        $r.data.protected_identity.sid == "S-1-5-21-1-2-3-2001" and
+        $r.data.request_principal == "MachineUtilitiesRequest" and
+        $r.data.broker_digest.value == ("a" * 64) and
+        $r.data.observed_policy_digest.value == ("b" * 64) and
+        $r.data.observed_constraints_digest.value == ("c" * 64) and
+        $r.data.observed_winget_context_digest.value == ("e" * 64) and
+        ($r.data.observed_action_contexts | length) == 3 and
+        ($r.data.observed_preconditions | length) == 3 and
+        $r.data.policy_proposal_digest == null and $r.data.context_canary_digest == null and
+        $r.data.mixed_inventory_authority == false and
+        $r.data.originating_node_identity.node_id == "origin-a")
+    ' "$tmp/u5-windows-status.jsonl" >/dev/null ||
+      fail "U5 signed Windows SFTP readiness did not preserve the exact remote projection"
+    grep -Fqx 'action-id|broker.readiness.v1' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'request-sid|S-1-5-21-1-2-3-2001' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'broker-version|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'broker-sha256|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'policy-sha256|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'constraints-sha256|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'precondition-sha256|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'enrollment-epoch|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'winget-context-sha256|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'context-canary-sha256|-' "$tmp/u5-windows-readiness-request" &&
+      grep -Fqx 'manager-source-identity|not-applicable' "$tmp/u5-windows-readiness-request" &&
+      awk -F '|' '$1 == "created-at" { created=$2 } $1 == "expires-at" { expires=$2 }
+        END { exit !(expires-created == 600) }' "$tmp/u5-windows-readiness-request" ||
+      fail "U5 Windows readiness request diverged from the closed broker control"
+    [ "$(wc -l <"$tmp/u5-windows-submit.batch" | tr -d ' ')" -eq 4 ] &&
+      [ "$(basename "$(awk -F '"' 'NR == 4 { print $2 }' "$tmp/u5-windows-submit.batch")")" = commit ] &&
+      [ "$(awk -F '"' 'NR == 4 { print $4 }' "$tmp/u5-windows-submit.batch")" = \
+        /ingress/slot/commit ] &&
+      grep -Eq '^get "/results/request-[0-9a-f]{32}[.]readiness" "[^\"]+"$' \
+        "$tmp/u5-windows-poll.batch" &&
+      ! grep -Eq '[.]result|/active|/last|(^|[[:space:]])ls([[:space:]]|$)' \
+        "$tmp/u5-windows-poll.batch" ||
+      fail "U5 Windows readiness widened the four-put or readiness-only SFTP batch"
+
+    set +e
+    parse_windows_broker_readiness_result "$tmp/u5-windows-readiness-result" \
+      "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+      S-1-5-21-1-2-3-9999 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-wrong-sid.json"
+    u5_wrong_sid_rc=$?
+    set -e
+    [ "$u5_wrong_sid_rc" -eq 70 ] || fail "U5 Windows readiness accepted a SID other than the configured pin"
+
+    sed -e 's/^observed-at|2000000000$/observed-at|1999999000/' \
+      -e 's/^expires-at|2000000300$/expires-at|1999999300/' \
+      "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-stale-readiness"
+    if parse_windows_broker_readiness_result "$tmp/u5-windows-stale-readiness" \
+        "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-stale.json"; then
+      fail "U5 Windows readiness accepted a locally expired result"
+    fi
+    awk '
+      /^action\|profile[.]apply-managed-bundle[.]v1\|/ { first=$0; next }
+      /^action\|profile[.]inventory-managed-state[.]v1\|/ { print; print first; next }
+      { print }
+    ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-unsorted-readiness"
+    if parse_windows_broker_readiness_result "$tmp/u5-windows-unsorted-readiness" \
+        "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-unsorted.json"; then
+      fail "U5 Windows readiness accepted unsorted action rows"
+    fi
+    sed 's/^action|profile.inventory-managed-state.v1|/action|profile.apply-managed-bundle.v1|/' \
+      "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-duplicate-readiness"
+    if parse_windows_broker_readiness_result "$tmp/u5-windows-duplicate-readiness" \
+        "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-duplicate.json"; then
+      fail "U5 Windows readiness accepted duplicate action/token rows"
+    fi
+    awk -F '|' -v digest="$u5_readiness_b" 'BEGIN { OFS="|" }
+      $1 == "action" && $2 == "profile.inventory-managed-state.v1" { $5=digest }
+      { print }
+    ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-precondition-conflict"
+    if parse_windows_broker_readiness_result "$tmp/u5-windows-profile-precondition-conflict" \
+        "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+        "$tmp/u5-windows-profile-precondition-conflict.json"; then
+      fail "U5 Windows readiness accepted conflicting profile action preconditions"
+    fi
+    awk -F '|' 'BEGIN { OFS="|" }
+      $1 == "profile-constraint" { $10="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+      { print }
+    ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-precondition-mismatch"
+    if parse_windows_broker_readiness_result "$tmp/u5-windows-profile-precondition-mismatch" \
+        "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+        "$tmp/u5-windows-profile-precondition-mismatch.json"; then
+      fail "U5 Windows readiness accepted inconsistent profile precondition evidence"
+    fi
+    awk '
+      /^action-count\|/ { print "action-count|2"; next }
+      /^action\|profile[.]inventory-managed-state[.]v1\|/ { next }
+      { print }
+    ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-apply-only-readiness"
+    parse_windows_broker_readiness_result "$tmp/u5-windows-profile-apply-only-readiness" \
+      "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-profile-apply-only-readiness")" \
+      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+      "$tmp/u5-windows-profile-apply-only.json"
+    jq -e '
+      (.actions | map(.action_id)) == ["profile.apply-managed-bundle.v1", "winget.inventory-machine.v1"] and
+      (.profile_constraints | length) == 1
+    ' "$tmp/u5-windows-profile-apply-only.json" >/dev/null ||
+      fail "U5 Windows readiness lost apply-only profile authorization"
+    awk '
+      /^action-count\|/ { print "action-count|2"; next }
+      /^action\|profile[.]apply-managed-bundle[.]v1\|/ { next }
+      { print }
+    ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-profile-inventory-only-readiness"
+    parse_windows_broker_readiness_result "$tmp/u5-windows-profile-inventory-only-readiness" \
+      "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-profile-inventory-only-readiness")" \
+      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+      "$tmp/u5-windows-profile-inventory-only.json"
+    jq -e '
+      (.actions | map(.action_id)) == ["profile.inventory-managed-state.v1", "winget.inventory-machine.v1"] and
+      (.profile_constraints | length) == 1
+    ' "$tmp/u5-windows-profile-inventory-only.json" >/dev/null ||
+      fail "U5 Windows readiness lost inventory-only profile authorization"
+    awk '
+      /^profile-task-ready\|/ { print "profile-task-ready|false"; next }
+      /^action-count\|/ { print "action-count|1"; next }
+      /^action\|profile[.]/ { next }
+      /^profile-constraint-count\|/ { print "profile-constraint-count|0"; next }
+      /^profile-constraint\|/ { next }
+      { print }
+    ' "$tmp/u5-windows-readiness-result" >"$tmp/u5-windows-machine-only-readiness"
+    parse_windows_broker_readiness_result "$tmp/u5-windows-machine-only-readiness" \
+      "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-machine-only-readiness")" \
+      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-machine-only.json"
+    windows_sftp_readiness_snapshot_from_result test-windows \
+      "$tmp/u5-windows-readiness-request" "$tmp/u5-windows-machine-only.json" \
+      "$tmp/u5-windows-machine-only.jsonl"
+    jq -e -s '
+      first(.[] | select(.kind == "privilege_broker" and .id == "readiness")) as $r |
+      $r.data.system_task_ready == true and $r.data.profile_task_ready == false and
+      $r.data.mixed_inventory_authority == false and
+      ($r.data.observed_action_contexts | map(.action_id)) == ["winget.inventory-machine.v1"]
+    ' "$tmp/u5-windows-machine-only.jsonl" >/dev/null ||
+      fail "U5 machine-only Windows readiness lost its conditional profile-task state"
+
+    # Protected SFTP readiness deliberately omits the action constraint digest.
+    # Only the trusted standalone projection may use that null while all sealed
+    # profile constraints remain bound.
+    jq -n --arg broker "$u5_readiness_b" --arg constraints "$u5_readiness_c" \
+      --arg constraint "$u5_readiness_a" --arg entry_map "$u5_readiness_e" '{
+      id:"profile.apply-managed-bundle.v1",privilege:{
+        policy:{digest:{algorithm:"sha256",value:$broker},
+          constraints_digest:{algorithm:"sha256",value:$constraints},
+          constraint_digest:$constraint,constraint_generation:7},
+        enrollment:{epoch:7},request:{request_sid:"S-1-5-21-1-2-3-2001"},
+        action:{policy_token:"profile-token"},
+        context:{manager_source_identity:$entry_map}}
+    }' >"$tmp/u5-profile-operation.json"
+    if profile_authorization_from_snapshot "$tmp/u5-windows-status.jsonl" \
+        "$tmp/u5-profile-operation.json" "$tmp/u5-profile-ordinary-authorization.json" \
+        >/dev/null 2>&1; then
+      fail "U5 ordinary profile authorization accepted an unattested constraint digest"
+    fi
+    profile_authorization_from_snapshot "$tmp/u5-windows-status.jsonl" \
+      "$tmp/u5-profile-operation.json" "$tmp/u5-profile-sftp-authorization.json" true
+    jq -e --arg entry_map "$u5_readiness_e" '
+      .policy_token == "profile-token" and .target_sid == "S-1-5-21-1-2-3-3001" and
+      .entry_map_digest == $entry_map
+    ' "$tmp/u5-profile-sftp-authorization.json" >/dev/null ||
+      fail "U5 trusted SFTP profile authorization lost its sealed constraints"
+    sed 's/^profile-task-ready|false$/profile-task-ready|true/' \
+      "$tmp/u5-windows-machine-only-readiness" >"$tmp/u5-windows-machine-only-overclaim"
+    if parse_windows_broker_readiness_result "$tmp/u5-windows-machine-only-overclaim" \
+        "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-machine-only-overclaim")" \
+        S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 \
+        "$tmp/u5-windows-machine-only-overclaim.json"; then
+      fail "U5 machine-only Windows readiness accepted a profile-task overclaim"
+    fi
+    printf '%s\n' 'windows-broker-readiness-result|1' \
+      "request-id|$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+      'state|unavailable' 'reason|fresh_probe_failed' 'end-readiness|' \
+      >"$tmp/u5-windows-unavailable-readiness"
+    set +e
+    parse_windows_broker_readiness_result "$tmp/u5-windows-unavailable-readiness" \
+      "$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/u5-windows-readiness-result")" \
+      S-1-5-21-1-2-3-2001 MachineUtilitiesRequest 2000000000 "$tmp/u5-windows-unavailable.json"
+    u5_unavailable_rc=$?
+    set -e
+    [ "$u5_unavailable_rc" -eq 75 ] &&
+      [ "$(jq -r '.state+"|"+.reason' "$tmp/u5-windows-unavailable.json")" = \
+        'unavailable|fresh_probe_failed' ] ||
+      fail "U5 Windows readiness did not preserve the exact unavailable result"
+
+    # A standalone sealed Windows action executes from the sign-in screen over
+    # the fixed SFTP broker lane. Ordinary Codex collection remains unavailable
+    # and the protected readiness projection remains explicitly non-inventory.
+    u5_loggedoff_created=$(jq -nr 'now | todateiso8601')
+    u5_loggedoff_expires=$(jq -nr 'now + 600 | todateiso8601')
+    u5_loggedoff_config_digest=$(sha256_file "$tmp/u5-config.json")
+    executor_status_command "$tmp/u5-loggedoff-executor.json"
+    jq -n --slurpfile executor "$tmp/u5-loggedoff-executor.json" \
+      --slurpfile origin "$tmp/u5-origin.json" \
+      --arg created "$u5_loggedoff_created" --arg expires "$u5_loggedoff_expires" \
+      --arg config_digest "$u5_loggedoff_config_digest" \
+      --arg broker "$u5_readiness_a" --arg policy "$u5_readiness_b" \
+      --arg constraints "$u5_readiness_c" --arg canary "$u5_readiness_d" \
+      --arg precondition "$u5_readiness_c" \
+      --arg host_key "$(jq -r '.machines["test-windows"].privilege_broker.automation_transport.pinned_host_key_fingerprint' \
+        "$tmp/u5-config.json")" '{
+      schema:"machine-utilities.plan",schema_version:3,created_at:$created,
+      domain:"updates",target:"test-windows",
+      operations:[{type:"semantic-action",kind:"privileged_action",id:"winget.inventory-machine.v1"}],
+      required_section:"packages",planning_snapshot_id:"u5-visible-planning-snapshot",
+      planning_observed_at:$created,
+      configuration_digest:{algorithm:"sha256",value:$config_digest},
+      worker_configuration_digest:{algorithm:"sha256",value:$config_digest},
+      precondition_digest:{algorithm:"sha256",value:$precondition},
+      required_executor:($executor[0] | {plugin,marketplace,version,integrity_manifest_sha256,files}),
+      privilege:{contract_version:1,
+        broker:{adapter:"windows-scheduled-task-v1",protocol_version:1,version:"1.0.0",
+          digest:{algorithm:"sha256",value:$broker}},
+        policy:{catalog_version:1,version:1,action_manifest_version:1,
+          digest:{algorithm:"sha256",value:$policy},proposal_digest:{algorithm:"sha256",value:("f" * 64)},
+          constraint_kind:"none",constraint_digest:"-",constraint_generation:7,
+          constraints_digest:{algorithm:"sha256",value:$constraints}},
+        action:{id:"winget.inventory-machine.v1",policy_token:null},
+        context:{required:"windows-system-v1",observed_execution_principal:"LocalSystem",
+          session_requirement:"no-console-session",platform_boundary:"windows",
+          manager_source_identity:"not-applicable",canary_digest:{algorithm:"sha256",value:$canary}},
+        request:{id:"request-7123456789abcdef0123456789abcdef",created_at:$created,expires_at:$expires,
+          transport:"windows-sftp",principal:"MachineUtilitiesRequest",
+          originating_node_id:$origin[0].node_id,node_key_fingerprint:$origin[0].node_key_fingerprint,
+          certificate_serial:$origin[0].certificate_serial},
+        enrollment:{epoch:7,fleet_domain:$origin[0].fleet_domain,
+          fleet_ca_fingerprint:$origin[0].fleet_ca_fingerprint,ca_generation:$origin[0].ca_generation,
+          certificate_valid_after:$origin[0].certificate_valid_after,
+          certificate_valid_before:$origin[0].certificate_valid_before,
+          pinned_host_key_fingerprint:$host_key},
+        precondition:{digest:{algorithm:"sha256",value:$precondition}}}
+    }' >"$tmp/u5-loggedoff-base.json"
+    u5_loggedoff_digest=$(jq -cS . "$tmp/u5-loggedoff-base.json" | sha256_stream)
+    u5_loggedoff_plan_id="plan-$(printf '%s' "$u5_loggedoff_digest" | cut -c1-16)"
+    jq -S --arg plan_id "$u5_loggedoff_plan_id" --arg digest "$u5_loggedoff_digest" \
+      '. + {plan_id:$plan_id,plan_digest:{algorithm:"sha256",value:$digest}}' \
+      "$tmp/u5-loggedoff-base.json" >"$tmp/u5-loggedoff-plan.json"
+    chmod 600 "$tmp/u5-loggedoff-plan.json"
+    validate_privileged_plan_file "$tmp/u5-loggedoff-plan.json"
+    mkdir "$tmp/u5-no-codex"
+    printf '%s\n' '#!/bin/sh' ': >"${U5_CODEX_COLLECT_MARKER:?}"' 'exit 70' \
+      >"$tmp/u5-no-codex/machine-utilities"
+    chmod +x "$tmp/u5-no-codex/machine-utilities"
+    export U5_CODEX_COLLECT_MARKER=$tmp/u5-codex-collect-invoked
+    rm -f "$U5_CODEX_COLLECT_MARKER" "$tmp/u5-windows-operation-request" \
+      "$tmp/u5-windows-operation-submit.batch"
+    u5_saved_script_dir=$script_dir
+    script_dir=$tmp/u5-no-codex
+    windows_poll_clock() { /bin/date -u +%s; }
+    apply_privileged_plan_command "$tmp/u5-loggedoff-plan.json" "$u5_loggedoff_plan_id" \
+      "$tmp/u5-loggedoff-result.jsonl" false
+    script_dir=$u5_saved_script_dir
+    [ ! -e "$U5_CODEX_COLLECT_MARKER" ] &&
+      [ "$(awk -F '|' '$1 == "action-id" { print $2; exit }' \
+        "$tmp/u5-windows-operation-request")" = winget.inventory-machine.v1 ] &&
+      [ "$(awk -F '|' '$1 == "precondition-sha256" { print $2; exit }' \
+        "$tmp/u5-windows-operation-request")" = "$u5_readiness_c" ] &&
+      [ "$(wc -l <"$tmp/u5-windows-operation-submit.batch" | tr -d ' ')" -eq 4 ] &&
+      [ "$(awk -F '"' 'NR == 4 { print $4 }' "$tmp/u5-windows-operation-submit.batch")" = \
+        /ingress/slot/commit ] ||
+      fail "U5 logged-off Windows apply used Codex collection or widened the SFTP slot"
+    validate_file "$tmp/u5-loggedoff-result.jsonl"
+    jq -e -s '
+      first(.[] | select(.kind == "privilege_broker" and .id == "readiness")) as $readiness |
+      first(.[] | select(.kind == "operation" and (.id | startswith("apply:plan-")) and
+        .data.phase == "verify")) as $apply |
+      $readiness.data.mixed_inventory_authority == false and
+      $apply.data.operation_status == "completed" and
+      $apply.data.post_inventory_status == "protected-readiness-only" and
+      $apply.data.transport == "windows-sftp" and
+      ($apply.data.authoritative_result_evidence | length) == 1
+    ' "$tmp/u5-loggedoff-result.jsonl" >/dev/null ||
+      fail "U5 logged-off Windows apply overclaimed inventory or lost protected terminal evidence"
+
+    u5_operation_readiness_digest=$u5_readiness_b
+    rm -f "$tmp/u5-windows-operation-request" "$tmp/u5-windows-operation-submit.batch"
+    script_dir=$tmp/u5-no-codex
+    set +e
+    apply_privileged_plan_command "$tmp/u5-loggedoff-plan.json" "$u5_loggedoff_plan_id" \
+      "$tmp/u5-loggedoff-drift-result.jsonl" false \
+      >"$tmp/u5-loggedoff-drift.stdout" 2>"$tmp/u5-loggedoff-drift.stderr"
+    u5_loggedoff_drift_rc=$?
+    set -e
+    script_dir=$u5_saved_script_dir
+    u5_operation_readiness_digest=$u5_readiness_c
+    [ "$u5_loggedoff_drift_rc" -eq 65 ] &&
+      [ ! -e "$tmp/u5-windows-operation-request" ] &&
+      [ ! -e "$tmp/u5-windows-operation-submit.batch" ] ||
+      fail "U5 changed Windows readiness after sealing reached an action SFTP slot"
+
+    normalize_privileged_plan_for_broker_execution "$tmp/u5-loggedoff-plan.json" \
+      "$tmp/u5-windows-status.jsonl" "$tmp/u5-direct-mixed-plan.json"
+    rm -f "$U5_CODEX_COLLECT_MARKER"
+    script_dir=$tmp/u5-no-codex
+    set +e
+    apply_mixed_privileged_plan_command "$tmp/u5-direct-mixed-plan.json" \
+      "$u5_loggedoff_plan_id" "$tmp/u5-direct-mixed-result.jsonl" false \
+      >"$tmp/u5-direct-mixed.stdout" 2>"$tmp/u5-direct-mixed.stderr"
+    u5_direct_mixed_rc=$?
+    set -e
+    script_dir=$u5_saved_script_dir
+    [ "$u5_direct_mixed_rc" -eq 69 ] && [ ! -e "$U5_CODEX_COLLECT_MARKER" ] &&
+      grep -Fq 'mixed Windows plans require ordinary Codex inventory' \
+        "$tmp/u5-direct-mixed.stderr" ||
+      fail "U5 direct mixed Windows plan reached collection or treated SFTP readiness as inventory"
+
+    mkdir -p "$tmp/u5-bad-ssh/bin"
+    cat >"$tmp/u5-bad-ssh/bin/ssh" <<'SH'
+#!/bin/sh
+payload=$(mktemp)
+printf '%s\n' 'remote-broker-result' >"$payload"
+if command -v sha256sum >/dev/null 2>&1; then digest=$(sha256sum "$payload" | awk '{print $1}')
+else digest=$(shasum -a 256 "$payload" | awk '{print $1}'); fi
+printf '%s\n' 'posix-dispatch-result|1' 'mode|broker-envelope' 'status|completed' 'exit-code|0' \
+  "payload-length|$(wc -c <"$payload" | tr -d ' ')" "payload-sha256|$digest" 'end-header|'
+cat "$payload"
+rm -f "$payload"
+exit 70
+SH
+    chmod +x "$tmp/u5-bad-ssh/bin/ssh"
+    system_ssh_path() { printf '%s\n' "$u5_fixture_root/u5-bad-ssh/bin/ssh"; }
+    if invoke_posix_broker_for_target test-apt "$tmp/u5-envelope" "$tmp/u5-bad-output" >/dev/null 2>&1; then
+      fail "U5 accepted a protected dispatcher frame whose SSH status did not match"
+    fi
+  )
+
+  for u5_skill in fleet-inventory fleet-update fleet-agents fleet-auth fleet-chezmoi fleet-projects; do
+    u5_skill_file="$script_dir/../skills/$u5_skill/SKILL.md"
+    [ "$(sed -n '1p' "$u5_skill_file")" = --- ] &&
+      [ "$(sed -n '2p' "$u5_skill_file")" = "name: $u5_skill" ] &&
+      [ "$(sed -n '3s/^description: //p' "$u5_skill_file" | wc -c | tr -d ' ')" -gt 1 ] ||
+      fail "U5 invalid frontmatter for $u5_skill"
+    for u5_term in privilege-status prepare-privilege-identity prepare-privilege-enrollment \
+        verify-privilege-plan submit-privilege-plan lookup-privilege-result \
+        preview-privilege-upgrade preview-privilege-revocation; do
+      grep -Fq "$u5_term" "$u5_skill_file" || fail "U5 $u5_skill omitted $u5_term"
+    done
+    grep -Eiq 'never (ask for|request).*(sudo|Administrator) password' "$u5_skill_file" ||
+      fail "U5 $u5_skill omitted the password boundary"
+  done
+
+  for u5_integrity_path in \
+      references/privilege-policy.default references/windows-winget-provider.lock \
+      scripts/certify-ssh-node scripts/enroll-privilege-posix \
+      scripts/enroll-privilege-windows.ps1 scripts/enroll-ssh-posix \
+      scripts/enroll-windows-sftp.ps1 scripts/prepare-ssh-identity \
+      scripts/privilege-broker-posix scripts/privilege-broker-windows.ps1 \
+      scripts/profile-worker-windows.ps1 scripts/register-profile-task-windows.ps1 \
+      scripts/windows-native-canary-runner.ps1 windows/WinGetBroker/BrokerCore.cs \
+      windows/WinGetBroker/Program.cs windows/WinGetBroker/WinGetBroker.csproj \
+      windows/WinGetBroker/packages.lock.json; do
+    jq -e --arg path "$u5_integrity_path" '.files | any(.path == $path)' \
+      "$plugin_cache/integrity.json" >/dev/null ||
+      fail "U5 release integrity omitted $u5_integrity_path"
+  done
+  cp "$plugin_cache/scripts/privilege-broker-posix" "$tmp/u5-broker-backup"
+  printf '\n# integrity tamper fixture\n' >>"$plugin_cache/scripts/privilege-broker-posix"
+  if "$cli" executor-status "$tmp/u5-tampered-executor.json" >/dev/null 2>&1; then
+    fail "U5 executor integrity accepted a modified protected broker source"
+  fi
+  cp "$tmp/u5-broker-backup" "$plugin_cache/scripts/privilege-broker-posix"
+}
+
+[ "${MACHINE_UTILITIES_TEST_SCOPE:-}" != u5-contracts ] || {
+  test_u5_contracts
+  printf 'PASS: U5 contracts\n'
   exit 0
 }
 

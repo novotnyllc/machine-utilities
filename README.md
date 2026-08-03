@@ -74,6 +74,8 @@ plugins/machine-utilities/scripts/machine-utilities validate-config
 plugins/machine-utilities/scripts/machine-utilities check-mutation-config
 plugins/machine-utilities/scripts/machine-utilities executor-status executor.json
 plugins/machine-utilities/scripts/machine-utilities verify-executor executor.json
+plugins/machine-utilities/scripts/machine-utilities privilege-status HOST privilege-status.jsonl
+plugins/machine-utilities/scripts/machine-utilities prepare-privilege-enrollment HOST enrollment.json
 plugins/machine-utilities/scripts/machine-utilities worker-config HOST DOMAIN worker-config.json
 plugins/machine-utilities/scripts/machine-utilities collect --target local --section all --output snapshot.jsonl
 plugins/machine-utilities/scripts/machine-utilities validate snapshot.jsonl
@@ -84,6 +86,11 @@ plugins/machine-utilities/scripts/machine-utilities seal-plan draft.json snapsho
 plugins/machine-utilities/scripts/machine-utilities verify-preconditions plan.json current.jsonl
 plugins/machine-utilities/scripts/machine-utilities apply-plan plan.json PLAN-ID verified.jsonl
 plugins/machine-utilities/scripts/machine-utilities apply-ssh-plan plan.json PLAN-ID verified.jsonl
+plugins/machine-utilities/scripts/machine-utilities verify-privilege-plan plan.json current.jsonl
+plugins/machine-utilities/scripts/machine-utilities submit-privilege-plan plan.json PLAN-ID verified.jsonl
+plugins/machine-utilities/scripts/machine-utilities lookup-privilege-result plan.json OPERATION-INDEX result.txt
+plugins/machine-utilities/scripts/machine-utilities preview-privilege-upgrade HOST upgrade.json
+plugins/machine-utilities/scripts/machine-utilities preview-privilege-revocation HOST revocation.json
 ```
 
 `--section` accepts `all`, `host`, `packages`, `agents`, `projects`, `startup`,
@@ -105,6 +112,27 @@ and hashes of the runtime executor files listed in `integrity.json`.
 when run from a source checkout. This detects a stale or altered worker without
 custom signing infrastructure; the authenticated Git marketplace remains the
 source of provenance.
+
+Protected APT, WinGet, and bounded Windows profile actions use repository-fixed
+semantic action/context pairs rather than request-supplied commands. WinGet is
+required for V1 Windows machine-package operations. Enrollment preparation and
+upgrade/revocation previews are inert: the agent stops at the owner's local
+password or UAC boundary and never requests or relays an elevation credential.
+WSL has no protected root boundary and reports `unsupported_security_boundary`
+without fallback. Result lookup is read-only and never resubmits a request.
+
+Release integrity proves plugin source bytes. It does not prove or mutate the
+separately installed root-/Administrator-owned broker generation, policy,
+OpenSSH transport, tasks, or native-canary receipts. Updating or uninstalling
+the plugin therefore neither upgrades nor revokes protected host state. The
+Windows SFTP readiness record is a `protected-local-observation`: its exact
+local ACL, controller-signed candidate/CMS, expiry, route, and protected local
+projections are checked together. U6 v1 does not expose portable native-canary
+proof, and copied public bytes or a user-owned identity receipt cannot establish
+readiness. The
+complete node-key, offline-CA, Windows SFTP, recovery, rotation, and revocation
+runbook is in
+[`plugins/machine-utilities/references/windows-sftp.md`](plugins/machine-utilities/references/windows-sftp.md).
 
 For a local target, `apply-plan` requires the exact sealed plan ID, accepts only
 operation-specific native command shapes, recaptures its own trusted preflight,

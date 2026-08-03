@@ -44,3 +44,27 @@ and follows `"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude
 reports unsupported. Never fall back through WSL. Preserve native approval
 prompts, stop per host on failure, and recapture package inventory afterward.
 Cleanup and autoremove are separate explicit actions.
+
+## Protected package actions
+
+When readiness advertises an active protected action-context pair, select only
+the repository-defined semantic action already present there:
+`apt.update-metadata.v1`, `apt.install-package-version.v1`,
+`apt.upgrade-package.v1`, `apt.autoremove.v1`,
+`winget.inventory-machine.v1`, `winget.install-machine-package.v1`, or
+`winget.upgrade-machine-package.v1`. WinGet is required for V1 Windows
+machine-package work. Never add argv, executable, source, installer,
+dependency, environment, shell, or elevation controls to a protected request;
+WinGet source dependency selection remains delegated to the attested provider.
+
+Run `"$CLI" privilege-status HOST SNAPSHOT`, seal the semantic action, use
+`verify-privilege-plan` immediately before `submit-privilege-plan`, and use
+`lookup-privilege-result PLAN INDEX OUTPUT` for recovery without resubmission.
+The shared Codex/Claude lifecycle vocabulary is
+`prepare-privilege-identity`, `prepare-privilege-enrollment`,
+`preview-privilege-upgrade`, and `preview-privilege-revocation`. Preserve
+`needs_enrollment`, `drifted`, `transport_unavailable`,
+`unsupported_context`, `unsupported_security_boundary`, `partial`, and
+`stale`; perform no fallback. Never ask for or relay a sudo or Administrator password.
+Human enrollment, upgrade, activation, and revocation
+stop at the local password/UAC boundary.

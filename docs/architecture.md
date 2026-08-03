@@ -34,6 +34,48 @@ credential contents, and environment-variable values. A separate,
 explicitly-requested shareable mode may anonymize machines, users, and paths.
 There is no default operational-data redaction.
 
+## Protected broker and transport lifecycle
+
+Protected operations are fixed semantic action/context pairs enforced by an
+OS-protected broker. Plans never supply a privileged executable, argv, shell,
+PowerShell, environment, working directory, elevation context, package source,
+installer, dependency control, or fallback. Linux admits the closed APT
+catalog through a root broker. Windows admits the closed WinGet machine catalog
+as LocalSystem and bounded managed-profile content through a separate
+non-elevated S4U task. WinGet is the required V1 Windows provider; its approved
+source retains the documented source-delegated installer and dependency
+authority.
+
+Logged-off reachability is separate from elevation. POSIX uses a forced bounded
+dispatcher; Windows uses a dedicated standard SID in an internal-SFTP-only
+chroot. The request SID has no shell or task authority and is distinct from the
+profile SID. Automation pins one node key, certificate, and host key, ignores
+`SSH_AUTH_SOCK` and user SSH configuration, disables forwarding and control
+sockets, and never stores an administrator credential. WSL cannot provide a
+protected root boundary and has no fallback.
+
+Node private keys are per-node and nonsynced. The offline fleet CA is available
+only to an isolated owner signing account whose fixed certification helper is
+independently digest-verified before every ceremony. Public readiness retains
+the CA fingerprint/generation, originating node ID, node-key fingerprint,
+certificate serial/validity, and target host-key fingerprint needed for audit,
+renewal, KRL revocation, and staged CA rotation.
+
+Plugin release integrity and protected installed-state attestation are
+independent. A plugin update does not activate a broker generation, and plugin
+removal does not revoke protected policy, transport trust, accounts, or tasks.
+Windows SFTP inventory labels its evidence `protected-local-observation`: exact
+local public-file ACLs, a one-signer controller CMS, expiry, route binding, and
+current protected local projections are required together. Because U6 v1 does
+not publish native-canary evidence digests, the public files are not portable
+cryptographic proof and cannot be trusted after copying them off the Windows
+target.
+Upgrade and normal revocation enter draining, reject new submissions, preserve
+result lookup, and wait for terminal evidence before changing the adapter
+grant. Emergency revocation may trade reachability for explicit partial/stale
+evidence. Agent surfaces prepare and inspect these ceremonies but stop at the
+local password/UAC boundary.
+
 ## Proposed v1 skills
 
 ### `fleet-inventory`
