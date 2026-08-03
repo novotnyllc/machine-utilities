@@ -18,7 +18,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "0c0cf8383c876c143a401b303ac30ee99187b2b33fbcef1a35bbde513ecb88d2"
+      "sha256": "d02dc091c3d57915aea13babfdd2d89216c8bf3a76e08dd296e0f2630620d938"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "7b20cb96b70e9f7b0c5dd9c92a8462820678933d624004d268be00f319c6efa6"
+      "sha256": "dd302dbee4cc9652f5002150ce5da796d532b210802d15149296c85c97b627c5"
     },
     {
       "path": "scripts/prepare-ssh-identity",

@@ -45,9 +45,14 @@ preserves authoritative partial output after a failed operation or
 postcondition when post-inventory remains available. SSH uses bounded
 connection/keepalive timeouts and verifies the configured native hostname/user.
 The executor
-supports a clean fast-forward source pull and a non-TTY full apply.
-`chezmoi add` is unsupported because allowed target paths are user-specific;
-it fails before plan sealing.
+supports a clean fast-forward source pull, a non-TTY full apply, and a sealed
+target-scoped apply. A target-scoped apply names 1-16 exact absolute destination
+paths under the target user's home directory. Its sealed argv is exactly
+`chezmoi --no-tty apply -- TARGET...`; it rejects flags, duplicates, traversal,
+cross-platform path forms, and paths outside that home boundary. Its immediate
+precondition and postcondition run `chezmoi status -- TARGET...`, so unrelated
+drift does not authorize or fail the target change. `chezmoi add` remains
+unsupported because source additions require user-specific reconciliation.
 
 For a readiness-advertised Windows profile action, render only the already
 authorized target-specific managed files into a private source root and build

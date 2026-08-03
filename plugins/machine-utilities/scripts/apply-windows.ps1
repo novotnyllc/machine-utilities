@@ -431,6 +431,11 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
             default { $false }
         }
         if (-not $Valid) { throw "Unsupported Windows operation" }
+        $HasTargets = $null -ne $Operation.PSObject.Properties["targets"]
+        if ($HasTargets -and [string]$Operation.type -ne "chezmoi-apply") {
+            throw "Only chezmoi apply may declare targets"
+        }
+        if ($HasTargets) { [void](Get-ChezmoiTargets $Operation) }
     }
 
     $PlanCopy = $Plan | ConvertTo-Json -Compress -Depth 100 | ConvertFrom-Json
@@ -466,7 +471,15 @@ function Read-Inventory([string[]]$Sections, [string]$SnapshotId) {
 
 function Get-PreconditionDigest([object]$Plan, [object[]]$Records) {
     $Wanted = @{}
-    foreach ($Operation in @($Plan.operations)) { $Wanted["$($Operation.kind)`0$($Operation.id)"] = $true }
+    $TargetedChezmoi = @{}
+    foreach ($Operation in @($Plan.operations)) {
+        $Key = "$($Operation.kind)`0$($Operation.id)"
+        $Wanted[$Key] = $true
+        if ($Operation.type -eq "chezmoi-apply" -and
+            $null -ne $Operation.PSObject.Properties["targets"]) {
+            $TargetedChezmoi[$Key] = $true
+        }
+    }
     $Selected = @($Records | Where-Object { $Wanted.ContainsKey("$($_.kind)`0$($_.id)") } |
         Sort-Object host_id, kind, id)
     $Text = ""
@@ -474,7 +487,14 @@ function Get-PreconditionDigest([object]$Plan, [object[]]$Records) {
         $Copy = $Record | ConvertTo-Json -Compress -Depth 100 | ConvertFrom-Json
         $Copy.PSObject.Properties.Remove("snapshot_id")
         $Copy.PSObject.Properties.Remove("observed_at")
-        if ($null -ne $Copy.data) { $Copy.data.PSObject.Properties.Remove("codex_checked_at") }
+        if ($null -ne $Copy.data) {
+            $Copy.data.PSObject.Properties.Remove("codex_checked_at")
+            if ($TargetedChezmoi.ContainsKey("$($Copy.kind)`0$($Copy.id)")) {
+                $Copy.data.PSObject.Properties.Remove("drift_count")
+                $Copy.data.PSObject.Properties.Remove("status_codes")
+                $Copy.data.PSObject.Properties.Remove("status_digest")
+            }
+        }
         $Text += (ConvertTo-CanonicalJson $Copy) + "`n"
     }
     return Get-TextSha256 $Text
@@ -482,6 +502,63 @@ function Get-PreconditionDigest([object]$Plan, [object[]]$Records) {
 
 function Get-Record([object[]]$Records, [string]$Kind, [string]$Id) {
     return @($Records | Where-Object { $_.kind -eq $Kind -and $_.id -eq $Id })
+}
+
+function Get-ChezmoiTargets([object]$Operation) {
+    $Property = $Operation.PSObject.Properties["targets"]
+    if ($null -eq $Property) { return $null }
+    $Targets = @($Property.Value)
+    if ($Targets.Count -eq 0 -or $Targets.Count -gt 16) { throw "Invalid chezmoi targets" }
+    $Seen = @{}
+    foreach ($Target in $Targets) {
+        if ($Target -isnot [string] -or $Target.Length -eq 0 -or $Target.Length -gt 512 -or
+            (-not (($Target.StartsWith("/") -and -not $Target.Contains("\")) -or
+                ($Target -match "^[A-Za-z]:\\" -and $Target.Contains("\")))) -or
+            $Target -match "(^|[\\/])\\.\\.?($|[\\/])" -or $Seen.ContainsKey($Target)) {
+            throw "Invalid chezmoi target"
+        }
+        $Seen[$Target] = $true
+    }
+    return [string[]]$Targets
+}
+
+function Assert-ChezmoiTargetsWithinHome([string[]]$Targets) {
+    $Home = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile))
+    $Prefix = $Home.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) +
+        [IO.Path]::DirectorySeparatorChar
+    foreach ($Target in $Targets) {
+        $FullPath = [IO.Path]::GetFullPath($Target)
+        if (-not $FullPath.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Chezmoi target escapes the current user profile"
+        }
+        $Relative = [IO.Path]::GetRelativePath($Home, $FullPath)
+        $Current = $Home
+        foreach ($Segment in @($Relative -split "[\\/]")) {
+            if ([string]::IsNullOrWhiteSpace($Segment) -or $Segment -eq ".") { continue }
+            $Current = Join-Path $Current $Segment
+            $Item = Get-Item -LiteralPath $Current -Force -ErrorAction SilentlyContinue
+            if ($null -ne $Item -and ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Chezmoi target traverses a reparse point"
+            }
+        }
+    }
+}
+
+function Assert-ChezmoiTargetStatus([object]$Operation, [bool]$ExpectDrift) {
+    $Targets = @(Get-ChezmoiTargets $Operation)
+    if ($Targets.Count -eq 0) { throw "Targeted chezmoi operation has no targets" }
+    Assert-ChezmoiTargetsWithinHome $Targets
+    $Command = Get-Command "chezmoi" -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $Command) { throw "Required command is unavailable: chezmoi" }
+    $Output = @(& $Command.Source status -- $Targets)
+    $Succeeded = $?
+    $ExitCode = $LASTEXITCODE
+    if (-not $Succeeded -or ($null -ne $ExitCode -and $ExitCode -ne 0)) {
+        throw "Chezmoi target status failed"
+    }
+    $HasDrift = $Output.Count -gt 0
+    if ($HasDrift -ne $ExpectDrift) { throw "Chezmoi targets did not reach the expected status" }
 }
 
 function Test-SameMeaningfulData([object]$Before, [object]$After) {
@@ -615,7 +692,12 @@ function Get-ExactArgv([object]$Operation, [object]$Config, [object]$Machine) {
         "project-clone" { return Get-ProjectCommand $Operation $Config $Machine }
         "project-update" { return Get-ProjectCommand $Operation $Config $Machine }
         "chezmoi-pull" { return @("chezmoi", "git", "--", "pull", "--ff-only") }
-        "chezmoi-apply" { return @("chezmoi", "--no-tty", "apply") }
+        "chezmoi-apply" {
+            if ($null -eq $Operation.PSObject.Properties["targets"]) {
+                return @("chezmoi", "--no-tty", "apply")
+            }
+            return @("chezmoi", "--no-tty", "apply", "--") + @(Get-ChezmoiTargets $Operation)
+        }
         default { throw "Unsupported Windows operation" }
     }
 }
@@ -712,7 +794,9 @@ function Assert-Postcondition([object]$Operation, [object[]]$Before, [object[]]$
             }
         }
         "chezmoi-apply" {
-            if ([int]$AfterRecord[0].data.drift_count -ne 0) {
+            if ($null -ne $Operation.PSObject.Properties["targets"]) {
+                Assert-ChezmoiTargetStatus $Operation $false
+            } elseif ([int]$AfterRecord[0].data.drift_count -ne 0) {
                 throw "Chezmoi still reports drift after apply"
             }
         }
@@ -912,6 +996,23 @@ if ($SelfTest) {
             '["chezmoi","git","--","pull","--ff-only"]') {
             throw "Chezmoi pull argv self-test failed"
         }
+        $TargetedChezmoiArgv = @(Get-ExactArgv ([pscustomobject]@{
+            type = "chezmoi-apply"; kind = "chezmoi_state"; id = "live"
+            targets = @("C:\Users\Claire\.profile.d\10-env.sh", "C:\Users\Claire\.zprofile.d\10-env.zsh")
+        }) $null $null)
+        if ((ConvertTo-CanonicalJson $TargetedChezmoiArgv) -ne
+            '["chezmoi","--no-tty","apply","--","C:\\Users\\Claire\\.profile.d\\10-env.sh","C:\\Users\\Claire\\.zprofile.d\\10-env.zsh"]') {
+            throw "Targeted chezmoi argv self-test failed"
+        }
+        $Rejected = $false
+        try {
+            [void](Get-ChezmoiTargets ([pscustomobject]@{
+                targets = @("C:relative\\example")
+            }))
+        } catch {
+            $Rejected = $true
+        }
+        if (-not $Rejected) { throw "Drive-relative chezmoi target self-test failed" }
         foreach ($UnsafeId in @("skills-cli:--help", "jsm:-x")) {
             $Rejected = $false
             try {
@@ -1379,13 +1480,17 @@ foreach ($Operation in @($Plan.operations)) {
     if ($Operation.type -eq "project-clone" -and $PreflightRecord[0].status -ne "absent") {
         throw "Project clone requires an absent configured project"
     }
-    if ($Operation.type -eq "project-update" -and
+        if ($Operation.type -eq "project-update" -and
         ($PreflightRecord[0].status -ne "present" -or
         $PreflightRecord[0].data.origin_matches -ne $true -or
         $PreflightRecord[0].data.repository_readiness -ne "ready" -or
         [int]$PreflightRecord[0].data.dirty_count -ne 0 -or
         $PreflightRecord[0].data.sync_state -ne "local-tracking-behind")) {
-        throw "Project update requires a clean, correct-origin checkout that is behind its upstream"
+            throw "Project update requires a clean, correct-origin checkout that is behind its upstream"
+        }
+    if ($Operation.type -eq "chezmoi-apply" -and
+        $null -ne $Operation.PSObject.Properties["targets"]) {
+        Assert-ChezmoiTargetStatus $Operation $true
     }
 }
 Assert-Executor $Plan.required_executor $ExecutorStatus
