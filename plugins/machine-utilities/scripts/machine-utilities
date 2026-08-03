@@ -1003,7 +1003,7 @@ precondition_digest() {
       . as $record |
       select(any($wanted[]; .kind == $record.kind and .id == $record.id)) |
       if any($targeted_chezmoi[]; . == ([$record.kind,$record.id] | @json)) then
-        .data |= del(.drift_count,.status_digest)
+        .data |= del(.drift_count,.status_codes,.status_digest)
       else . end |
       del(.snapshot_id,.observed_at,.data.codex_checked_at)
     ] | sort_by(.host_id,.kind,.id)[]' | sha256_stream

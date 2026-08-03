@@ -445,6 +445,7 @@ function Get-PreconditionDigest([object]$Plan, [object[]]$Records) {
             $Copy.data.PSObject.Properties.Remove("codex_checked_at")
             if ($TargetedChezmoi.ContainsKey("$($Copy.kind)`0$($Copy.id)")) {
                 $Copy.data.PSObject.Properties.Remove("drift_count")
+                $Copy.data.PSObject.Properties.Remove("status_codes")
                 $Copy.data.PSObject.Properties.Remove("status_digest")
             }
         }

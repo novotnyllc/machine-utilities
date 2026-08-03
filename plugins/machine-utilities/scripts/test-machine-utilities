@@ -2545,6 +2545,14 @@ CHEZMOI_STATUS_DRIFT=1 "$cli" collect --target test-host --section chezmoi \
   "$tmp/targeted-chezmoi-snapshot.jsonl" "$tmp/targeted-chezmoi-plan.json"
 targeted_chezmoi_plan_id=$(jq -r '.plan_id' "$tmp/targeted-chezmoi-plan.json")
 rm -f "$CHEZMOI_TARGET_APPLY_MARKER"
+if "$cli" apply-plan "$tmp/targeted-chezmoi-plan.json" \
+  "$targeted_chezmoi_plan_id" "$tmp/targeted-chezmoi-clean-result.jsonl" >"$tmp/targeted-chezmoi-clean.stderr" 2>&1; then
+  fail "targeted chezmoi apply accepted a clean target"
+fi
+grep -F "machine-utilities: chezmoi targets are not drifted" "$tmp/targeted-chezmoi-clean.stderr" >/dev/null ||
+  fail "targeted chezmoi apply did not reject a clean target"
+[ ! -e "$CHEZMOI_TARGET_APPLY_MARKER" ] ||
+  fail "clean targeted chezmoi apply reached the native command"
 CHEZMOI_TARGET_STATUS_DRIFT=1 "$cli" apply-plan "$tmp/targeted-chezmoi-plan.json" \
   "$targeted_chezmoi_plan_id" "$tmp/targeted-chezmoi-applied.jsonl"
 [ -e "$CHEZMOI_TARGET_APPLY_MARKER" ] || fail "targeted chezmoi apply was not executed"
