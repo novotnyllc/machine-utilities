@@ -1,0 +1,548 @@
+#!/bin/bash
+set -euo pipefail
+
+umask 077
+export LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset APT_CONFIG BASH_ENV CDPATH ENV GLOBIGNORE \
+  http_proxy https_proxy ftp_proxy all_proxy no_proxy \
+  HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+
+usage() {
+  printf '%s\n' 'usage: enroll-privilege-posix status|preview|install|revoke' >&2
+  exit 64
+}
+
+result() {
+  printf 'enrollment|1\nstate|%s\nreason|%s\nplatform-boundary|%s\n' "$1" "$2" "$3"
+}
+
+fixture_root=${MACHINE_UTILITIES_U2_FIXTURE_ROOT:-}
+if [ -n "$fixture_root" ]; then
+  case $fixture_root in /*) ;; *) result rejected fixture_root_not_absolute fixture; exit 64 ;; esac
+  [ "$(/usr/bin/id -u)" -ne 0 ] || { result rejected fixture_mode_refuses_root fixture; exit 64; }
+  root_prefix=${fixture_root%/}
+  protected_owner=$(/usr/bin/id -un)
+  platform=linux
+  fixture_mode=true
+else
+  root_prefix=
+  protected_owner=root
+  fixture_mode=false
+  platform=$(/usr/bin/uname -s)
+  if [ "$platform" = Linux ] && [ -r /proc/sys/kernel/osrelease ] &&
+    /usr/bin/grep -Eiq '(microsoft|wsl)' /proc/sys/kernel/osrelease; then
+    platform=wsl
+  fi
+fi
+
+case $platform in
+  Darwin)
+    result unsupported no_cataloged_action macos
+    exit 69
+    ;;
+  wsl)
+    result unsupported unsupported_security_boundary wsl
+    exit 69
+    ;;
+  Linux|linux) ;;
+  *) result unsupported unsupported_platform unknown; exit 69 ;;
+esac
+
+[ "$fixture_mode" = true ] || [ "$(/usr/bin/id -u)" -eq 0 ] || {
+  result needs_human_enrollment authenticated_bootstrap_required linux
+  exit 77
+}
+
+readonly config_root=$root_prefix/etc/machine-utilities
+readonly state_root=$root_prefix/var/lib/machine-utilities
+readonly broker_path=$root_prefix/usr/libexec/machine-utilities/posix-broker
+readonly sudoers_path=$root_prefix/etc/sudoers.d/machine-utilities-posix-broker
+readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
+readonly command=${1:-}
+shift || true
+
+portable_stat() {
+  /usr/bin/stat -f "$1" "$3" 2>/dev/null || /usr/bin/stat -c "$2" "$3" 2>/dev/null
+}
+file_owner() { portable_stat %Su %U "$1"; }
+file_mode() { portable_stat %Lp %a "$1"; }
+file_size() { portable_stat %z %s "$1"; }
+
+sha256_file() {
+  if [ -x /usr/bin/sha256sum ]; then
+    /usr/bin/sha256sum "$1" | /usr/bin/awk '{print tolower($1)}'
+  else
+    /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print tolower($1)}'
+  fi
+}
+
+safe_permissions() {
+  mode=$(file_mode "$1") || return 1
+  permissions=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "${#permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+}
+
+protected_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1"
+}
+
+protected_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1" && [ "$(file_size "$1")" -le "$2" ]
+}
+
+token() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; }
+digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
+
+bundle=
+manifest_digest=
+epoch=
+policy_digest=
+constraints_digest=
+verify_bootstrap_bundle() {
+  bundle=$1
+  expected_manifest=${2:-}
+  case $bundle in "$bootstrap_root"/staged/*) ;; *) return 1 ;; esac
+  protected_directory "$bootstrap_root" && protected_directory "$bootstrap_root/staged" &&
+    protected_directory "$bootstrap_root/receipts" && protected_directory "$bundle" &&
+    protected_file "$bootstrap_root/release-allowed-signers" 16384 &&
+    protected_file "$bundle/bootstrap.manifest" 65536 &&
+    protected_file "$bundle/bootstrap.manifest.sig" 16384 || return 1
+  manifest_digest=$(sha256_file "$bundle/bootstrap.manifest") || return 1
+  [ "${bundle##*/}" = "$manifest_digest" ] &&
+    { [ -z "$expected_manifest" ] || [ "$expected_manifest" = "$manifest_digest" ]; } || return 1
+  receipt=$bootstrap_root/receipts/$manifest_digest
+  protected_file "$receipt" 1024 || return 1
+  [ "$(/usr/bin/sed -n '1p' "$receipt")" = \
+    "bootstrap|1|manifest-sha256=$manifest_digest|release-principal=machine-utilities-release" ] || return 1
+  /usr/bin/ssh-keygen -Y verify -f "$bootstrap_root/release-allowed-signers" \
+    -I machine-utilities-release -n machine-utilities-release \
+    -s "$bundle/bootstrap.manifest.sig" <"$bundle/bootstrap.manifest" >/dev/null 2>&1 || return 1
+
+  previous=
+  found_broker=false
+  found_enrollment=false
+  found_policy=false
+  found_constraints=false
+  found_identity=false
+  found_context=false
+  found_apt_config=false
+  found_apt_context=false
+  found_ca=false
+  found_signers=false
+  found_krl=false
+  while IFS='|' read -r kind relative expected_digest; do
+    [ "$kind" = file ] && digest "$expected_digest" || return 1
+    [ "${#relative}" -le 512 ] && [[ $relative =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
+      [[ /$relative/ != */../* && /$relative/ != */./* ]] || return 1
+    [ -z "$previous" ] || [[ $previous < $relative ]] || return 1
+    previous=$relative
+    candidate=$bundle/$relative
+    protected_file "$candidate" 33554432 && [ "$(sha256_file "$candidate")" = "$expected_digest" ] || return 1
+    case $relative in
+      privilege-broker-posix) found_broker=true ;;
+      enroll-privilege-posix) found_enrollment=true ;;
+      policy.actions) found_policy=true ;;
+      policy.constraints) found_constraints=true ;;
+      host.identity) found_identity=true ;;
+      context.canary) found_context=true ;;
+      apt.conf) found_apt_config=true ;;
+      apt.context) found_apt_context=true ;;
+      fleet-ca.pub) found_ca=true ;;
+      allowed_signers) found_signers=true ;;
+      revoked.krl) found_krl=true ;;
+    esac
+  done <"$bundle/bootstrap.manifest"
+  [ "$found_broker" = true ] && [ "$found_enrollment" = true ] &&
+    [ "$found_policy" = true ] && [ "$found_constraints" = true ] &&
+    [ "$found_identity" = true ] && [ "$found_context" = true ] &&
+    [ "$found_apt_config" = true ] && [ "$found_apt_context" = true ] &&
+    [ "$found_ca" = true ] &&
+    [ "$found_signers" = true ] && [ "$found_krl" = true ] || return 1
+  if [ "$fixture_mode" = false ]; then
+    [ "$0" = "$bundle/enroll-privilege-posix" ] || return 1
+  fi
+
+  policy_digest=$(sha256_file "$bundle/policy.actions")
+  constraints_digest=$(sha256_file "$bundle/policy.constraints")
+  epoch=$(/usr/bin/sed -n '1s/^constraints|1|generation=\([^|]*\)|policy-sha256=\([^|]*\)$/\1/p' \
+    "$bundle/policy.constraints")
+  bound_policy=$(/usr/bin/sed -n '1s/^constraints|1|generation=\([^|]*\)|policy-sha256=\([^|]*\)$/\2/p' \
+    "$bundle/policy.constraints")
+  [[ $epoch =~ ^[1-9][0-9]{0,9}$ ]] && [ "$bound_policy" = "$policy_digest" ] || return 1
+
+  /usr/bin/awk -F '|' '
+    BEGIN {
+      expected["apt.autoremove.v1"]="posix-root-v1|none"
+      expected["apt.install-package-version.v1"]="posix-root-v1|package-source-version-closure-set-sha256"
+      expected["apt.update-metadata.v1"]="posix-root-v1|none"
+      expected["apt.upgrade-package.v1"]="posix-root-v1|package-source-channel-set-sha256"
+      expected["profile.apply-managed-bundle.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
+      expected["profile.inventory-managed-state.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
+      expected["winget.install-machine-package.v1"]="windows-system-v1|winget-package-version-set-sha256"
+      expected["winget.inventory-machine.v1"]="windows-system-v1|none"
+      expected["winget.upgrade-machine-package.v1"]="windows-system-v1|winget-package-channel-set-sha256"
+    }
+    $0!~/^[ -~]+$/{exit 1}
+    NR==1{if($0!="policy|1|catalog=1")exit 1;next}
+    {if(NF!=6||$1!="action"||!($2 in expected)||seen[$2]++||($3"|"$5)!=expected[$2]||
+       ($4!="enabled"&&$4!="disabled")||($5=="none"?$6!="-":($6!="-"&&(length($6)!=64||$6!~/^[0-9a-f]+$/)))||
+       (previous!=""&&previous>=$2))exit 1;previous=$2}
+    END{if(NR!=10)exit 1;for(id in expected)if(!seen[id])exit 1}
+  ' "$bundle/policy.actions" || return 1
+
+  /usr/bin/awk -F '|' -v policy_digest="$policy_digest" '
+    function token(v){return v~/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/}
+    function atom(v){return v~/^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/}
+    function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
+    function version(v){return v~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/}
+    function uint(v){return v~/^(0|[1-9][0-9]*)$/&&(v+0)<=2147483647}
+    $0!~/^[ -~]+$/||length($0)>2048{exit 1}
+    NR==1{if(NF!=4||$1!="constraints"||$2!="1"||$3!~/^generation=[1-9][0-9]{0,9}$/||
+      $4!="policy-sha256="policy_digest)exit 1;next}
+    {if(previous!=""&&previous>=$0)exit 1;previous=$0;
+      membership_action=($1=="profile"?"profile":$2);membership_token=($1=="profile"?$2:$3);
+      if(seen[membership_action SUBSEP membership_token]++)exit 1}
+    $1=="apt-install"{if(NF!=8||$2!="apt.install-package-version.v1"||!token($3)||!atom($4)||
+      !atom($5)||!version($6)||!digest($7)||!digest($8))exit 1;next}
+    $1=="apt-upgrade"{if(NF!=9||$2!="apt.upgrade-package.v1"||!token($3)||!atom($4)||
+      !atom($5)||!version($6)||!version($7)||!uint($8)||!digest($9))exit 1;next}
+    $1=="profile"{if(NF!=9||!token($2)||$3!~/^S-[0-9]+(-[0-9]+){1,14}$/||!atom($4)||
+      !digest($5)||!digest($6)||($7!="managed-only"&&$7!="managed-and-prune")||
+      !uint($8)||$8=="0"||!uint($9)||$9=="0")exit 1;next}
+    $1=="winget-install"{if(NF!=14||$2!="winget.install-machine-package.v1"||!token($3)||
+      !atom($4)||!atom($5)||!atom($6)||!digest($7)||$8!="machine"||!atom($9)||!atom($10)||
+      !atom($11)||!version($12)||$13!="provider-enforced-manifest-hash"||
+      $14!="source-delegated-all")exit 1;next}
+    $1=="winget-upgrade"{if(NF!=16||$2!="winget.upgrade-machine-package.v1"||!token($3)||
+      !atom($4)||!atom($5)||!atom($6)||!digest($7)||$8!="machine"||!atom($9)||!atom($10)||
+      !atom($11)||!version($12)||!version($13)||!uint($14)||
+      $15!="provider-enforced-manifest-hash"||$16!="source-delegated-all")exit 1;next}
+    {exit 1}
+  ' "$bundle/policy.constraints" || return 1
+}
+
+preview_bundle() {
+  printf 'enrollment-preview|1\nmanifest-sha256|%s\nepoch|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
+    "$manifest_digest" "$epoch" "$policy_digest" "$constraints_digest"
+  /usr/bin/awk -F '|' 'NR>1{printf "action|%s|%s|%s|%s|%s\n",$2,$3,$4,$5,$6}' \
+    "$bundle/policy.actions"
+}
+
+make_protected_directory() {
+  /bin/mkdir -p "$1"
+  /bin/chmod "$2" "$1"
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$1"; fi
+}
+
+manifest_file_digest() {
+  /usr/bin/awk -F '|' -v relative="$1" '$1=="file"&&$2==relative{print $3;exit}' \
+    "$bundle/bootstrap.manifest"
+}
+
+copy_manifest_file() {
+  relative=$1
+  destination=$2
+  expected=$(manifest_file_digest "$relative")
+  digest "$expected" || return 1
+  source_path=$bundle/$relative
+  protected_file "$source_path" 33554432 || return 1
+  exec 3<"$source_path" || return 1
+  /bin/cat <&3 >"$destination" || { exec 3<&-; return 1; }
+  exec 3<&-
+  [ "$(sha256_file "$destination")" = "$expected" ] || return 1
+  /bin/chmod 0644 "$destination"
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$destination"; fi
+}
+
+install_bundle() (
+  set -Eeuo pipefail
+  install_bundle_path=$1
+  install_manifest_digest=$2
+  confirmed_policy_digest=$3
+  verify_bootstrap_bundle "$install_bundle_path" "$install_manifest_digest" || {
+    result rejected authenticated_bootstrap_failed linux
+    exit 65
+  }
+  [ "$confirmed_policy_digest" = "$policy_digest" ] || {
+    result rejected policy_confirmation_mismatch linux
+    exit 65
+  }
+
+  active_before=
+  previous_epoch=0
+  if [ -L "$config_root/active" ]; then
+    active_before=$(/usr/bin/readlink "$config_root/active")
+    [[ $active_before =~ ^generations/([1-9][0-9]{0,9})$ ]] || {
+      result drifted invalid_active_generation linux
+      exit 65
+    }
+    previous_epoch=${BASH_REMATCH[1]}
+  elif [ -e "$config_root/active" ]; then
+    result drifted invalid_active_generation linux
+    exit 65
+  fi
+  [ "$epoch" -eq $((previous_epoch + 1)) ] || {
+    result rejected non_monotonic_generation linux
+    exit 65
+  }
+
+  # Check the signed host/context records before creating protected state.
+  IFS='|' read -r identity_type identity_version host_id enrolled_uid request_user \
+    fleet_domain ca_fingerprint ca_generation host_fingerprint endpoint_principals \
+    <"$bundle/host.identity" || true
+  [ "$identity_type" = identity ] && [ "$identity_version" = 1 ] && token "$host_id" &&
+    [[ $enrolled_uid =~ ^(0|[1-9][0-9]{0,9})$ ]] && [ "$enrolled_uid" != 0 ] &&
+    token "$request_user" &&
+    [[ $fleet_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
+    [[ $ca_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [[ $ca_generation =~ ^[1-9][0-9]{0,9}$ ]] &&
+    [[ $host_fingerprint =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]] &&
+    [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] || {
+      result rejected invalid_host_identity linux
+      exit 65
+    }
+  [ "$(/usr/bin/sed -n '1p' "$bundle/context.canary")" = \
+    'context|1|platform=linux|required=posix-root-v1|principal=root|console-session=none' ] || {
+    result rejected invalid_context_canary linux
+    exit 65
+  }
+
+  make_protected_directory "$root_prefix/etc" 0755
+  make_protected_directory "$root_prefix/etc/sudoers.d" 0755
+  make_protected_directory "$root_prefix/usr" 0755
+  make_protected_directory "$root_prefix/usr/libexec" 0755
+  make_protected_directory "$root_prefix/usr/libexec/machine-utilities" 0755
+  make_protected_directory "$root_prefix/var" 0755
+  make_protected_directory "$root_prefix/var/lib" 0755
+  make_protected_directory "$config_root" 0755
+  make_protected_directory "$config_root/generations" 0755
+  make_protected_directory "$config_root/trust" 0755
+  make_protected_directory "$state_root" 0700
+  for state_directory in replay journal audit lock rollback; do
+    make_protected_directory "$state_root/$state_directory" 0700
+  done
+  protected_directory "$config_root" && protected_directory "$config_root/generations" &&
+    protected_directory "$config_root/trust" && protected_directory "$state_root" || {
+      result rejected protected_path_validation_failed linux
+      exit 65
+    }
+
+  draining=$state_root/draining
+  [ ! -e "$draining" ] || {
+    result draining enrollment_already_draining linux
+    exit 75
+  }
+  printf 'draining|1|upgrade|from=%s|to=%s\n' "$previous_epoch" "$epoch" >"$draining"
+  /bin/chmod 0600 "$draining"
+  [ "$fixture_mode" = true ] || /usr/bin/chown root:root "$draining"
+  [ ! -e "$state_root/lock/active" ] || {
+    result draining active_request_must_settle linux
+    exit 75
+  }
+
+  staging=$config_root/generations/.staging-$epoch-$$
+  final_generation=$config_root/generations/$epoch
+  [ ! -e "$staging" ] && [ ! -e "$final_generation" ] || {
+    result drifted generation_already_exists linux
+    exit 65
+  }
+  make_protected_directory "$staging" 0755
+  make_protected_directory "$staging/apt" 0755
+  make_protected_directory "$staging/apt/sources.list.d" 0755
+  make_protected_directory "$staging/apt/trusted.gpg.d" 0755
+  for relative in policy.actions policy.constraints host.identity context.canary apt.conf apt.context; do
+    copy_manifest_file "$relative" "$staging/$relative" || {
+      result rejected protected_copy_digest_mismatch linux
+      exit 65
+    }
+  done
+  while IFS='|' read -r kind relative expected; do
+    case $relative in
+      apt/*)
+        destination=$staging/$relative
+        destination_directory=${destination%/*}
+        make_protected_directory "$destination_directory" 0755
+        copy_manifest_file "$relative" "$destination" || {
+          result rejected protected_copy_digest_mismatch linux
+          exit 65
+        }
+        ;;
+    esac
+  done <"$bundle/bootstrap.manifest"
+  printf '%s\n' "$(manifest_file_digest privilege-broker-posix)" >"$staging/broker.sha256"
+  printf '%s\n' 1.0.0 >"$staging/broker.version"
+  /bin/chmod 0644 "$staging/broker.sha256" "$staging/broker.version"
+  [ "$fixture_mode" = true ] || /usr/bin/chown root:root "$staging/broker.sha256" "$staging/broker.version"
+
+  # Re-verify every protected copy and the complete broker syntax before any
+  # active pointer or sudoers grant can name it.
+  [ "$(sha256_file "$staging/policy.actions")" = "$policy_digest" ] &&
+    [ "$(sha256_file "$staging/policy.constraints")" = "$constraints_digest" ] &&
+    /bin/bash -n "$bundle/privilege-broker-posix" || {
+      result rejected staged_generation_validation_failed linux
+      exit 65
+    }
+  new_broker=$state_root/.posix-broker.$$
+  copy_manifest_file privilege-broker-posix "$new_broker" || {
+    result rejected protected_copy_digest_mismatch linux
+    exit 65
+  }
+  /bin/chmod 0755 "$new_broker"
+  if "$new_broker" arbitrary </dev/null >/dev/null 2>&1; then
+    result rejected broker_argument_canary_failed linux
+    exit 65
+  fi
+
+  new_ca=$state_root/.fleet-ca.$$
+  new_signers=$state_root/.allowed-signers.$$
+  new_krl=$state_root/.revoked-krl.$$
+  copy_manifest_file fleet-ca.pub "$new_ca"
+  copy_manifest_file allowed_signers "$new_signers"
+  copy_manifest_file revoked.krl "$new_krl"
+  observed_ca=$(/usr/bin/ssh-keygen -lf "$new_ca" -E sha256 2>/dev/null |
+    /usr/bin/awk 'NR==1{print $2}')
+  [ "$observed_ca" = "$ca_fingerprint" ] || {
+    result rejected fleet_ca_fingerprint_mismatch linux
+    exit 65
+  }
+
+  sudoers_temp=$state_root/.sudoers.$$
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' "$request_user" \
+    /usr/libexec/machine-utilities/posix-broker >"$sudoers_temp"
+  /bin/chmod 0440 "$sudoers_temp"
+  [ "$fixture_mode" = true ] || {
+    /usr/bin/chown root:root "$sudoers_temp"
+    [ -x /usr/sbin/visudo ] && /usr/sbin/visudo -cf "$sudoers_temp" >/dev/null
+  }
+
+  backup=$state_root/rollback/$previous_epoch
+  make_protected_directory "$backup" 0700
+  [ ! -e "$broker_path" ] || /bin/cp -p "$broker_path" "$backup/posix-broker"
+  [ ! -e "$sudoers_path" ] || /bin/cp -p "$sudoers_path" "$backup/sudoers"
+  for trust_name in fleet-ca.pub allowed_signers revoked.krl; do
+    [ ! -e "$config_root/trust/$trust_name" ] ||
+      /bin/cp -p "$config_root/trust/$trust_name" "$backup/$trust_name"
+  done
+  printf '%s\n' "$active_before" >"$backup/active-target"
+
+  mutation_started=true
+  rollback_install() {
+    rc=$?
+    set +e
+    if [ "${mutation_started:-false}" = true ]; then
+      if [ -s "$backup/active-target" ]; then
+        old_target=$(/usr/bin/sed -n '1p' "$backup/active-target")
+        /bin/ln -s "$old_target" "$config_root/.active.rollback.$$" &&
+          /bin/mv -f "$config_root/.active.rollback.$$" "$config_root/active"
+      else
+        /bin/rm -f "$config_root/active"
+      fi
+      [ ! -f "$backup/posix-broker" ] || /bin/cp -p "$backup/posix-broker" "$broker_path"
+      [ ! -f "$backup/sudoers" ] || /bin/cp -p "$backup/sudoers" "$sudoers_path"
+      for trust_name in fleet-ca.pub allowed_signers revoked.krl; do
+        [ ! -f "$backup/$trust_name" ] || /bin/cp -p "$backup/$trust_name" "$config_root/trust/$trust_name"
+      done
+    fi
+    /bin/rm -f "$draining" "$new_broker" "$new_ca" "$new_signers" "$new_krl" "$sudoers_temp"
+    [ ! -d "$staging" ] || /bin/rm -rf "$staging"
+    result drifted rollback_restored_previous_generation linux
+    exit "$rc"
+  }
+  trap rollback_install ERR
+
+  /bin/mv "$staging" "$final_generation"
+  /bin/mv -f "$new_broker" "$broker_path"
+  /bin/mv -f "$new_ca" "$config_root/trust/fleet-ca.pub"
+  /bin/mv -f "$new_signers" "$config_root/trust/allowed_signers"
+  /bin/mv -f "$new_krl" "$config_root/trust/revoked.krl"
+  /bin/mv -f "$sudoers_temp" "$sudoers_path"
+  /bin/ln -s "generations/$epoch" "$config_root/.active.$$"
+  /bin/mv -f "$config_root/.active.$$" "$config_root/active"
+  if [ "$fixture_mode" = false ]; then
+    /usr/sbin/visudo -cf /etc/sudoers >/dev/null
+  fi
+  [ "$(sha256_file "$broker_path")" = "$(/usr/bin/sed -n '1p' "$final_generation/broker.sha256")" ] &&
+    [ "$(/usr/bin/readlink "$config_root/active")" = "generations/$epoch" ]
+
+  trap - ERR
+  mutation_started=false
+  /bin/rm -f "$draining"
+  printf 'enrollment|1\nstate|enrolled\nreason|generation_activated\nplatform-boundary|linux\n'
+  printf 'epoch|%s\nmanifest-sha256|%s\nbroker-sha256|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
+    "$epoch" "$manifest_digest" "$(sha256_file "$broker_path")" "$policy_digest" "$constraints_digest"
+  printf 'native-canary|pending\nvisudo-canary|%s\n' \
+    "$(if [ "$fixture_mode" = true ]; then printf not-run; else printf passed-complete-policy; fi)"
+)
+
+revoke_bundle() (
+  set -Eeuo pipefail
+  revoke_bundle_path=$1
+  revoke_manifest_digest=$2
+  expected_epoch=$3
+  verify_bootstrap_bundle "$revoke_bundle_path" "$revoke_manifest_digest" || {
+    result rejected authenticated_bootstrap_failed linux
+    exit 65
+  }
+  [[ $expected_epoch =~ ^[1-9][0-9]{0,9}$ ]] || usage
+  [ -L "$config_root/active" ] || {
+    result revoked already_not_enrolled linux
+    exit 0
+  }
+  active_target=$(/usr/bin/readlink "$config_root/active")
+  [ "$active_target" = "generations/$expected_epoch" ] || {
+    result drifted revocation_generation_mismatch linux
+    exit 65
+  }
+  printf 'draining|1|revoke|epoch=%s\n' "$expected_epoch" >"$state_root/draining"
+  /bin/chmod 0600 "$state_root/draining"
+  [ "$fixture_mode" = true ] || /usr/bin/chown root:root "$state_root/draining"
+  [ ! -e "$state_root/lock/active" ] || {
+    result draining active_request_must_settle linux
+    exit 75
+  }
+  backup=$state_root/rollback/revoked-$expected_epoch
+  make_protected_directory "$backup" 0700
+  /bin/cp -p "$broker_path" "$backup/posix-broker"
+  /bin/cp -p "$sudoers_path" "$backup/sudoers"
+  printf '%s\n' "$active_target" >"$backup/active-target"
+  /bin/rm -f "$sudoers_path"
+  if [ "$fixture_mode" = false ]; then /usr/sbin/visudo -cf /etc/sudoers >/dev/null; fi
+  /bin/rm -f "$broker_path" "$config_root/active" "$state_root/draining"
+  [ ! -e "$broker_path" ] && [ ! -e "$sudoers_path" ] && [ ! -e "$config_root/active" ] || {
+    result drifted revocation_incomplete linux
+    exit 65
+  }
+  printf 'enrollment|1\nstate|revoked\nreason|grant_and_broker_removed\nplatform-boundary|linux\n'
+  printf 'epoch|%s\nordinary-inventory|preserved\nprotected-journal|preserved\n' "$expected_epoch"
+)
+
+case $command in
+  status)
+    [ "$#" -eq 0 ] || usage
+    if [ -L "$config_root/active" ] && [ -x "$broker_path" ]; then
+      result enrolled protected_generation_present linux
+    else
+      result needs_human_enrollment broker_not_enrolled linux
+    fi
+    ;;
+  preview)
+    [ "$#" -eq 1 ] || usage
+    verify_bootstrap_bundle "$1" || {
+      result rejected authenticated_bootstrap_failed linux
+      exit 65
+    }
+    preview_bundle
+    ;;
+  install)
+    [ "$#" -eq 3 ] || usage
+    install_bundle "$1" "$2" "$3"
+    ;;
+  revoke)
+    [ "$#" -eq 3 ] || usage
+    revoke_bundle "$1" "$2" "$3"
+    ;;
+  *) usage ;;
+esac

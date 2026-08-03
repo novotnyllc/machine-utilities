@@ -633,6 +633,433 @@ printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 printf '%s\n' 2.0.0 >"$CLAUDE_STATE_FILE"
 printf '%s\n' '{"portable":"session"}' >"$OP_SECRET_FILE"
 
+test_u2_contracts() {
+  broker="$script_dir/privilege-broker-posix"
+  enrollment="$script_dir/enroll-privilege-posix"
+  [ -x "$broker" ] || fail "U2 POSIX broker is missing or not executable"
+  [ -x "$enrollment" ] || fail "U2 POSIX enrollment entrypoint is missing or not executable"
+
+  apt_marker="$tmp/u2-apt-executed"
+  if APT_EXEC_MARKER="$apt_marker" "$broker" unexpected </dev/null >/dev/null 2>&1; then
+    fail "U2 broker accepted an argument"
+  fi
+  [ ! -e "$apt_marker" ] || fail "U2 argument rejection reached APT"
+
+  if printf '%s\n' 'request|2' | APT_EXEC_MARKER="$apt_marker" \
+      "$broker" >/dev/null 2>&1; then
+    fail "U2 broker accepted an unknown request version"
+  fi
+  [ ! -e "$apt_marker" ] || fail "U2 malformed request reached APT"
+
+  u2_root="$tmp/u2-root"
+  u2_bootstrap="$u2_root/var/lib/machine-utilities-bootstrap"
+  u2_build="$tmp/u2-bundle"
+  u2_generation="$u2_root/etc/machine-utilities/generations/1"
+  mkdir -p "$u2_bootstrap/staged" "$u2_bootstrap/receipts" "$u2_build/apt/sources.list.d" \
+    "$u2_build/apt/trusted.gpg.d" "$u2_build/apt/preferences.d" "$u2_root/usr/bin" \
+    "$u2_root/usr/lib/apt/methods" "$u2_root/usr/lib/apt/solvers" \
+    "$u2_root/usr/lib/apt/planners"
+  chmod -R go-w "$u2_root" "$u2_build"
+
+  u2_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+    else shasum -a 256 "$1" | awk '{print $1}'; fi
+  }
+  u2_tree_digest() {
+    tree=$1
+    tree_listing="$tmp/u2-tree-listing"
+    : >"$tree_listing"
+    find "$tree" -type f -print | LC_ALL=C sort | while IFS= read -r tree_file; do
+      printf '%s|%s\n' "${tree_file#"$tree"/}" "$(u2_sha256 "$tree_file")"
+    done >"$tree_listing"
+    u2_sha256 "$tree_listing"
+  }
+  u2_sha256_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+    else shasum -a 256 | awk '{print $1}'; fi
+  }
+  u2_path_set_digest() {
+    path_listing="$tmp/u2-path-listing"
+    : >"$path_listing"
+    while [ "$#" -gt 0 ]; do
+      path_label=$1
+      path_candidate=$2
+      shift 2
+      if [ -f "$path_candidate" ]; then
+        printf '%s|file|%s\n' "$path_label" "$(u2_sha256 "$path_candidate")" >>"$path_listing"
+      elif [ -d "$path_candidate" ]; then
+        printf '%s|directory\n' "$path_label" >>"$path_listing"
+        find "$path_candidate" -type f -print | LC_ALL=C sort | while IFS= read -r path_member; do
+          printf '%s/%s|file|%s\n' "$path_label" "${path_member#"$path_candidate"/}" \
+            "$(u2_sha256 "$path_member")"
+        done >>"$path_listing"
+      else
+        printf '%s|absent\n' "$path_label" >>"$path_listing"
+      fi
+    done
+    u2_sha256 "$path_listing"
+  }
+  u2_expect_rejected() {
+    expected_reason=$1
+    input=$2
+    output=$3
+    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$broker" <"$input" >"$output" 2>/dev/null; then
+      fail "U2 broker accepted fixture expected to fail: $expected_reason"
+    fi
+    grep -Fqx "reason|$expected_reason" "$output" ||
+      fail "U2 broker rejection was not $expected_reason"
+    [ ! -e "$apt_marker" ] || fail "U2 rejection reached APT: $expected_reason"
+  }
+
+  ssh_keygen=/usr/bin/ssh-keygen
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-release-key"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-fleet-ca"
+  "$ssh_keygen" -q -t ed25519 -N '' -f "$tmp/u2-node-key"
+  "$ssh_keygen" -q -s "$tmp/u2-fleet-ca" -I 'node-a@fleet.example' -z 41 \
+    -n 'node-a@fleet.example,machine-utilities-posix,machine-utilities-windows' -V '-5m:+2h' \
+    -O no-agent-forwarding -O no-port-forwarding -O no-pty -O no-user-rc -O no-X11-forwarding \
+    "$tmp/u2-node-key.pub"
+  awk 'NR==1{print "machine-utilities-release "$0}' "$tmp/u2-release-key.pub" \
+    >"$u2_bootstrap/release-allowed-signers"
+  awk 'NR==1{print "node-a@fleet.example cert-authority "$0}' "$tmp/u2-fleet-ca.pub" \
+    >"$u2_build/allowed_signers"
+  cp "$tmp/u2-fleet-ca.pub" "$u2_build/fleet-ca.pub"
+  : >"$u2_build/revoked.krl"
+
+  cat >"$u2_root/usr/bin/apt-get" <<SH
+#!/bin/sh
+printf '%s|%s\n' "\$0" "\$*" >>'$apt_marker'
+case " \$* " in
+  *' --simulate '*) printf '%s\n' 'Inst fixture-package (1.2.3 fixture [fixture])' 'Conf fixture-package (1.2.3 fixture [fixture])' ;;
+esac
+exit 0
+SH
+  cat >"$u2_root/usr/bin/apt-config" <<'SH'
+#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = dump ] || exit 64
+generation=${APT_CONFIG%/apt.conf}
+/bin/cat "$generation/apt/effective.dump"
+SH
+  cat >"$u2_root/usr/bin/apt-cache" <<'SH'
+#!/bin/sh
+[ "${1:-}" = policy ] || exit 64
+if [ "$#" -eq 1 ]; then
+  printf '%s\n' 'metadata|1'
+  exit 0
+fi
+printf '%s\n' "$2:" '  Installed: (none)' '  Candidate: 1.2.3' \
+  '  Version table:' '     1.2.3 500' '        500 https://packages.example.invalid stable/main fixture Packages'
+SH
+  cat >"$u2_root/usr/bin/dpkg" <<'SH'
+#!/bin/sh
+case "${1:-}" in
+  --print-architecture) printf '%s\n' fixture ;;
+  --compare-versions) exit 0 ;;
+  *) exit 64 ;;
+esac
+SH
+  cat >"$u2_root/usr/bin/dpkg-query" <<'SH'
+#!/bin/sh
+exit 1
+SH
+  cat >"$u2_root/usr/bin/dpkg-deb" <<'SH'
+#!/bin/sh
+exit 64
+SH
+  cat >"$u2_root/usr/bin/setsid" <<'SH'
+#!/bin/sh
+exec "$@"
+SH
+  for fake_binary in apt-get apt-config apt-cache dpkg dpkg-query dpkg-deb setsid; do
+    chmod 755 "$u2_root/usr/bin/$fake_binary"
+  done
+  cat >"$u2_root/usr/lib/apt/apt-helper" <<'SH'
+#!/bin/sh
+exit 64
+SH
+  chmod 755 "$u2_root/usr/lib/apt/apt-helper"
+  cat >"$u2_root/usr/bin/gpgv" <<'SH'
+#!/bin/sh
+exit 64
+SH
+  chmod 755 "$u2_root/usr/bin/gpgv"
+  cat >"$u2_root/usr/lib/apt/methods/https" <<'SH'
+#!/bin/sh
+exit 99
+SH
+  chmod 755 "$u2_root/usr/lib/apt/methods/https"
+  printf '%s\n' 'deb [signed-by=trusted.gpg.d/fleet.gpg] https://packages.example.invalid stable main' \
+    >"$u2_build/apt/sources.list"
+  cp "$tmp/u2-fleet-ca.pub" "$u2_build/apt/trusted.gpg.d/fleet.gpg"
+  : >"$u2_build/apt/preferences"
+  : >"$u2_build/apt/preferences.d/00-machine-utilities"
+  printf '%s\n' 'source-identities|1' >"$u2_build/apt/source-identities"
+
+  u2_policy="$u2_build/policy.actions"
+  cp "$script_dir/../references/privilege-policy.default" "$u2_policy"
+  u2_policy_digest=$(u2_sha256 "$u2_policy")
+  printf 'constraints|1|generation=1|policy-sha256=%s\n' "$u2_policy_digest" \
+    >"$u2_build/policy.constraints"
+  u2_uid=$(id -u)
+  u2_ca_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-fleet-ca.pub" -E sha256 | awk 'NR==1{print $2}')
+  u2_host_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-node-key.pub" -E sha256 | awk 'NR==1{print $2}')
+  printf 'identity|1|test-apt|%s|machine-utilities|fleet.example|%s|1|%s|machine-utilities-posix,machine-utilities-windows\n' \
+    "$u2_uid" "$u2_ca_fingerprint" "$u2_host_fingerprint" >"$u2_build/host.identity"
+  printf '%s\n' 'context|1|platform=linux|required=posix-root-v1|principal=root|console-session=none' \
+    >"$u2_build/context.canary"
+  cat >"$u2_build/apt.conf" <<EOF
+Dir::Etc::main "/dev/null";
+Dir::Etc::parts "/dev/null";
+Dir::Etc::sourcelist "$u2_generation/apt/sources.list";
+Dir::Etc::sourceparts "$u2_generation/apt/sources.list.d";
+Dir::Etc::trusted "$u2_generation/apt/trusted.gpg";
+Dir::Etc::trustedparts "$u2_generation/apt/trusted.gpg.d";
+Dir::Etc::preferences "$u2_generation/apt/preferences";
+Dir::Etc::preferencesparts "$u2_generation/apt/preferences.d";
+Dir::Bin::methods "$u2_root/usr/lib/apt/methods";
+Dir::Bin::dpkg "$u2_root/usr/bin/dpkg";
+APT::Architecture "fixture";
+Acquire::AllowInsecureRepositories "false";
+APT::Get::AllowUnauthenticated "false";
+EOF
+  cp "$u2_build/apt.conf" "$u2_build/apt/effective.dump"
+  u2_apt_config_digest=$(u2_sha256 "$u2_build/apt.conf")
+  u2_effective_config_digest=$(u2_sha256 "$u2_build/apt/effective.dump")
+  u2_sources_digest=$(u2_path_set_digest source-main "$u2_build/apt/sources.list" \
+    source-parts "$u2_build/apt/sources.list.d")
+  u2_keyrings_digest=$(u2_path_set_digest trusted-main "$u2_build/apt/trusted.gpg" \
+    trusted-parts "$u2_build/apt/trusted.gpg.d")
+  u2_preferences_digest=$(u2_path_set_digest preferences-main "$u2_build/apt/preferences" \
+    preferences-parts "$u2_build/apt/preferences.d")
+  u2_methods_digest=$(u2_path_set_digest methods "$u2_root/usr/lib/apt/methods")
+  u2_compressors_digest=$(u2_path_set_digest gzip "$u2_root/usr/bin/gzip" \
+    xz "$u2_root/usr/bin/xz" bzip2 "$u2_root/usr/bin/bzip2" \
+    lz4 "$u2_root/usr/bin/lz4" zstd "$u2_root/usr/bin/zstd")
+  u2_helpers_digest=$(u2_path_set_digest apt-helper "$u2_root/usr/lib/apt/apt-helper" \
+    apt-solvers "$u2_root/usr/lib/apt/solvers" apt-planners "$u2_root/usr/lib/apt/planners" \
+    gpgv "$u2_root/usr/bin/gpgv")
+  cat >"$u2_build/apt.context" <<EOF
+apt-context|2
+architecture|fixture
+config-file-sha256|$u2_apt_config_digest
+effective-config-sha256|$u2_effective_config_digest
+sources-sha256|$u2_sources_digest
+keyrings-sha256|$u2_keyrings_digest
+preferences-sha256|$u2_preferences_digest
+source-identities-sha256|$(u2_sha256 "$u2_build/apt/source-identities")
+methods-sha256|$u2_methods_digest
+compressors-sha256|$u2_compressors_digest
+helpers-sha256|$u2_helpers_digest
+binary|apt-get|$(u2_sha256 "$u2_root/usr/bin/apt-get")
+binary|apt-config|$(u2_sha256 "$u2_root/usr/bin/apt-config")
+binary|apt-cache|$(u2_sha256 "$u2_root/usr/bin/apt-cache")
+binary|dpkg|$(u2_sha256 "$u2_root/usr/bin/dpkg")
+binary|dpkg-query|$(u2_sha256 "$u2_root/usr/bin/dpkg-query")
+binary|dpkg-deb|$(u2_sha256 "$u2_root/usr/bin/dpkg-deb")
+binary|setsid|$(u2_sha256 "$u2_root/usr/bin/setsid")
+EOF
+  cp "$broker" "$u2_build/privilege-broker-posix"
+  cp "$enrollment" "$u2_build/enroll-privilege-posix"
+
+  : >"$u2_build/bootstrap.manifest"
+  for u2_relative in allowed_signers apt.conf apt.context apt/effective.dump apt/preferences \
+    apt/preferences.d/00-machine-utilities apt/source-identities apt/sources.list \
+    apt/trusted.gpg.d/fleet.gpg context.canary enroll-privilege-posix fleet-ca.pub \
+    host.identity policy.actions policy.constraints privilege-broker-posix revoked.krl; do
+    printf 'file|%s|%s\n' "$u2_relative" "$(u2_sha256 "$u2_build/$u2_relative")"
+  done | LC_ALL=C sort -t '|' -k2,2 >"$u2_build/bootstrap.manifest"
+  u2_manifest_digest=$(u2_sha256 "$u2_build/bootstrap.manifest")
+  "$ssh_keygen" -Y sign -f "$tmp/u2-release-key" -n machine-utilities-release \
+    "$u2_build/bootstrap.manifest" >/dev/null
+  u2_bundle="$u2_bootstrap/staged/$u2_manifest_digest"
+  mv "$u2_build" "$u2_bundle"
+  printf 'bootstrap|1|manifest-sha256=%s|release-principal=machine-utilities-release\n' \
+    "$u2_manifest_digest" >"$u2_bootstrap/receipts/$u2_manifest_digest"
+  chmod -R go-w "$u2_root"
+  "$ssh_keygen" -Y verify -f "$u2_bootstrap/release-allowed-signers" \
+    -I machine-utilities-release -n machine-utilities-release \
+    -s "$u2_bundle/bootstrap.manifest.sig" <"$u2_bundle/bootstrap.manifest" >/dev/null 2>&1 ||
+    fail "U2 release signature fixture was invalid"
+
+  if ! MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" preview "$u2_bundle" \
+      >"$tmp/u2-preview"; then
+    cat "$tmp/u2-preview" >&2
+    fail "U2 authenticated bootstrap preview failed"
+  fi
+  grep -Fqx "policy-sha256|$u2_policy_digest" "$tmp/u2-preview" ||
+    fail "U2 enrollment preview omitted the confirmed policy digest"
+  if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \
+      "$u2_manifest_digest" "$(printf '0%.0s' {1..64})" >"$tmp/u2-wrong-confirmation" 2>/dev/null; then
+    fail "U2 enrollment accepted an unconfirmed policy digest"
+  fi
+  [ ! -e "$u2_root/etc/machine-utilities/active" ] ||
+    fail "U2 failed confirmation changed active state"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" install "$u2_bundle" \
+    "$u2_manifest_digest" "$u2_policy_digest" >"$tmp/u2-enrolled"
+  grep -Fqx 'state|enrolled' "$tmp/u2-enrolled" || fail "U2 fixture enrollment did not activate"
+  grep -Fqx 'native-canary|pending' "$tmp/u2-enrolled" || fail "U2 fixture claimed a native canary"
+  grep -Fqx 'visudo-canary|not-run' "$tmp/u2-enrolled" || fail "U2 fixture claimed visudo validation"
+  [ "$(readlink "$u2_root/etc/machine-utilities/active")" = generations/1 ] ||
+    fail "U2 enrollment did not atomically select generation 1"
+  [ -x "$u2_root/usr/libexec/machine-utilities/posix-broker" ] ||
+    fail "U2 enrollment did not install the protected broker"
+  grep -Fqx 'machine-utilities ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker ""' \
+    "$u2_root/etc/sudoers.d/machine-utilities-posix-broker" ||
+    fail "U2 sudoers fixture was not the fixed no-argument broker grant"
+
+  u2_broker_digest=$(u2_sha256 "$broker")
+  u2_constraints_digest=$(u2_sha256 "$u2_root/etc/machine-utilities/generations/1/policy.constraints")
+  u2_context_digest=$(u2_sha256 "$u2_root/etc/machine-utilities/generations/1/context.canary")
+  u2_node_fingerprint=$("$ssh_keygen" -lf "$tmp/u2-node-key-cert.pub" -E sha256 | awk 'NR==1{print $2}')
+  u2_valid_after=$(TZ=UTC "$ssh_keygen" -Lf "$tmp/u2-node-key-cert.pub" |
+    awk '/Valid: from/{gsub(/[-:]/,"",$3);print $3"Z"}')
+  u2_valid_before=$(TZ=UTC "$ssh_keygen" -Lf "$tmp/u2-node-key-cert.pub" |
+    awk '/Valid: from/{gsub(/[-:]/,"",$5);print $5"Z"}')
+  u2_metadata_digest=$(printf '%s\n' 'metadata|1' | u2_sha256_stream)
+  u2_precondition_digest=$(printf 'metadata|%s\n' "$u2_metadata_digest" | u2_sha256_stream)
+  u2_make_envelope() {
+    envelope_action=$1
+    envelope_request_id=$2
+    envelope_created=$3
+    envelope_expiry=$4
+    envelope_node=${5:-node-a}
+    envelope_token=${6:--}
+    envelope_manager=${7:-not-applicable}
+    request_suffix=${envelope_request_id#request-}
+    request_file="$tmp/u2-request-$request_suffix"
+    signature_file="$request_file.sig"
+    envelope_file="$tmp/u2-envelope-$request_suffix"
+    cat >"$request_file" <<EOF
+request|1
+target-host-id|test-apt
+target-uid|$u2_uid
+plan-id|plan-0123456789abcdef
+request-id|$envelope_request_id
+action-id|$envelope_action
+policy-token|$envelope_token
+broker-protocol|1
+broker-version|1.0.0
+broker-sha256|$u2_broker_digest
+policy-sha256|$u2_policy_digest
+constraints-sha256|$u2_constraints_digest
+precondition-sha256|$u2_precondition_digest
+created-at|$envelope_created
+expires-at|$envelope_expiry
+transport|posix-ssh
+request-principal|machine-utilities
+required-context|posix-root-v1
+observed-execution-principal|root
+console-session-state|none
+platform-boundary|linux
+enrollment-epoch|1
+context-canary-sha256|$u2_context_digest
+pinned-host-key-fingerprint|$u2_host_fingerprint
+node-id|$envelope_node
+fleet-domain|fleet.example
+fleet-ca-fingerprint|$u2_ca_fingerprint
+ca-generation|1
+node-key-fingerprint|$u2_node_fingerprint
+certificate-serial|41
+certificate-valid-after|$u2_valid_after
+certificate-valid-before|$u2_valid_before
+certificate-source-addresses|-
+manager-source-identity|$envelope_manager
+end-request|
+EOF
+    "$ssh_keygen" -Y sign -f "$tmp/u2-node-key-cert.pub" -n machine-utilities-request \
+      "$request_file" >/dev/null
+    {
+      cat "$request_file"
+      printf 'certificate|%s\nsignature-begin\n' "$(sed -n '1p' "$tmp/u2-node-key-cert.pub")"
+      cat "$signature_file"
+      printf 'end-envelope\n'
+    } >"$envelope_file"
+    printf '%s\n' "$envelope_file"
+  }
+
+  u2_now=$(date -u +%s)
+  u2_happy=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000001 "$u2_now" $((u2_now + 300)))
+  if ! APT_EXEC_MARKER="$apt_marker" MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" \
+      "$broker" <"$u2_happy" >"$tmp/u2-happy"; then
+    cat "$tmp/u2-happy" >&2
+    fail "U2 valid signed broker fixture was rejected"
+  fi
+  grep -Fqx 'state|completed' "$tmp/u2-happy" || fail "U2 signed fixture did not complete"
+  grep -Fqx 'reason|post_state_verified' "$tmp/u2-happy" ||
+    fail "U2 fixture did not verify native post-state"
+  grep -Fqx 'derived-argv|/usr/bin/apt-get --quiet=2 update' "$tmp/u2-happy" ||
+    fail "U2 broker did not derive the exact refresh handler"
+  grep -Fqx "$u2_root/usr/bin/apt-get|--quiet=2 update" "$apt_marker" ||
+    fail "U2 fixture did not execute only the protected fake APT path"
+  rm -f "$apt_marker"
+
+  u2_expect_rejected replayed_request "$u2_happy" "$tmp/u2-replay"
+  u2_unknown=$(u2_make_envelope apt.unknown.v1 request-00000000000000000000000000000002 \
+    "$u2_now" $((u2_now + 300)))
+  u2_expect_rejected unknown_action "$u2_unknown" "$tmp/u2-unknown-action"
+  u2_expired=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000003 $((u2_now - 600)) $((u2_now - 300)))
+  u2_expect_rejected expired_request "$u2_expired" "$tmp/u2-expired"
+  u2_wrong_node=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000004 "$u2_now" $((u2_now + 300)) node-b)
+  u2_expect_rejected signature_verification_failed "$u2_wrong_node" "$tmp/u2-wrong-node"
+
+  u2_changed=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000005 "$u2_now" $((u2_now + 300)))
+  sed 's/target-host-id|test-apt/target-host-id|other-host/' "$u2_changed" >"$tmp/u2-changed-bytes"
+  u2_expect_rejected host_identity_mismatch "$tmp/u2-changed-bytes" "$tmp/u2-changed-result"
+
+  u2_policy_active="$u2_root/etc/machine-utilities/generations/1/policy.actions"
+  cp "$u2_policy_active" "$tmp/u2-policy-backup"
+  printf '%s\n' '# drift' >>"$u2_policy_active"
+  u2_policy_drift=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000006 "$u2_now" $((u2_now + 300)))
+  u2_expect_rejected policy_or_context_drift "$u2_policy_drift" "$tmp/u2-policy-drift"
+  mv "$tmp/u2-policy-backup" "$u2_policy_active"
+
+  u2_apt_active="$u2_root/etc/machine-utilities/generations/1/apt.conf"
+  cp "$u2_apt_active" "$tmp/u2-apt-backup"
+  printf '%s\n' 'APT::Update::Pre-Invoke { "touch /tmp/forbidden"; };' >>"$u2_apt_active"
+  u2_hook=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000007 "$u2_now" $((u2_now + 300)))
+  u2_expect_rejected apt_configuration_hook_drift "$u2_hook" "$tmp/u2-hook-drift"
+  mv "$tmp/u2-apt-backup" "$u2_apt_active"
+
+  mv "$u2_root/var/lib/machine-utilities/audit/events.log" "$tmp/u2-audit-log"
+  mkdir "$u2_root/var/lib/machine-utilities/audit/events.log"
+  u2_audit=$(u2_make_envelope apt.update-metadata.v1 \
+    request-00000000000000000000000000000008 "$u2_now" $((u2_now + 300)))
+  u2_expect_rejected audit_write_failed "$u2_audit" "$tmp/u2-audit-failure"
+  mv "$u2_root/var/lib/machine-utilities/audit/events.log" "$tmp/u2-blocked-audit"
+  mv "$tmp/u2-audit-log" "$u2_root/var/lib/machine-utilities/audit/events.log"
+
+  mkdir "$u2_root/var/lib/machine-utilities/lock/active"
+  if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" revoke "$u2_bundle" \
+      "$u2_manifest_digest" 1 >"$tmp/u2-revoke-draining" 2>/dev/null; then
+    fail "U2 revocation ignored active work"
+  fi
+  grep -Fqx 'state|draining' "$tmp/u2-revoke-draining" ||
+    fail "U2 revocation did not report draining"
+  [ -x "$u2_root/usr/libexec/machine-utilities/posix-broker" ] ||
+    fail "U2 draining revocation removed the active broker"
+  rmdir "$u2_root/var/lib/machine-utilities/lock/active"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$u2_root" "$enrollment" revoke "$u2_bundle" \
+    "$u2_manifest_digest" 1 >"$tmp/u2-revoked"
+  grep -Fqx 'state|revoked' "$tmp/u2-revoked" || fail "U2 revocation did not complete"
+  [ ! -e "$u2_root/usr/libexec/machine-utilities/posix-broker" ] &&
+    [ ! -e "$u2_root/etc/sudoers.d/machine-utilities-posix-broker" ] &&
+    [ ! -e "$u2_root/etc/machine-utilities/active" ] || fail "U2 revocation left a privileged grant"
+  [ -f "$u2_root/var/lib/machine-utilities/journal/request-00000000000000000000000000000001.result" ] ||
+    fail "U2 revocation discarded protected result evidence"
+}
+
+[ "${MACHINE_UTILITIES_TEST_SCOPE:-}" != u2-contracts ] || {
+  test_u2_contracts
+  printf 'PASS: U2 contracts\n'
+  exit 0
+}
+
 characterize_u1_contracts() {
   "$cli" collect --target test-host --section packages --output "$tmp/u1-planning.jsonl"
   cat >"$tmp/u1-unprivileged-draft.json" <<'JSON'
