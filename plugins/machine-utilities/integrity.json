@@ -14,7 +14,7 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "8cd0bdad92ea0a6a8cc9e8434dff9e8003d354c6329d737f4527c69d8c60d95d"
+      "sha256": "08d80aa99b3d23f2a5cc3b94b0072c67dd7358708224a41e08fb5695f2254598"
     },
     {
       "path": "scripts/collect-windows.ps1",
