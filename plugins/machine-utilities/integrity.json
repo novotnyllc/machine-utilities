@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "ed78960bac3264cd8947c8364c708fa7249950c0bed56d50fa024192dffa24b4"
+      "sha256": "bb8c793aff8e903fa20e877d263618daf0cc4be0aa8b302099fa6ad738a8f308"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "1b3c8b0ed29877dd16e34614de617cb2016411fad09f3c45f549414df71a1b21"
+      "sha256": "82875d1fc4e15245e4cc711e724f7f2a9356aea50a7c5e9cf71cea34b8992f93"
     },
     {
       "path": "scripts/apply-windows.ps1",
@@ -22,12 +22,12 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "3423a18a2e84778503a215b694d8894a3839e42747d8a1dd876c03a25f06623c"
+      "sha256": "4b82a272c85596511a7ffc63a8b3354f30cb36bef2ed30cddf3172c6ffc4fb68"
     }
   ],
   "marketplace": "novotnyllc",
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.5"
+  "version": "0.2.6"
 }

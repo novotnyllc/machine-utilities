@@ -577,6 +577,13 @@ git -C "$tmp/home/dev/example" add file.txt
 git -C "$tmp/home/dev/example" -c commit.gpgsign=false commit -qm initial
 git -C "$tmp/home/dev/example" remote add origin ssh://user:secret@github.com/owner/example.git
 git clone -q --bare "$tmp/home/dev/example" "$tmp/clone-example.git"
+mkdir -p "$tmp/home/.local/share/chezmoi"
+git -C "$tmp/home/.local/share/chezmoi" init -q
+git -C "$tmp/home/.local/share/chezmoi" config user.email test@example.invalid
+git -C "$tmp/home/.local/share/chezmoi" config user.name Test
+printf 'managed\n' >"$tmp/home/.local/share/chezmoi/README.md"
+git -C "$tmp/home/.local/share/chezmoi" add README.md
+git -C "$tmp/home/.local/share/chezmoi" -c commit.gpgsign=false commit -qm initial
 
 cat >"$tmp/bin/git" <<'SH'
 #!/usr/bin/env bash
@@ -1173,6 +1180,7 @@ if MACHINE_UTILITIES_CONFIG="$tmp/untrusted-config.json" "$cli" collect --target
 fi
 [ ! -e "$tmp/untrusted-config-executed" ] || fail "untrusted auth verification command executed"
 
+mv "$tmp/home/.local/share/chezmoi" "$tmp/home/.local/share/chezmoi-git-fixture"
 mkdir -p "$tmp/home/.local/share/chezmoi"
 set +e
 "$cli" collect --target test-host --section chezmoi --output "$tmp/partial.jsonl"
@@ -1183,6 +1191,7 @@ set -e
 [ "$(jq -r 'select(.kind == "operation") | .data.operation_status' "$tmp/partial.jsonl")" = partial ] ||
   fail "partial record did not mark operation partial"
 rm -rf "$tmp/home/.local/share/chezmoi"
+mv "$tmp/home/.local/share/chezmoi-git-fixture" "$tmp/home/.local/share/chezmoi"
 
 cp "$tmp/snapshot.jsonl" "$tmp/invalid.jsonl"
 printf '%s\n' '{"schema":"machine-utilities.inventory","schema_version":99}' >>"$tmp/invalid.jsonl"
@@ -2304,6 +2313,13 @@ CHEZMOI_STATUS_DRIFT=1 "$cli" collect --target test-host --section chezmoi \
 [ "$(jq -r 'select(.kind == "chezmoi_state" and .id == "live") |
   [.status,.data.drift_count] | @tsv' "$tmp/chezmoi-drift-snapshot.jsonl")" = "$(printf 'present\t1')" ] ||
   fail "successfully measured chezmoi drift was not usable inventory"
+jq -c 'if .kind == "file" and .id == "chezmoi:source" then .status = "absent" else . end' \
+  "$tmp/chezmoi-drift-snapshot.jsonl" >"$tmp/chezmoi-absent-source-snapshot.jsonl"
+if "$cli" seal-plan "$tmp/chezmoi-plan-draft.json" \
+  "$tmp/chezmoi-absent-source-snapshot.jsonl" "$tmp/chezmoi-absent-source-plan.json" \
+  >/dev/null 2>&1; then
+  fail "chezmoi pull accepted an absent source repository"
+fi
 "$cli" seal-plan "$tmp/chezmoi-plan-draft.json" "$tmp/chezmoi-drift-snapshot.jsonl" \
   "$tmp/chezmoi-drift-plan.json"
 "$cli" seal-plan "$tmp/chezmoi-plan-draft.json" "$tmp/snapshot.jsonl" "$tmp/chezmoi-plan.json"

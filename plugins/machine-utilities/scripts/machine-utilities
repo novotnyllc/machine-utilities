@@ -1142,6 +1142,9 @@ seal_plan_command() {
           .status == "present" and .data.origin_matches == true and
           .data.repository_readiness == "ready" and .data.dirty_count == 0 and
           .data.sync_state == "local-tracking-behind")
+      elif .type == "chezmoi-pull" then
+        any($records[]; .kind == "file" and .id == "chezmoi:source" and
+          .status == "present" and .data.dirty_count == 0)
       else true end)
   ' >/dev/null || {
     printf 'machine-utilities: plan does not match an actionable observed state\n' >&2
