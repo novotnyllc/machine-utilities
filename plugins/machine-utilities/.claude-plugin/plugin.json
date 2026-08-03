@@ -22,6 +22,7 @@
     "projects"
   ],
   "skills": [
+    "./skills/fleet-readiness",
     "./skills/fleet-inventory",
     "./skills/fleet-update",
     "./skills/fleet-agents",

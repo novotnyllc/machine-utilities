@@ -57,8 +57,10 @@ for the complete schema-by-example.
 
 ## Use
 
-Ask Codex or Claude Code for one of the eight bundled skills:
+Ask Codex or Claude Code for one of the nine bundled skills:
 
+- `fleet-readiness` — assess project, agent, authentication, and host readiness
+  across configured machines and route reconciliation to the owning skill
 - `fleet-inventory` — collect and compare structured JSONL snapshots
 - `fleet-update` — plan, then explicitly apply Homebrew, APT, or winget updates
 - `fleet-agents` — reconcile Codex/Claude runtimes, settings, plugins,

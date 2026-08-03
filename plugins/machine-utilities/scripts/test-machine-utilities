@@ -23,6 +23,18 @@ assert_contains() {
   esac
 }
 
+readiness_skill="$script_dir/../skills/fleet-readiness/SKILL.md"
+[ -f "$readiness_skill" ] || fail "fleet-readiness skill is missing"
+grep -Fx 'name: fleet-readiness' "$readiness_skill" >/dev/null ||
+  fail "fleet-readiness frontmatter name is missing"
+grep -F '🖥️ <state emoji> <Git issue and/or PR if applicable> <specific focus>' "$readiness_skill" >/dev/null ||
+  fail "fleet-readiness two-emoji title contract is missing"
+grep -F 'overrides conflicting task-title instructions' "$readiness_skill" >/dev/null ||
+  fail "fleet-readiness title override is missing"
+jq -e '.skills | index("./skills/fleet-readiness") != null' \
+  "$script_dir/../.claude-plugin/plugin.json" >/dev/null ||
+  fail "Claude manifest does not expose fleet-readiness"
+
 test_file_mode() {
   value=$(stat -f %Lp "$1" 2>/dev/null) ||
     value=$(stat -c %a "$1" 2>/dev/null) ||

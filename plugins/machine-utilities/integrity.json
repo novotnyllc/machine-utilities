@@ -2,7 +2,7 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "bb8c793aff8e903fa20e877d263618daf0cc4be0aa8b302099fa6ad738a8f308"
+      "sha256": "2d51c7c7272d52805e2963d714b96306976fad0e9794c4653415b13feeb19d2b"
     },
     {
       "path": ".codex-plugin/plugin.json",
