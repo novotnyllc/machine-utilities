@@ -6092,15 +6092,15 @@ apply_privileged_plan_command() (
   confirmation=$2
   output=$3
   native_mode=${4:-false}
-  require_jq
-  check_mutation_config
-  check_private_owned_file "$plan" "privileged apply plan"
-  validate_privileged_plan_file "$plan"
+  require_jq || exit $?
+  check_mutation_config || exit $?
+  check_private_owned_file "$plan" "privileged apply plan" || exit $?
+  validate_privileged_plan_file "$plan" || exit $?
   [ "$(jq -r '.plan_id' "$plan")" = "$confirmation" ] || {
     printf 'machine-utilities: apply confirmation must equal the sealed privilege plan ID\n' >&2
     exit 64
   }
-  privileged_plan_integrity_check "$plan"
+  privileged_plan_integrity_check "$plan" || exit $?
   [ "$native_mode" = false ] || {
     printf 'machine-utilities: protected plans require their fixed broker transport\n' >&2
     exit 69
@@ -6112,20 +6112,20 @@ apply_privileged_plan_command() (
   transport=$(jq -r --arg target "$target" '.machines[$target].transport // empty' "$config")
   route_mode=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // empty' "$config")
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-v3-execution.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-v3-execution.XXXXXX") || exit $?
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   if [ "$platform:$transport:$route_mode" = windows:codex-remote-control:windows-sftp ]; then
-    verify_mixed_configuration_binding "$plan"
-    verify_executor_requirement "$plan" >/dev/null
-    windows_sftp_readiness_snapshot "$target" "$tmp/current.jsonl"
-    validate_file "$tmp/current.jsonl"
+    verify_mixed_configuration_binding "$plan" || exit $?
+    verify_executor_requirement "$plan" >/dev/null || exit $?
+    windows_sftp_readiness_snapshot "$target" "$tmp/current.jsonl" || exit $?
+    validate_file "$tmp/current.jsonl" || exit $?
   else
     "$script_dir/machine-utilities" collect --target "$target" --section host --section "$required_section" \
-      --output "$tmp/current.jsonl"
-    validate_file "$tmp/current.jsonl"
-    verify_privileged_preconditions_command "$plan" "$tmp/current.jsonl" >/dev/null
+      --output "$tmp/current.jsonl" || exit $?
+    validate_file "$tmp/current.jsonl" || exit $?
+    verify_privileged_preconditions_command "$plan" "$tmp/current.jsonl" >/dev/null || exit $?
   fi
-  normalize_privileged_plan_for_broker_execution "$plan" "$tmp/current.jsonl" "$tmp/executable.json"
+  normalize_privileged_plan_for_broker_execution "$plan" "$tmp/current.jsonl" "$tmp/executable.json" || exit $?
   result=0
   apply_mixed_privileged_plan_command "$tmp/executable.json" "$confirmation" "$output" false \
     "$plan" true "$tmp/current.jsonl" || result=$?

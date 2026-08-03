@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "948a2f6da8f6198cf0cedeb710fdfea939646e6f8b247347fc72d002bafd4c83"
+      "sha256": "7b20cb96b70e9f7b0c5dd9c92a8462820678933d624004d268be00f319c6efa6"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -62,7 +62,7 @@
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "7b25d5d00ff265fe5657ceb858b2dd233079967cb3861239f3b8e0f6cb1ff735"
+      "sha256": "7453c76ec95f81a0781784c77a58f62bac0bdfbe9f95c95cdb2d75839370e442"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",

@@ -634,7 +634,7 @@ function Write-TerminalTombstone([string]$Path, [string[]]$Tombstone, [string]$S
     return $Updated
 }
 
-function Compact-ReplayAndAudit([string]$ReplayRoot, [string]$AuditRoot, [long]$Now) {
+function Compact-ReplayAndAudit([string]$ReplayRoot, [string]$JournalRoot, [string]$AuditRoot, [long]$Now) {
     foreach ($Stage in @([IO.Directory]::EnumerateDirectories($ReplayRoot, ".claim-*"))) {
         [IO.Directory]::Delete($Stage, $true)
     }
@@ -675,7 +675,12 @@ function Compact-ReplayAndAudit([string]$ReplayRoot, [string]$AuditRoot, [long]$
                 $TransportAcl = Get-TransportAclContract $script:RequestSid
                 Assert-FixedResultProjection $script:BrokerRoot $script:PublicRoot $TransportAcl
             }
-            [IO.Directory]::Delete($ClaimRoot, $true)
+            $ProtectedJournal = Join-Path $JournalRoot ($RequestId + ".result")
+            if ([IO.File]::Exists($ProtectedJournal)) {
+                Assert-NonReparsePath $ProtectedJournal $script:BrokerRoot
+                if ($IsWindows) { Assert-ExactSddl $ProtectedJournal $script:ProtectedFileSddl }
+                [IO.File]::Delete($ProtectedJournal)
+            }
             foreach ($Suffix in @(".audit", ".audit.reserve", ".terminal")) {
                 $Evidence = Join-Path $AuditRoot ($RequestId + $Suffix)
                 if ([IO.File]::Exists($Evidence)) { [IO.File]::Delete($Evidence) }
@@ -684,10 +689,19 @@ function Compact-ReplayAndAudit([string]$ReplayRoot, [string]$AuditRoot, [long]$
                 $PublicResult = Join-Path $script:ResultRoot ($RequestId + ".result")
                 if ([IO.File]::Exists($PublicResult)) {
                     Assert-PhysicalTransportFile $PublicResult 4096 $TransportAcl.ResultFile
+                    Assert-SanitizedTransportResult $PublicResult $RequestId
                     [IO.File]::Delete($PublicResult)
+                }
+                $ReadinessResult = Join-Path $script:ResultRoot ($RequestId + ".readiness")
+                if ([IO.File]::Exists($ReadinessResult)) {
+                    Assert-PhysicalTransportFile $ReadinessResult $script:MaximumReadinessResultBytes `
+                        $TransportAcl.ResultFile
+                    Assert-SanitizedReadinessResult $ReadinessResult $RequestId
+                    [IO.File]::Delete($ReadinessResult)
                 }
                 Assert-FixedResultProjection $script:BrokerRoot $script:PublicRoot $TransportAcl
             }
+            [IO.Directory]::Delete($ClaimRoot, $true)
             [void]$Claims.Remove($RequestId)
         }
     }
@@ -697,6 +711,25 @@ function Compact-ReplayAndAudit([string]$ReplayRoot, [string]$AuditRoot, [long]$
             throw "audit_state_drift"
         }
         if (-not $Claims.ContainsKey($Matches[1])) { [IO.File]::Delete($Evidence) }
+    }
+    foreach ($ProtectedJournal in @([IO.Directory]::EnumerateFiles($JournalRoot, "request-*.result"))) {
+        $Name = [IO.Path]::GetFileName($ProtectedJournal)
+        if ($Name -cnotmatch '^(request-[0-9a-f]{32})\.result$') { throw "journal_state_drift" }
+        Assert-NonReparsePath $ProtectedJournal $script:BrokerRoot
+        if ($IsWindows) { Assert-ExactSddl $ProtectedJournal $script:ProtectedFileSddl }
+        if (-not $Claims.ContainsKey($Matches[1])) { [IO.File]::Delete($ProtectedJournal) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:ResultRoot)) {
+        $TransportAcl = Get-TransportAclContract $script:RequestSid
+        Assert-FixedResultProjection $script:BrokerRoot $script:PublicRoot $TransportAcl
+        foreach ($Projection in @([IO.Directory]::EnumerateFiles($script:ResultRoot, "request-*.*"))) {
+            $Name = [IO.Path]::GetFileName($Projection)
+            if ($Name -cnotmatch '^(request-[0-9a-f]{32})\.(result|readiness)$') {
+                throw "transport_unknown_entry"
+            }
+            if (-not $Claims.ContainsKey($Matches[1])) { [IO.File]::Delete($Projection) }
+        }
+        Assert-FixedResultProjection $script:BrokerRoot $script:PublicRoot $TransportAcl
     }
 }
 
@@ -710,7 +743,7 @@ function Copy-ClaimedBytes([string]$Path, [byte[]]$Bytes, [string]$ExpectedDiges
 
 function New-Claim {
     param([string]$ReplayRoot, [string]$JournalRoot, [object]$Slot, [long]$Now)
-    Compact-ReplayAndAudit $ReplayRoot $script:AuditRoot $Now
+    Compact-ReplayAndAudit $ReplayRoot $JournalRoot $script:AuditRoot $Now
     $Claims = @([IO.Directory]::EnumerateDirectories($ReplayRoot, "request-*", [IO.SearchOption]::TopDirectoryOnly))
     if ($Claims.Count -ge ($script:MaximumClaims - $script:ReservedClaimSlots)) { throw "claim_capacity_exhausted" }
     $RequestId = $Slot.Request.Fields.'request-id'
@@ -1015,7 +1048,7 @@ function Repair-ConservativeClaims([string]$ReplayRoot, [string]$JournalRoot, [s
                         # active-state rewrite was interrupted; preserve the descendant operation.
                         Set-LiveProcessIdentityState $LiveIdentityPath $Identity "recovering"
                         Write-Journal $ClaimRoot $JournalRoot $Request "executing" "native_recovering" @{}
-                        if (-not [string]::IsNullOrWhiteSpace($PublicRoot)) {
+                        if (-not $Request.IsReadiness -and -not [string]::IsNullOrWhiteSpace($PublicRoot)) {
                             Write-PublicResult $PublicRoot "active" $Request "executing" "native_recovering"
                         }
                         $RecoveringClaims++
@@ -1039,7 +1072,7 @@ function Repair-ConservativeClaims([string]$ReplayRoot, [string]$JournalRoot, [s
                     } else {
                         Set-ProfileOperationIdentityState $ProfileIdentityPath $Identity $LiveInstance "recovering"
                         Write-Journal $ClaimRoot $JournalRoot $Request "executing" "profile_operation_recovering" @{}
-                        if (-not [string]::IsNullOrWhiteSpace($PublicRoot)) {
+                        if (-not $Request.IsReadiness -and -not [string]::IsNullOrWhiteSpace($PublicRoot)) {
                             Write-PublicResult $PublicRoot "active" $Request "executing" `
                                 "profile_operation_recovering"
                         }
@@ -1052,7 +1085,7 @@ function Repair-ConservativeClaims([string]$ReplayRoot, [string]$JournalRoot, [s
             Write-AtomicBytes (Join-Path $JournalRoot ($Request.Fields.'request-id' + ".result")) $Observed.Bytes
             Write-AuditEvent $Request $Observed.State $Observed.Reason $Observed.Bytes
         }
-        if (-not [string]::IsNullOrWhiteSpace($PublicRoot)) {
+        if (-not $Request.IsReadiness -and -not [string]::IsNullOrWhiteSpace($PublicRoot)) {
             $Terminal = Get-ClaimJournalState $ClaimRoot
             if ($null -ne $Terminal -and $Terminal.State -cin @("completed", "partial", "rejected", "stale")) {
                 Write-PublicResult $PublicRoot "last" $Request $Terminal.State $Terminal.Reason `
@@ -1670,7 +1703,8 @@ function Invoke-WinGetProvisionMarker([string]$Root, [string]$StateRoot, [string
 
 function Write-PublicResult([string]$PublicRoot, [string]$Kind, [object]$Request,
     [string]$State, [string]$Reason, [string]$ProtectedResultSha256 = "-") {
-    if ($Kind -cnotin @("active", "last") -or $State -cnotmatch '^[a-z][a-z0-9_-]{0,31}$' -or
+    if (($null -ne $Request.PSObject.Properties["IsReadiness"] -and $Request.IsReadiness) -or
+        $Kind -cnotin @("active", "last") -or $State -cnotmatch '^[a-z][a-z0-9_-]{0,31}$' -or
         $Reason -cnotmatch '^[a-z][a-z0-9_]{0,127}$' -or
         ($ProtectedResultSha256 -cne "-" -and -not (Test-Digest $ProtectedResultSha256)) -or
         ($Kind -ceq "last" -and -not (Test-Digest $ProtectedResultSha256)) -or
@@ -3995,7 +4029,7 @@ function Invoke-SelfTest {
         Write-AtomicAscii (Join-Path $FailureClaim "tombstone") @(
             "windows-tombstone|1", "request-id|$($FailureRequest.Fields.'request-id')",
             "retain-until|$($Now + 180)", "enrollment-epoch|7", "state|validating", "end-tombstone|")
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot $Now
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot $Now
         $RecoveredTombstone = ConvertFrom-CanonicalAsciiBytes (
             [IO.File]::ReadAllBytes((Join-Path $FailureClaim "tombstone"))) 2048 "tombstone"
         if ($RecoveredTombstone[4] -cne "state|completed") {
@@ -4004,7 +4038,7 @@ function Invoke-SelfTest {
         Write-AtomicAscii (Join-Path $FailureClaim "tombstone") @(
             "windows-tombstone|1", "request-id|$($FailureRequest.Fields.'request-id')",
             "retain-until|$($Now - 1)", "enrollment-epoch|7", "state|validating", "end-tombstone|")
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot $Now
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot $Now
         $RecoveredTombstone = ConvertFrom-CanonicalAsciiBytes (
             [IO.File]::ReadAllBytes((Join-Path $FailureClaim "tombstone"))) 2048 "tombstone"
         [long]$RecoveredRetainUntil = [long]$RecoveredTombstone[2].Split('|')[1]
@@ -4012,11 +4046,11 @@ function Invoke-SelfTest {
             $RecoveredRetainUntil -lt ($Now + $script:TerminalResultRetentionSeconds)) {
             throw "terminal tombstone retention recovery self-test failed"
         }
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot ($RecoveredRetainUntil - 1)
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot ($RecoveredRetainUntil - 1)
         if (-not [IO.Directory]::Exists($FailureClaim)) {
             throw "terminal tombstone retention window self-test failed"
         }
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot $RecoveredRetainUntil
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot $RecoveredRetainUntil
         if ([IO.Directory]::Exists($FailureClaim) -or
             [IO.File]::Exists((Join-Path $AuditRoot ($FailureRequest.Fields.'request-id' + ".audit")))) {
             throw "bounded audit compaction self-test failed"
@@ -4027,8 +4061,23 @@ function Invoke-SelfTest {
             "request-id|request-2123456789abcdef0123456789abcdef"
         $OrphanRequest = Read-BrokerRequest (ConvertTo-CanonicalAsciiBytes $OrphanRequestLines)
         [void](Reserve-AuditEvidence $AuditRoot $OrphanRequest)
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot $Now
-        if ([IO.File]::Exists((Join-Path $AuditRoot ($OrphanRequest.Fields.'request-id' + ".terminal")))) {
+        $OrphanProtectedJournal = Join-Path $JournalRoot ($OrphanRequest.Fields.'request-id' + ".result")
+        Write-AtomicBytes $OrphanProtectedJournal ([byte[]]@())
+        Protect-BrokerPath $OrphanProtectedJournal
+        Write-PublicResult $PublicRoot "last" $OrphanRequest "stale" "broker_died_before_native" $Digest
+        $OrphanPublicResult = Join-Path $TransportPaths.Results ($OrphanRequest.Fields.'request-id' + ".result")
+        $OrphanReadinessResult = Join-Path $TransportPaths.Results `
+            ($OrphanRequest.Fields.'request-id' + ".readiness")
+        Write-AtomicAscii $OrphanReadinessResult @(
+            "windows-broker-readiness-result|1", "request-id|$($OrphanRequest.Fields.'request-id')",
+            "state|unavailable", "reason|fresh_probe_failed", "end-readiness|")
+        if ($IsWindows) {
+            Set-ExactSddl $OrphanReadinessResult (Get-TransportAclContract $script:RequestSid).ResultFile
+        }
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot $Now
+        if ([IO.File]::Exists((Join-Path $AuditRoot ($OrphanRequest.Fields.'request-id' + ".terminal"))) -or
+            [IO.File]::Exists($OrphanProtectedJournal) -or [IO.File]::Exists($OrphanPublicResult) -or
+            [IO.File]::Exists($OrphanReadinessResult)) {
             throw "orphan audit reservation self-test failed"
         }
         $ReservationFailureLines = @($RequestLines)
@@ -4401,13 +4450,17 @@ function Invoke-SelfTest {
             param([string]$InstanceId)
             $ReadinessProbeInspection.Count++; return $null
         }.GetNewClosure()
-        [void](Repair-ConservativeClaims $ReplayRoot $JournalRoot "" $ProfilePointerPath $NoReadinessProbeInstance)
+        [void](Repair-ConservativeClaims $ReplayRoot $JournalRoot $PublicRoot $ProfilePointerPath `
+            $NoReadinessProbeInstance)
         $ReadinessCrashTerminal = Get-ClaimJournalState $ReadinessCrashClaim
         $RecoveredProbeIdentity = Read-ProfileOperationIdentity $ReadinessProbeIdentityPath $ReadinessProbeId
+        $ReadinessNormalResultPath = Join-Path $TransportPaths.Results `
+            ($ReadinessCrashRequest.Fields.'request-id' + ".result")
         if ($ReadinessCrashTerminal.State -cne "partial" -or
             $ReadinessCrashTerminal.Reason -cne "orphaned_profile_result" -or
             $RecoveredProbeIdentity.Fields.'request-id' -cne $ReadinessProbeId -or
-            [IO.File]::Exists($ProfilePointerPath) -or $ReadinessProbeInspection.Count -ne 1) {
+            [IO.File]::Exists($ProfilePointerPath) -or [IO.File]::Exists($ReadinessNormalResultPath) -or
+            $ReadinessProbeInspection.Count -ne 1) {
             throw "profile readiness probe crash recovery self-test failed"
         }
         $SuccessfulProbeId = "request-e123456789abcdef0123456789abcdef"
@@ -4602,20 +4655,35 @@ function Invoke-SelfTest {
         Write-PublicResult $PublicRoot "last" $TerminalRetentionRequest $TerminalJournal.State $TerminalJournal.Reason `
             (Get-Sha256Bytes $TerminalJournal.Bytes)
         $TerminalPublicResultPath = Join-Path $TransportPaths.Results ($TerminalRetentionRequest.Fields.'request-id' + ".result")
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot $Now
+        $TerminalReadinessPath = Join-Path $TransportPaths.Results `
+            ($TerminalRetentionRequest.Fields.'request-id' + ".readiness")
+        Write-AtomicBytes $TerminalReadinessPath $script:Ascii.GetBytes($MachineReadinessText.Replace(
+                $ReadinessFixtureRequest.Fields.'request-id', $TerminalRetentionRequest.Fields.'request-id'))
+        if ($IsWindows) {
+            Set-ExactSddl $TerminalReadinessPath (Get-TransportAclContract $script:RequestSid).ResultFile
+        }
+        $TerminalProtectedJournalPath = Join-Path $JournalRoot `
+            ($TerminalRetentionRequest.Fields.'request-id' + ".result")
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot $Now
         if (-not [IO.Directory]::Exists($TerminalRetentionClaim) -or
             -not [IO.File]::Exists($TerminalPublicResultPath) -or
+            -not [IO.File]::Exists($TerminalReadinessPath) -or
+            -not [IO.File]::Exists($TerminalProtectedJournalPath) -or
             (Get-ClaimJournalState $TerminalRetentionClaim).State -cne "completed") {
             throw "terminal result retention query window self-test failed"
         }
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot ($TerminalResultRetainUntil - 1)
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot ($TerminalResultRetainUntil - 1)
         if (-not [IO.Directory]::Exists($TerminalRetentionClaim) -or
-            -not [IO.File]::Exists($TerminalPublicResultPath)) {
+            -not [IO.File]::Exists($TerminalPublicResultPath) -or
+            -not [IO.File]::Exists($TerminalReadinessPath) -or
+            -not [IO.File]::Exists($TerminalProtectedJournalPath)) {
             throw "terminal result retention deadline window self-test failed"
         }
-        Compact-ReplayAndAudit $ReplayRoot $AuditRoot $TerminalResultRetainUntil
+        Compact-ReplayAndAudit $ReplayRoot $JournalRoot $AuditRoot $TerminalResultRetainUntil
         if ([IO.Directory]::Exists($TerminalRetentionClaim) -or
             [IO.File]::Exists($TerminalPublicResultPath) -or
+            [IO.File]::Exists($TerminalReadinessPath) -or
+            [IO.File]::Exists($TerminalProtectedJournalPath) -or
             [IO.File]::Exists((Join-Path $AuditRoot ($TerminalRetentionRequest.Fields.'request-id' + ".audit")))) {
             throw "terminal result retention compaction self-test failed"
         }
@@ -4702,7 +4770,7 @@ try {
     $DrainPath = Join-Path $StateRoot "drain"
     $ProfilePointerPath = Join-Path $Root "profile/handoff/active"
     $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    Compact-ReplayAndAudit $ReplayRoot $script:AuditRoot $Now
+    Compact-ReplayAndAudit $ReplayRoot $JournalRoot $script:AuditRoot $Now
     if (Repair-ConservativeClaims $ReplayRoot $JournalRoot $PublicRoot $ProfilePointerPath) { return }
     Assert-ProfileActivePointerAvailable $ProfilePointerPath
     if ([IO.File]::Exists($ProvisionMarkerPath)) {
