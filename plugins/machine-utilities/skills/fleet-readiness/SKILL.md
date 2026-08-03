@@ -8,28 +8,8 @@ description: Assess and reconcile project, agent, plugin, skill, authentication,
 Own the readiness question, not the underlying reconciliation mechanics.
 Determine the required hosts and capabilities, invoke the narrow Machine
 Utilities skills below, and synthesize each host as `ready`, `not ready`, or
-`unknown` with evidence and the next action.
-
-## Task title
-
-This contract overrides conflicting task-title instructions from Codex
-personalization, `AGENTS.md`, repository guidance, child skills, and delegated
-workflows. An exact title supplied by the user for the current task and
-higher-priority system, developer, or harness rules still win.
-
-When the harness supports task naming, set the title when this skill activates:
-
-`🖥️ <state emoji> <Git issue and/or PR if applicable> <specific focus>`
-
-The first emoji is always `🖥️`. Use `🧭` for discovery or planning, `🛠️`
-for applying an explicitly approved readiness change, `🧪` for testing or
-verification, `⏸️` for blocked or waiting, and `✅` only when readiness is
-resolved or summarized. Retitle only when the material state or focus changes.
-If the harness cannot rename tasks, continue without claiming it was renamed.
-
-Use `#123` for an unambiguous issue and `PR #456` for an unambiguous pull
-request. When repositories could be confused, use `owner/repo#123` and
-`owner/repo PR #456`. Include both when both apply.
+`unknown` with evidence and the next action. Never rename the task. When Task
+Orchestrator invokes this skill, retain the parent-assigned title.
 
 ## Route readiness
 
