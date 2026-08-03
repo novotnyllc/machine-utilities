@@ -78,6 +78,12 @@
       "provider": "plugin",
       "source": "agent-utilities"
     },
+    "oracle": {
+      "groups": ["development"],
+      "agents": ["codex", "claude"],
+      "provider": "plugin",
+      "source": "agent-utilities"
+    },
     "machine-utilities": {
       "groups": ["development"],
       "agents": ["codex", "claude"],
