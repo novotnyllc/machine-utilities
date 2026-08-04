@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "f2372bf02c27ff569ece728adc7ef86186c19908a3d1cc4a30036358eae48805"
+      "sha256": "90461115f53d6f821213202ed958ded3ada7a4be0620f5ffdcd23a8d21316e4c"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "43d2277dc78953c6b2025d2c8673d7c61d19e46c6d4bfb53677da9f8972a9f4e"
+      "sha256": "2901c65d9e34af91f9e81848e77cb01525e28df9d3684a980893771d0af7fcc2"
     },
     {
       "path": "references/privilege-policy.default",
@@ -85,5 +85,5 @@
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.14"
+  "version": "0.2.15"
 }
