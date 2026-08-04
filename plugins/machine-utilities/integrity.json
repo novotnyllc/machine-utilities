@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "e849d3a23629bc8c8615d93e297cb36e7f628281ed077fc3021dd6b06f649109"
+      "sha256": "f2372bf02c27ff569ece728adc7ef86186c19908a3d1cc4a30036358eae48805"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "a0888bbc5a01f4f913c1c48223241dfe961d42f86e06cff60731482c9680b4f3"
+      "sha256": "43d2277dc78953c6b2025d2c8673d7c61d19e46c6d4bfb53677da9f8972a9f4e"
     },
     {
       "path": "references/privilege-policy.default",
@@ -54,7 +54,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "c115fb1472b4ee2a9247419fa20c2fd4402ec51187a59c7da53722acb4cba60f"
+      "sha256": "8dcd6dbbdb1bd45b2ef567e4cdb035ed0a4481bb99c3f154acfb2c709fc82ce7"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -85,5 +85,5 @@
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.11"
+  "version": "0.2.14"
 }

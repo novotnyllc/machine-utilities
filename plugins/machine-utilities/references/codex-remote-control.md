@@ -7,8 +7,10 @@ Use this only for a machine whose configured transport is
 
 Task-control tools may be loaded lazily. Only when the selected targets include
 a `codex-remote-control` machine, discover and check the app tools, including
-`list_projects`, `create_thread`, and `wait_threads`; reuse that capability
-result for the bounded operation. An absent eager tool listing is not evidence
+`list_projects`, `create_thread`, `wait_threads`, and `set_thread_archived`;
+reuse that capability
+result for the bounded operation. Reuse only the tool-availability result,
+never a `list_projects` response or project ID. An absent eager tool listing is not evidence
 that a tool is unavailable. Classify failure precisely:
 
 - `tool_surface_missing`: lazy discovery proves a required app tool is absent;
@@ -21,6 +23,8 @@ that a tool is unavailable. Classify failure precisely:
   native Windows target;
 - `task_creation_failed`: `create_thread` fails for the matched project or its
   client task never resolves through `wait_threads`;
+- `task_cleanup_failed`: the completed task cannot be archived, or unexpected
+  task-owned worktree cleanup cannot finish safely;
 - `executor_mismatch`: the task runs but the installed executor version or
   integrity hashes do not match; or
 - `executor_or_plugin_failure`: the verified task runs but a manager command
@@ -28,31 +32,92 @@ that a tool is unavailable. Classify failure precisely:
 
 Do not collapse these states into a generic task-control failure.
 
+## Fresh-task project binding
+
+Every remote-control operation starts a new visible task. Never resume,
+unarchive, or send a follow-up to an older task as a recovery path, even when
+that task used the same host, project, or operation type.
+
+Do not use `list_threads`, `read_thread`, `set_thread_archived`, `fork_thread`,
+`handoff_thread`, or `send_message_to_thread` to select or recover the task.
+Follow-ups are allowed only on the new task created for the current operation.
+
+Call `list_projects` immediately before creation and select exactly one object
+whose `hostDisplayName` matches the configured `codex_host` and whose
+environment-native path matches the configured project path. Retain its opaque
+`hostId`. Pass that same object's `projectId`
+verbatim to `create_thread` with `environment: { type: "local" }`; do not type,
+reconstruct, cache, or copy an ID from prose, memory, readiness metadata,
+config, or an earlier listing. Keep the selected object and the creation result
+together as evidence.
+
+If `create_thread` returns `Unknown projectId`, call `list_projects` once more
+and discard every prior project object and ID. Rematch the exact host and path,
+then retry once with that newly returned object's `projectId`, whether or not
+the value changed. If either call used an ID other than the same response's
+matched object, record a controller invocation error. If the fresh rematch is
+missing or unreachable, classify that exact state; if the one retry fails,
+classify `task_creation_failed`. Do not reuse an old task or substitute another host.
+When creation returns a client task ID, wait only for that setup to yield its
+real task and host IDs; all waits and follow-ups must remain correlated to that
+new task.
+
+## Parent-owned task cleanup
+
+The controller that creates the task owns its full lifecycle. After it captures
+and validates the terminal result, deletes any task temporary payload, and
+needs no further follow-up, it archives that exact new task in the same
+operation. Never leave a successfully completed child visible for later reuse.
+
+`environment: { type: "local" }` uses the saved checkout and normally creates
+no task worktree. If a task nevertheless reports an owned worktree, do not assume archive removes it: verify its changes are integrated or explicitly
+handed off, then use the host's supported handoff or worktree cleanup and wait
+for success before archiving. Never use raw filesystem deletion or force
+cleanup of dirty or unintegrated work. Leave the task and worktree visible and
+record `task_cleanup_failed` on conflict or cleanup failure. Archive failure
+also records `task_cleanup_failed`; it never authorizes reuse or unarchiving of
+an older task.
+
 ## Routine named-plugin refresh
 
 An explicit named-plugin refresh does not require a full native inventory or
 sealed plan. Resolve the host, saved project, plugin, marketplace, requested
-version, and applicable Codex harness from the controller's configured scope.
-Use the capability check above, create a visible task in the configured saved
-project, and run native PowerShell only. Capture `codex plugin list --json`
-before and after, retaining the exact `PLUGIN@MARKETPLACE` record. In the task,
-run only these commands in order:
+version, and applicable Codex and Claude harnesses from the controller's
+configured scope. Use the capability check and fresh-task binding above,
+create a new visible task in the configured saved project, and run native PowerShell only.
+Before and after each
+applicable harness, capture `codex plugin list --json`; for Claude, capture
+`claude plugin list --json`. Retain the exact `PLUGIN@MARKETPLACE` record and,
+for Claude, compare every non-target record by `id`, `version`, `enabled`, and
+`scope` and require the unrelated plugin diff to be empty. In the task, run
+only these mutation commands in order for each applicable harness:
 
 ```powershell
+# Codex
 codex plugin marketplace upgrade MARKETPLACE --json
 codex plugin add PLUGIN@MARKETPLACE --json
+
+# Claude
+claude plugin marketplace update MARKETPLACE
+claude plugin update PLUGIN@MARKETPLACE --scope user
 ```
 
-Require the post-state record to be installed, enabled, and equal the requested
-version. Do not use WSL, update another plugin, synchronize settings or skills,
-or claim success from manager output alone. Record a failed postcondition as
+The Codex add is idempotent. For Claude, use `plugin update` when the exact
+plugin is installed; if it is absent, replace only that second Claude command
+with `claude plugin install PLUGIN@MARKETPLACE --scope user`. Require each
+matching post-state record to be present, enabled, and equal the requested
+version; the Codex record must be installed and the Claude record must have
+user scope. If native PowerShell cannot find
+`claude`, mark only the Claude harness unavailable. WSL or SSH are prohibited.
+Treat Codex and Claude harness failures independently: preserve each before/after
+record and attempt the other applicable harness. Do not update a runtime,
+settings, skills, provenance, or another plugin, and do not claim success from
+manager output alone. Record a failed postcondition as
 `executor_or_plugin_failure` while preserving before-state and command output;
 keep executor version/hash mismatch separate as `executor_mismatch` only when
 an executor load or verification was attempted. This manager-native refresh
 does not require or preflight the Machine Utilities executor, because that
 would prevent it from repairing a stale Machine Utilities installation.
-Claude is not applicable to `codex-remote-control`; do not infer its state from
-WSL.
 
 Use the full protocol below for inventory, broad reconciliation, settings,
 provenance, conversions, ambiguous scope, and sealed-plan mutations.

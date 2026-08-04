@@ -381,8 +381,10 @@ Codex project readiness is a distinct check from Git readiness:
 5. the task is visible in the cross-host task catalog
 
 The controlling Mac does not need a local copy of a WSL or remote Mac path.
-Direct remote task creation selects the destination saved project's host and
-project identifiers. Cross-host handoff of an existing task requires a matching
+Direct remote task creation freshly matches the destination host and native
+path, then passes that listing object's project identifier verbatim into a new
+task. It never resumes an older task to recover from an ID or creation error.
+Cross-host handoff of an existing task requires a matching
 saved-project worktree on the destination. Ordinary in-thread subagents are
 different: they inherit the parent task's working directory and selected
 environments and cannot independently select a new host.
@@ -397,6 +399,14 @@ a control project. Agents may detect or propose this repository, but GitHub
 creation, remote changes, and pushes require explicit user approval. The
 configured project source/path or an exact user-supplied path locates an
 existing checkout; no repository name or local directory is assumed.
+
+The creating controller owns terminal cleanup. Once result evidence is
+validated and temporary payloads are removed, it archives that exact task in
+the same operation. Local-environment tasks normally create no worktree. If a
+task-owned worktree exists, supported handoff or worktree cleanup must succeed
+before archive; dirty, unintegrated, or conflicting state remains visible as a
+`task_cleanup_failed` blocker. Archive is never treated as worktree deletion,
+and completed tasks are never reused.
 
 Do not edit Codex Desktop's internal SQLite, LevelDB, or path-keyed trust config
 to simulate registration. Audit registration and use a supported Desktop/API
