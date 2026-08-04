@@ -783,15 +783,25 @@ current_session_identity() {
   printf '%s:%s' "$uid" "$sid" | sha256_stream
 }
 find_agent_peer() {
-  local lsof pid candidate_uid candidate_executable candidate_start matches=
-  lsof=$(lsof_binary) || return 1
+  local lsof pid candidate_uid candidate_executable candidate_start matches= saw_pid=false
+  lsof=$(lsof_binary) || {
+    [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer lsof' >&2
+    return 1
+  }
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
+    saw_pid=true
     candidate_uid=$(process_uid "$pid") || continue
     [ "$candidate_uid" = "$(/usr/bin/id -u)" ] || continue
-    candidate_executable=$(process_executable "$pid") || continue
+    candidate_executable=$(process_executable "$pid") || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer executable' >&2
+      continue
+    }
     [ "$candidate_executable" = "$agent_peer_executable" ] || continue
-    candidate_start=$(process_start_identity "$pid") || continue
+    candidate_start=$(process_start_identity "$pid") || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer start' >&2
+      continue
+    }
     [ -z "$matches" ] || return 1
     matches=$pid
     agent_peer_pid=$pid
@@ -799,7 +809,14 @@ find_agent_peer() {
   done <<EOF
 $($lsof -n -w -Fp -a -U "$agent_socket_canonical" 2>/dev/null | /usr/bin/awk '/^p[0-9]+$/ {sub(/^p/, ""); print}' | /usr/bin/sort -u)
 EOF
-  [ -n "$matches" ]
+  [ "$saw_pid" = true ] || {
+    [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer owner' >&2
+    return 1
+  }
+  [ -n "$matches" ] || {
+    [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer match' >&2
+    return 1
+  }
 }
 verify_agent_socket() {
   local canonical parent mode
