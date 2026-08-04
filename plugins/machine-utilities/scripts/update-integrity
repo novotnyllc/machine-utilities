@@ -42,19 +42,14 @@ for relative in \
   scripts/enroll-privilege-windows.ps1 \
   scripts/enroll-ssh-posix \
   scripts/enroll-windows-sftp.ps1 \
+  scripts/homebrew-bridge.rb \
   scripts/machine-utilities \
   scripts/prepare-ssh-identity \
   scripts/privilege-broker-posix \
   scripts/privilege-broker-windows.ps1 \
   scripts/profile-worker-windows.ps1 \
   scripts/register-profile-task-windows.ps1 \
-  scripts/windows-native-canary-runner.ps1 \
-  windows/global.json \
-  windows/WinGetBroker/BrokerCore.cs \
-  windows/WinGetBroker/Program.cs \
-  windows/WinGetBroker/Properties/AssemblyInfo.cs \
-  windows/WinGetBroker/WinGetBroker.csproj \
-  windows/WinGetBroker/packages.lock.json
+  scripts/windows-native-canary-runner.ps1
 do
   [ -f "$plugin_root/$relative" ] || {
     printf 'update-integrity: missing release file: %s\n' "$relative" >&2

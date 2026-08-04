@@ -140,20 +140,3 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $requirementPath -Force -ErrorAction SilentlyContinue
           }
-      - name: Verify compiled WinGet helper contracts
-        shell: pwsh
-        working-directory: plugins/machine-utilities/windows
-        run: |
-          $ErrorActionPreference = "Stop"
-          dotnet restore WinGetBroker.Tests/WinGetBroker.Tests.csproj --locked-mode
-          if ($LASTEXITCODE -ne 0) { throw "Locked WinGet helper restore failed" }
-          dotnet run --no-restore --configuration Release --framework net8.0 `
-            --project WinGetBroker.Tests/WinGetBroker.Tests.csproj
-          if ($LASTEXITCODE -ne 0) { throw "WinGet helper contract tests failed" }
-          dotnet restore WinGetBroker/WinGetBroker.csproj --locked-mode
-          if ($LASTEXITCODE -ne 0) { throw "Locked WinGet helper restore failed" }
-          foreach ($rid in @("win-x64", "win-arm64")) {
-            dotnet build WinGetBroker/WinGetBroker.csproj --no-restore --configuration Release `
-              --framework net8.0-windows10.0.26100.0 --runtime $rid
-            if ($LASTEXITCODE -ne 0) { throw "WinGet helper build failed: $rid" }
-          }

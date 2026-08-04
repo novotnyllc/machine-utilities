@@ -451,16 +451,22 @@ key_fingerprint() {
   "$ssh_keygen" -lf "$1" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1 {print $2; exit}'
 }
 
-valid_domain() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]]; }
+valid_domain() {
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ $1 == *.* ]]
+}
 valid_node_id() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
 valid_principal() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$ ]]; }
 valid_source() {
   local value=$1 address prefix a b c d extra component one two three four numeric mask
   case $value in */*) ;; *) return 1 ;; esac
-  address=$(printf '%s' "$value" | /usr/bin/sed 's,/.*$,,' )
-  prefix=$(printf '%s' "$value" | /usr/bin/sed 's,^.*/,,' )
-  [[ $prefix =~ ^(0|[1-9]|[12][0-9]|3[0-2])$ ]] || return 1
-  [[ $address != *:* ]] || return 1
+  address=${value%/*}
+  prefix=${value##*/}
+  [[ $prefix =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+  if [[ $address == *:* ]]; then
+    [ "$prefix" -le 128 ] && [[ $address =~ ^[0-9A-Fa-f:]+$ ]]
+    return
+  fi
+  [ "$prefix" -le 32 ] || return 1
   IFS=. read -r a b c d extra <<EOF
 $address
 EOF
@@ -1996,8 +2002,12 @@ self_test() {
     "$request" >"$root/bad-source"
   ! parse_csr "$root/bad-source" || return 1
   /usr/bin/sed 's/source-addresses|10.0.0.0\/8,192.0.2.0\/24/source-addresses|2001:db8::\/32/' \
-    "$request" >"$root/bad-ipv6"
-  ! parse_csr "$root/bad-ipv6" || return 1
+    "$request" >"$root/ipv6"
+  parse_csr "$root/ipv6" || return 1
+  /usr/bin/sed -e 's/fleet-domain|fleet.example/fleet-domain|fleet/' \
+    -e 's/signing-principal|node-a@fleet.example/signing-principal|node-a@fleet/' \
+    "$request" >"$root/bad-domain"
+  ! parse_csr "$root/bad-domain" || return 1
   hostile_target=$root/hostile-tmp-target
   hostile_tmp=$root/hostile-tmp
   /bin/mkdir "$hostile_target"

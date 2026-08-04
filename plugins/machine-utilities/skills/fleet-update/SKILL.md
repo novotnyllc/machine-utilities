@@ -12,7 +12,12 @@ and inventory the package section first. Default to a read-only plan:
 
 - Homebrew: `brew update` changes metadata, so ask before running it; use
   `brew outdated --json=v2` for the plan and `brew upgrade` only for approved
-  formulae/casks.
+  formulae/casks. macOS casks run as the ordinary Homebrew owner through the
+  packaged bridge hook so Homebrew retains Caskroom authority. An unprivileged
+  app upgrade (including Visual Studio Code when its destination is writable)
+  follows Homebrew normally. A cask package that reaches Homebrew's hardcoded
+  `sudo` succeeds only when it byte-matches an active exact
+  `sealed-cask-payload-v1` enrollment; other privileged artifacts fail closed.
 - APT: `apt-get update` changes metadata, so ask first; plan with
   `apt-get --simulate upgrade`. Do not use `full-upgrade`, `dist-upgrade`, or
   `autoremove` unless explicitly selected.
@@ -56,9 +61,22 @@ the repository-defined semantic action already present there:
 `winget.upgrade-machine-package.v1`. WinGet is required for V1 Windows
 machine-package work. macOS actions are owner-enrolled and default-disabled;
 use them only when readiness advertises the exact active action. Never use root
-Homebrew, arbitrary `sudo`, installer scripts, or arbitrary plist paths. Never add argv, executable, source, installer,
-dependency, environment, shell, or elevation controls to a protected request;
-WinGet source dependency selection remains delegated to the attested provider.
+Homebrew, arbitrary `sudo`, arbitrary installer scripts, or arbitrary plist
+paths. `sealed-cask-payload-v1` is the sole scripted-package exception: it
+authorizes one exact owner-enrolled Apple-signed package and still invokes only
+the fixed broker installer action. During a normal `homebrew-cask:*` apply,
+Homebrew remains the ordinary-user transaction owner and writes its own
+Caskroom metadata. A human-enrolled `macos-cask-app` record may bind the cask
+token to one existing `/Applications/<Name>.app`; the typed broker prepares
+only that non-symlink tree for the enrolled UID, then Homebrew replaces it as
+the ordinary user. For package casks, the root bridge ignores Homebrew's
+submitted package path after matching its bytes and executes the protected
+artifact instead. It does not authorize unenrolled app targets, package
+receipt-pattern deletion, installer choices, or any other Homebrew sudo shape; those return
+`unsupported_homebrew_cask_privilege_boundary`. Never add argv, executable,
+source, installer, dependency, environment, shell, or elevation controls to a
+protected request; WinGet source dependency selection remains delegated to the
+attested provider.
 
 Run `"$CLI" privilege-status HOST SNAPSHOT`, seal the semantic action, use
 `verify-privilege-plan` immediately before `submit-privilege-plan`, and use

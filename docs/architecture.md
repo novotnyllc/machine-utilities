@@ -53,8 +53,21 @@ boundary. The signed-package action remains script-free unless a human
 enrollment seals an exact Apple-signed package as `sealed-cask-payload-v1`;
 the broker still invokes only fixed `installer -pkg … -target /`. That is a
 root-phase primitive, not a Homebrew transaction: Caskroom state remains
-user-owned and is never reported as updated by the broker. Interactive macOS
-elevation remains an owner-local workflow and is never a remote fallback.
+user-owned and is never reported as updated by the broker. Fleet cask apply
+keeps Homebrew itself unprivileged and loads a packaged user-mode hook. A
+protected `macos-cask-app` record binds one cask token to one app basename. For
+an existing root-owned app, the typed broker may transfer only that exact,
+non-symlink `/Applications` target tree to the enrolled UID with attested
+`/usr/sbin/chown -R -P -h`; the caller never supplies a path. Homebrew then
+performs the replacement and Caskroom transaction as the ordinary user. If
+Homebrew requests package elevation, the hook reaches the same typed sudoers
+entry point; it accepts only `installer -pkg … -target /`, matches the
+submitted bytes to one active exact `sealed-cask-payload-v1` constraint, and
+executes the protected package copy rather than the user path. Unenrolled app
+targets, receipt-pattern deletion, installer choices, and every other
+attempted sudo shape are unsupported.
+Interactive macOS elevation remains an owner-local workflow and is never a
+remote fallback.
 
 Logged-off reachability is separate from elevation. POSIX uses a forced bounded
 dispatcher; Windows uses a dedicated standard SID in an internal-SFTP-only

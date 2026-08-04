@@ -127,7 +127,19 @@ permits only `macos.install-signed-pkg.v1` and
 default; its `sealed-cask-payload-v1` policy mode may run only the exact,
 owner-enrolled Apple-signed package through fixed `installer -pkg … -target /`.
 It never runs Homebrew as root and does not claim Homebrew's Caskroom state was
-updated. WinGet is
+updated when the broker action is used alone. Fleet cask apply instead keeps
+Homebrew as the ordinary-user transaction owner so successful app upgrades
+update Caskroom metadata. A human-enrolled `macos-cask-app` constraint binds
+one cask token to one app basename; the typed broker may prepare only that
+existing, non-symlink `/Applications` target for the enrolled user with an
+attested, non-symlink-following `chown`. Homebrew still performs the app
+replacement as the ordinary user. If Homebrew attempts its hardcoded package
+`sudo`, the packaged hook redirects only the fixed signed-package installer
+shape to the broker, which substitutes the exact protected
+`sealed-cask-payload-v1` artifact. Unenrolled app targets, receipt-pattern
+deletion, installer choices, scripts outside that sealed package, and other
+exotic artifacts return
+`unsupported_homebrew_cask_privilege_boundary`. WinGet is
 required for V1 Windows machine-package operations. Enrollment preparation and
 upgrade/revocation previews are inert: the agent stops at the owner's local
 password or UAC boundary and never requests or relays an elevation credential.

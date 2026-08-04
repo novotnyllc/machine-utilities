@@ -83,6 +83,14 @@ readonly revocation_reserve=$state_root/revocation.reserve
 readonly command=${1:-}
 shift || true
 
+render_sudoers_policy() {
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' "$request_user" "$broker_system_path"
+  if [ "$platform_boundary" = macos ]; then
+    printf '%s ALL=(root) NOPASSWD:NOSETENV: %s --homebrew-bridge-v1 *\n' \
+      "$request_user" "$broker_system_path"
+  fi
+}
+
 portable_stat() {
   /usr/bin/stat -f "$1" "$3" 2>/dev/null || /usr/bin/stat -c "$2" "$3" 2>/dev/null
 }
@@ -396,6 +404,7 @@ verify_bootstrap_bundle() {
     function version(v){return v~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/}
     function uint(v){return v~/^(0|[1-9][0-9]*)$/&&(v+0)<=2147483647}
     function team_id(v){return v~/^[A-Z0-9]{10}$/}
+    function app_name(v){return length(v)<=128&&v~/^[A-Za-z0-9][A-Za-z0-9._+() -]*[.]app$/&&v!~/[.][.]/}
     function setting_value(id,v) {
       if(id=="timezone")return v~/^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/&&length(v)<=255
       if(id=="network-time-server")return v~/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/&&v!~/\.\./
@@ -417,6 +426,8 @@ verify_bootstrap_bundle() {
       ($4!="script-free"&&$4!="sealed-cask-payload-v1")||!uint($5)||$5=="0"||
       !digest($6)||!package_id($7)||!version($8)||!team_id($9)||!digest($10)||
       !package_id($11)||!version($12))exit 1;next}
+    $1=="macos-cask-app"{if(NF!=4||$2!="macos.install-signed-pkg.v1"||!token($3)||
+      !app_name($4))exit 1;next}
     $1=="macos-setting"{if(NF!=5||$2!="macos.apply-system-setting.v1"||!token($3)||
       !setting_value($4,$5))exit 1;next}
     $1=="profile"{if(NF!=9||!token($2)||$3!~/^S-[0-9]+(-[0-9]+){1,14}$/||!atom($4)||
@@ -644,14 +655,13 @@ context_binary() {
 validate_macos_context() {
   local dependency name expected_digest
   /usr/bin/awk -F '|' '
-    BEGIN { binary[2]="installer"; binary[3]="pkgutil"; binary[4]="pmset"; binary[5]="systemsetup" }
+    BEGIN { binary[2]="chown"; binary[3]="installer"; binary[4]="pkgutil"; binary[5]="pmset"; binary[6]="systemsetup" }
     $0!~/^[ -~]+$/ { exit 1 }
-    NR==1 { if(NF!=2||$1!="macos-context"||$2!="1")exit 1; next }
-    NR>=2&&NR<=5 { if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||$3!~/^[0-9a-f]+$/)exit 1; next }
-    { exit 1 }
-    END { if(NR!=5)exit 1 }
+    NR==1 { if(NF!=2||$1!="macos-context"||$2!="2")exit 1; next }
+    NR>=2&&NR<=6 { if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||$3!~/^[0-9a-f]+$/)exit 1; next }
+    { exit 1 } END { if(NR!=6)exit 1 }
   ' "$bundle/macos.context" || return 1
-  for name in installer pkgutil pmset systemsetup; do
+  for name in chown installer pkgutil pmset systemsetup; do
     case $name in pmset) dependency=$root_prefix/usr/bin/pmset ;; *) dependency=$root_prefix/usr/sbin/$name ;; esac
     expected_digest=$(context_binary "$name" macos.context) || return 1
     digest "$expected_digest" && validate_protected_ancestors "$dependency" &&
@@ -1185,9 +1195,8 @@ validate_coherent_enrollment() {
   [ "$epoch_line" = constraints ] && [ "$constraint_version" = 1 ] && [ -z "$constraint_extra" ] &&
     [ "$generation_bound" = "$expected_epoch" ] && [ "$policy_field" = "policy-sha256=$generation_policy" ] || return 1
   IFS='|' read -r _ _ _ _ request_user_from_identity _ _ _ _ _ _ <"$generation/host.identity" || return 1
-  expected_sudoers="$request_user_from_identity ALL=(root) NOPASSWD:NOSETENV: $broker_system_path \"\""
-  [ "$(/usr/bin/sed -n '1p' "$sudoers_path")" = "$expected_sudoers" ] &&
-    [ "$(/usr/bin/wc -l <"$sudoers_path" | /usr/bin/tr -d ' ')" = 1 ] || return 1
+  expected_sudoers=$(request_user=$request_user_from_identity render_sudoers_policy) || return 1
+  [ "$(/bin/cat "$sudoers_path")" = "$expected_sudoers" ] || return 1
   for state_directory in replay journal audit lock rollback quarantine; do
     protected_directory "$state_root/$state_directory" && exact_mode "$state_root/$state_directory" 700 || return 1
   done
@@ -1251,8 +1260,7 @@ emit_preview_body() {
       ;;
     *) return 1 ;;
   esac
-  candidate_sudoers=$(printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' \
-    "$request_user" "$broker_system_path" | sha256_stream)
+  candidate_sudoers=$(render_sudoers_policy | sha256_stream)
   printf 'enrollment-preview|2\noperation|install\n'
   printf 'from-epoch|%s\nto-epoch|%s\nmanifest-sha256|%s\n' "$current_epoch" "$epoch" "$manifest_digest"
   printf 'change|broker|%s|%s\n' "$current_broker_digest" "$candidate_broker"
@@ -1267,11 +1275,13 @@ emit_preview_body() {
       "$candidate_source_uri" "$candidate_source_suite" "$candidate_source_component" \
       "$candidate_publisher_fingerprint"
   else
-    printf 'change|macos-context-v1|%s|%s\n' "$current_platform_context_digest" "$candidate_platform_context"
+    printf 'change|macos-context-v2|%s|%s\n' "$current_platform_context_digest" "$candidate_platform_context"
     printf 'change|macos-protected-packages|%s|%s\n' "$current_platform_artifacts_digest" "$candidate_platform_artifacts"
   fi
-  printf 'sudoers|principal=%s|uid=%s|command=%s|argv=empty|sha256=%s\n' \
-    "$request_user" "$enrolled_uid" "$broker_system_path" "$candidate_sudoers"
+  printf 'sudoers|principal=%s|uid=%s|command=%s|argv=%s|sha256=%s\n' \
+    "$request_user" "$enrolled_uid" "$broker_system_path" \
+    "$([ "$platform_boundary" = macos ] && printf empty+typed-homebrew-cask || printf empty)" \
+    "$candidate_sudoers"
   printf 'trust|fleet-ca=%s|ca-generation=%s|endpoint-principals=%s\n' \
     "$ca_fingerprint" "$ca_generation" "$endpoint_principals"
   /usr/bin/awk -F '|' 'NR>1{printf "candidate-action|%s|%s|%s|%s|%s\n",$2,$3,$4,$5,$6}' \
@@ -2484,6 +2494,8 @@ run_enrollment_canary() {
     /usr/bin/grep -Fqx 'reason|needs_human_enrollment' "$direct_output" || return 1
     if [ "$platform_boundary" = macos ]; then
       if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+          "$broker_system_path" --homebrew-bridge-v1 /bin/sh -c : >/dev/null 2>&1; then return 1; fi
+      if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
           /usr/sbin/installer -help >/dev/null 2>&1; then return 1; fi
       for brew_path in /opt/homebrew/bin/brew /usr/local/bin/brew; do
         if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k -l \
@@ -2746,8 +2758,7 @@ install_bundle() (
   copy_manifest_file revoked.krl "$new_krl"
   observed_ca=$("$ssh_keygen" -lf "$new_ca" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1{print $2}')
   [ "$observed_ca" = "$ca_fingerprint" ] || { result rejected fleet_ca_fingerprint_mismatch linux; exit 65; }
-  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' \
-    "$request_user" "$broker_system_path" >"$sudoers_temp"
+  render_sudoers_policy >"$sudoers_temp"
   /bin/chmod 0440 "$sudoers_temp"
   if [ "$fixture_mode" = false ]; then
     /usr/bin/chown root:"$protected_group" "$sudoers_temp"

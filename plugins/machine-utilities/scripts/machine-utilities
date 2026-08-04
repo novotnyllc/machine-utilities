@@ -126,6 +126,7 @@ validate_privilege_constraints_file() (
       function version(value) { return value ~ /^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/ }
       function package_id(value) { return value ~ /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/ }
       function team_id(value) { return value ~ /^[A-Z0-9]{10}$/ }
+      function app_name(value) { return length(value) <= 128 && value ~ /^[A-Za-z0-9][A-Za-z0-9._+() -]*[.]app$/ && value !~ /[.][.]/ }
       function setting_value(id, value) {
         if (id == "timezone") return value ~ /^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/ && length(value) <= 255
         if (id == "network-time-server") return value ~ /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/ && value !~ /\.\./
@@ -169,6 +170,10 @@ validate_privilege_constraints_file() (
             !uint($5, 2147483647) || $5 == "0" || !digest($6) || !package_id($7) ||
             !version($8) || !team_id($9) || !digest($10) || !package_id($11) ||
             !version($12)) exit 1
+        next
+      }
+      $1 == "macos-cask-app" {
+        if (NF != 4 || $2 != "macos.install-signed-pkg.v1" || !token($3) || !app_name($4)) exit 1
         next
       }
       $1 == "macos-setting" {
@@ -776,6 +781,8 @@ validate_config_file() {
                test("^[0-9A-Fa-f:]+/[0-9]{1,3}$") and ((split("/")[-1] | tonumber) <= 128)
               else
                test("^[0-9.]+/[0-9]{1,2}$") and ((split("/")[-1] | tonumber) <= 32)
+               and (split("/")[0] | split(".") | length == 4 and
+                 all(.[]; test("^(0|[1-9][0-9]{0,2})$") and ((tonumber) <= 255)))
               end)
            ] | all) and
            (if .platform == "windows" then
@@ -3824,6 +3831,42 @@ EOF
             printf 'machine-utilities: unsafe Homebrew cask upgrade argv\n' >&2
             return 64
           fi
+          if [ "${id%%:*}" = homebrew-cask ]; then
+            homebrew_app_broker=/usr/local/libexec/machine-utilities/posix-broker
+            if [ -x "$homebrew_app_broker" ]; then
+              if homebrew_prepare_output=$(/usr/bin/sudo -n -- "$homebrew_app_broker" \
+                  --homebrew-bridge-v1 prepare-app "$package_name" 2>&1); then
+                :
+              else
+                homebrew_prepare_status=$?
+                case $homebrew_prepare_output in
+                  'machine-utilities: unsupported_homebrew_cask_privilege_boundary: app_target_not_enrolled'|\
+                  'machine-utilities: unsupported_homebrew_cask_privilege_boundary: action_not_enabled'|sudo:*) ;;
+                  *)
+                    printf '%s\n' "$homebrew_prepare_output" >&2
+                    return "$homebrew_prepare_status"
+                    ;;
+                esac
+              fi
+            fi
+            homebrew_bridge_hook=$plugin_root/scripts/homebrew-bridge.rb
+            [ -f "$homebrew_bridge_hook" ] && [ ! -L "$homebrew_bridge_hook" ] || {
+              printf 'machine-utilities: Homebrew cask privilege bridge hook is unavailable\n' >&2
+              return 69
+            }
+            homebrew_repository=$(brew --repository 2>/dev/null) || {
+              printf 'machine-utilities: Homebrew repository is unavailable\n' >&2
+              return 69
+            }
+            case $homebrew_repository in /*) ;; *) return 69 ;; esac
+            homebrew_entrypoint=$homebrew_repository/Library/Homebrew/brew.rb
+            [ -f "$homebrew_entrypoint" ] && [ ! -L "$homebrew_entrypoint" ] || {
+              printf 'machine-utilities: Homebrew Ruby entrypoint is unavailable\n' >&2
+              return 69
+            }
+            set -- env HOMEBREW_NO_AUTO_UPDATE=1 brew ruby "-r$homebrew_bridge_hook" \
+              "$homebrew_entrypoint" -- upgrade --cask "$package_name"
+          fi
           ;;
         apt:*)
           printf 'machine-utilities: direct APT execution is forbidden; use a sealed broker action\n' >&2
@@ -3946,7 +3989,8 @@ EOF
         }
         shift 4
         validate_chezmoi_targets "$@" || return
-        jq -e --args "$@" '.targets == $ARGS.positional' "$operation" >/dev/null || {
+        targets_json=$(jq -cn --args '$ARGS.positional' "$@") || return
+        jq -e --argjson targets "$targets_json" '.targets == $targets' "$operation" >/dev/null || {
           printf 'machine-utilities: targeted chezmoi argv does not match the sealed targets\n' >&2
           return 64
         }

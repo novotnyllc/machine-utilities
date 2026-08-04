@@ -344,7 +344,7 @@ identity_directory() {
 }
 
 valid_domain() {
-  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]]
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] && [[ $1 == *.* ]]
 }
 
 valid_node_id() {
@@ -380,9 +380,14 @@ valid_source_address() {
     */*) address=${value%/*}; prefix=${value##*/} ;;
     *) return 1 ;;
   esac
-  [[ $prefix =~ ^(0|[1-9]|[12][0-9]|3[0-2])$ ]] || return 1
-  valid_source_prefix=$prefix
-  [[ $address != *:* ]] && valid_ipv4 "$address"
+  [[ $prefix =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+  if [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$prefix" -le 32 ] || return 1
+    valid_source_prefix=$prefix
+    valid_ipv4 "$address"
+  else
+    [ "$prefix" -le 128 ] && [[ $address =~ ^[0-9A-Fa-f:]+$ ]] && [[ $address == *:* ]]
+  fi
 }
 
 canonicalize_csv() {
@@ -1704,7 +1709,8 @@ self_test() {
 
   ! emit_preview fleet.example node-a mu-posix 010.0.0.0/8 || return 1
   ! emit_preview fleet.example node-a mu-posix 10.0.0.1/8 || return 1
-  ! emit_preview fleet.example node-a mu-posix 2001:db8::/32 || return 1
+  emit_preview fleet.example node-a mu-posix 2001:db8::/32 >/dev/null || return 1
+  ! emit_preview fleet node-a mu-posix 10.0.0.0/8 || return 1
   ! emit_preview fleet.example node-a mu-posix 10.0.0.0/033 || return 1
   saved_request=$test_root/request.saved
   /bin/cp "$current/$request_name" "$saved_request"

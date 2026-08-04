@@ -1,16 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-# The sudoers grant names this file with an empty argument string. The sole
-# non-public entry point is the broker's fixed internal launcher. It accepts a
-# request identifier only; the native path and arguments are always derived
-# again from protected state.
+# The primary sudoers grant names this file with an empty argument string. On
+# macOS, a second typed entry point prepares one owner-enrolled app target or
+# substitutes an exact protected package payload. The sole other non-public
+# entry point is the broker's fixed internal launcher.
 internal_launch=false
 internal_request_id=
+homebrew_bridge=false
 if [ "$#" -eq 2 ] && [ "$1" = --internal-launch-v1 ] &&
   [[ $2 =~ ^request-[0-9a-f]{32}$ ]]; then
   internal_launch=true
   internal_request_id=$2
+elif [ "$#" -ge 2 ] && [ "$1" = --homebrew-bridge-v1 ]; then
+  homebrew_bridge=true
+  shift
 elif [ "$#" -ne 0 ]; then
   exit 64
 fi
@@ -87,6 +91,8 @@ portable_stat() {
 }
 
 file_owner() { portable_stat %Su %U "$1"; }
+file_uid() { portable_stat %u %u "$1"; }
+file_inode() { portable_stat %i %i "$1"; }
 file_mode() { portable_stat %Lp %a "$1"; }
 file_size() { portable_stat %z %s "$1"; }
 file_blocks() { portable_stat %b %b "$1"; }
@@ -262,6 +268,11 @@ macos_pkg_payload_mode_valid() {
   case $1 in script-free|sealed-cask-payload-v1) return 0 ;; *) return 1 ;; esac
 }
 
+macos_app_basename_valid() {
+  local pattern='^[A-Za-z0-9][A-Za-z0-9._+() -]{0,123}[.]app$'
+  [ "${#1}" -le 128 ] && [[ $1 =~ $pattern ]] && [[ $1 != *..* ]]
+}
+
 macos_receipt_version() {
   local pkgutil_binary=$1 receipt=$2 output=$3 error_output observed_id observed_version
   [[ $receipt =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]] || return 1
@@ -398,6 +409,209 @@ inspect_macos_package() {
     /usr/bin/grep -Fq '<plist version="1.0">' "$pkginfo_output"
 }
 
+homebrew_bridge_fail() {
+  printf 'machine-utilities: unsupported_homebrew_cask_privilege_boundary: %s\n' "$1" >&2
+  exit "${2:-69}"
+}
+
+load_homebrew_bridge_authority() {
+  local active_target caller_uid actual_policy_digest policy_group_digest identity_type identity_version
+  local protected_host_id protected_domain protected_ca_fingerprint protected_ca_generation
+  local protected_host_fingerprint endpoint_principals identity_extra
+  [ "$broker_platform" = macos ] || homebrew_bridge_fail bridge_requires_native_macos
+  protected_directory "$config_root" && protected_directory "$generations_root" &&
+    protected_directory "$state_root" || homebrew_bridge_fail protected_path_drift 65
+  [ -L "$active_link" ] || homebrew_bridge_fail active_generation_missing 65
+  active_target=$(/usr/bin/readlink "$active_link") || homebrew_bridge_fail active_generation_unreadable 65
+  [[ $active_target =~ ^generations/([1-9][0-9]{0,9})$ ]] ||
+    homebrew_bridge_fail active_generation_invalid 65
+  homebrew_active_epoch=${BASH_REMATCH[1]}
+  homebrew_generation=$config_root/$active_target
+  homebrew_policy=$homebrew_generation/policy.actions
+  homebrew_constraints=$homebrew_generation/policy.constraints
+  homebrew_host_identity=$homebrew_generation/host.identity
+  homebrew_macos_context=$homebrew_generation/macos.context
+  protected_directory "$homebrew_generation" && protected_file "$homebrew_policy" 65536 &&
+    protected_file "$homebrew_constraints" 65536 && protected_file "$homebrew_host_identity" 65536 &&
+    protected_file "$homebrew_macos_context" 65536 &&
+    protected_file "$homebrew_generation/broker.sha256" 128 && protected_file "$broker_path" 1048576 &&
+    [ -x "$broker_path" ] || homebrew_bridge_fail protected_file_drift 65
+  [ "$0" = "$broker_path" ] || homebrew_bridge_fail broker_path_drift 65
+  [ "$(sha256_file "$broker_path")" = "$(/usr/bin/sed -n '1p' "$homebrew_generation/broker.sha256")" ] ||
+    homebrew_bridge_fail broker_drift 65
+  /usr/bin/awk -F '|' '
+    BEGIN{binary[2]="chown";binary[3]="installer";binary[4]="pkgutil";binary[5]="pmset";binary[6]="systemsetup"}
+    NR==1{if($0!="macos-context|2")exit 1;next}
+    NR>=2&&NR<=6{if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||
+      $3!~/^[0-9a-f]+$/||seen[$2]++)exit 1;next}
+    {exit 1} END{if(NR!=6)exit 1}
+  ' "$homebrew_macos_context" || homebrew_bridge_fail invalid_macos_context 65
+
+  IFS='|' read -r identity_type identity_version protected_host_id protected_uid protected_principal \
+    protected_domain protected_ca_fingerprint protected_ca_generation protected_host_fingerprint \
+    endpoint_principals identity_extra <"$homebrew_host_identity" ||
+    homebrew_bridge_fail invalid_host_identity 65
+  [ "$identity_type" = identity ] && [ "$identity_version" = 1 ] && [ -z "$identity_extra" ] &&
+    token "$protected_host_id" && uint "$protected_uid" && [ "$protected_uid" != 0 ] &&
+    token "$protected_principal" &&
+    [[ $protected_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
+    fingerprint "$protected_ca_fingerprint" && uint "$protected_ca_generation" &&
+    fingerprint "$protected_host_fingerprint" &&
+    [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] &&
+    [ "$(/usr/bin/wc -l <"$homebrew_host_identity" | /usr/bin/tr -d ' ')" = 1 ] ||
+    homebrew_bridge_fail invalid_host_identity 65
+  caller_uid=${SUDO_UID:-}
+  [ "$caller_uid" = "$protected_uid" ] && [ "${SUDO_USER:-}" = "$protected_principal" ] ||
+    homebrew_bridge_fail caller_uid_mismatch 65
+
+  actual_policy_digest=$(sha256_file "$homebrew_policy") || homebrew_bridge_fail policy_digest_unavailable 65
+  [ "$(/usr/bin/sed -n '1p' "$homebrew_constraints")" = \
+    "constraints|1|generation=$homebrew_active_epoch|policy-sha256=$actual_policy_digest" ] ||
+    homebrew_bridge_fail policy_or_context_drift 65
+  policy_group_digest=$(/usr/bin/awk -F '|' \
+    '($1=="macos-pkg"||$1=="macos-cask-app")&&$2=="macos.install-signed-pkg.v1"{print}' \
+    "$homebrew_constraints" | sha256_stream) || homebrew_bridge_fail constraint_group_drift 65
+  /usr/bin/awk -F '|' -v digest="$policy_group_digest" '
+    $1=="action"&&$2=="macos.install-signed-pkg.v1"&&$3=="macos-root-v1"&&
+      $4=="enabled"&&$5=="macos-signed-pkg-sha256"&&$6==digest{found++}
+    END{exit found==1?0:1}' "$homebrew_policy" || homebrew_bridge_fail action_not_enabled 65
+}
+
+run_homebrew_app_prepare() {
+  local cask_token=$1 selected_constraint app_name applications_root target_path target_uid target_inode
+  local chown_path chown_digest
+  token "$cask_token" || homebrew_bridge_fail invalid_cask_token
+  selected_constraint=$(/usr/bin/awk -F '|' -v token="$cask_token" '
+    $1=="macos-cask-app"&&$2=="macos.install-signed-pkg.v1"&&$3==token{print;count++}
+    END{if(count!=1)exit 1}' "$homebrew_constraints") || homebrew_bridge_fail app_target_not_enrolled
+  IFS='|' read -r _ _ _ app_name <<EOF
+$selected_constraint
+EOF
+  macos_app_basename_valid "$app_name" || homebrew_bridge_fail invalid_protected_constraints 65
+  applications_root=$root_prefix/Applications
+  target_path=$applications_root/$app_name
+  [ -d "$applications_root" ] && [ ! -L "$applications_root" ] ||
+    homebrew_bridge_fail applications_root_drift 65
+  if [ "$fixture_mode" = false ]; then
+    [ "$(file_uid "$applications_root")" = 0 ] || homebrew_bridge_fail applications_root_drift 65
+  else
+    [ "$(file_uid "$applications_root")" = "$(/usr/bin/id -u)" ] ||
+      homebrew_bridge_fail applications_root_drift 65
+  fi
+  case $(file_mode "$applications_root") in 755|775) ;; *) homebrew_bridge_fail applications_root_drift 65 ;; esac
+  if [ ! -e "$target_path" ] && [ ! -L "$target_path" ]; then return 0; fi
+  [ -d "$target_path" ] && [ ! -L "$target_path" ] || homebrew_bridge_fail app_target_not_directory
+  target_uid=$(file_uid "$target_path") || homebrew_bridge_fail app_target_unreadable
+  [ "$target_uid" = 0 ] || [ "$target_uid" = "$protected_uid" ] ||
+    homebrew_bridge_fail app_target_owner_mismatch
+  target_inode=$(file_inode "$target_path") || homebrew_bridge_fail app_target_unreadable
+
+  chown_path=$root_prefix/usr/sbin/chown
+  chown_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="chown"{if(found++)exit 1;print $3}
+    END{if(found!=1)exit 1}' "$homebrew_macos_context") || homebrew_bridge_fail invalid_macos_context 65
+  protected_file "$chown_path" 33554432 && [ -x "$chown_path" ] &&
+    [ "$(sha256_file "$chown_path")" = "$chown_digest" ] || homebrew_bridge_fail macos_dependency_drift 65
+  /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "$chown_path" -R -P -h -- "$protected_uid" "$target_path" ||
+    homebrew_bridge_fail app_target_prepare_failed 70
+  [ -d "$target_path" ] && [ ! -L "$target_path" ] &&
+    [ "$(file_inode "$target_path")" = "$target_inode" ] &&
+    [ "$(file_uid "$target_path")" = "$protected_uid" ] ||
+    homebrew_bridge_fail app_target_post_state_mismatch 70
+}
+
+# Homebrew remains the ordinary-user transaction owner. This entry point
+# prepares only an enrolled app target or substitutes an exact protected
+# package for Homebrew's hardcoded sudo call; it never executes Homebrew or
+# caller-supplied paths as root.
+run_homebrew_bridge() {
+  [ "$#" -ge 1 ] || homebrew_bridge_fail unsupported_privileged_cask_artifact
+  local executable=$1 package_flag=${2:-} submitted_artifact=${3:-} target_flag=${4:-} target=${5:-}
+  local verbose=${6:-} selected_constraint policy_token payload_mode package_size package_digest package_id
+  local package_version team_id signature_digest receipt_id receipt_version protected_artifact
+  local installer_path pkgutil_path installer_digest pkgutil_digest scratch current_version
+
+  load_homebrew_bridge_authority
+  if [ "$#" -eq 2 ] && [ "$1" = prepare-app ]; then
+    run_homebrew_app_prepare "$2"
+    return 0
+  fi
+  [ "$fixture_mode" = false ] || homebrew_bridge_fail package_bridge_requires_native_macos
+  [ "$#" -eq 5 ] || { [ "$#" -eq 6 ] && [ "$verbose" = -verboseR ]; } ||
+    homebrew_bridge_fail unsupported_pkg_installer_shape
+  [ "$executable" = /usr/sbin/installer ] && [ "$package_flag" = -pkg ] &&
+    [ "$target_flag" = -target ] && [ "$target" = / ] ||
+    homebrew_bridge_fail unsupported_privileged_cask_artifact
+  case $submitted_artifact in
+    /opt/homebrew/Caskroom/*/*.pkg|/usr/local/Caskroom/*/*.pkg) ;;
+    *) homebrew_bridge_fail package_not_in_homebrew_caskroom ;;
+  esac
+  case /$submitted_artifact/ in */../*|*/./*) homebrew_bridge_fail noncanonical_package_path ;; esac
+  [ -f "$submitted_artifact" ] && [ ! -L "$submitted_artifact" ] ||
+    homebrew_bridge_fail package_not_regular
+  [ "$(file_size "$submitted_artifact")" -le 2147483647 ] ||
+    homebrew_bridge_fail package_too_large
+
+  package_size=$(file_size "$submitted_artifact") || homebrew_bridge_fail package_unreadable
+  package_digest=$(sha256_file "$submitted_artifact") || homebrew_bridge_fail package_unreadable
+  selected_constraint=$(/usr/bin/awk -F '|' -v size="$package_size" -v digest="$package_digest" '
+    $1=="macos-pkg"&&$2=="macos.install-signed-pkg.v1"&&$4=="sealed-cask-payload-v1"&&
+      $5==size&&$6==digest{print;count++} END{if(count!=1)exit 1}' "$homebrew_constraints") ||
+    homebrew_bridge_fail exact_sealed_package_not_enrolled
+  IFS='|' read -r _ _ policy_token payload_mode package_size package_digest package_id \
+    package_version team_id signature_digest receipt_id receipt_version <<EOF
+$selected_constraint
+EOF
+  token "$policy_token" && [ "$payload_mode" = sealed-cask-payload-v1 ] ||
+    homebrew_bridge_fail invalid_protected_constraints 65
+  protected_artifact=$homebrew_generation/macos/packages/$policy_token.pkg
+  protected_file "$protected_artifact" 2147483647 && exact_mode "$protected_artifact" 644 &&
+    [ "$(file_size "$protected_artifact")" = "$package_size" ] &&
+    [ "$(sha256_file "$protected_artifact")" = "$package_digest" ] ||
+    homebrew_bridge_fail protected_package_drift 65
+
+  /usr/bin/awk -F '|' '
+    BEGIN{binary[2]="chown";binary[3]="installer";binary[4]="pkgutil";binary[5]="pmset";binary[6]="systemsetup"}
+    NR==1{if($0!="macos-context|2")exit 1;next}
+    NR>=2&&NR<=6{if(NF!=3||$1!="binary"||$2!=binary[NR]||
+      length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++)exit 1;next}
+    {exit 1} END{if(NR!=6)exit 1}
+  ' "$homebrew_macos_context" || homebrew_bridge_fail invalid_macos_context 65
+  installer_path=/usr/sbin/installer
+  pkgutil_path=/usr/sbin/pkgutil
+  installer_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="installer"{print $3}' "$homebrew_macos_context")
+  pkgutil_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pkgutil"{print $3}' "$homebrew_macos_context")
+  protected_file "$installer_path" 33554432 && protected_file "$pkgutil_path" 33554432 &&
+    [ -x "$installer_path" ] && [ -x "$pkgutil_path" ] &&
+    [ "$(sha256_file "$installer_path")" = "$installer_digest" ] &&
+    [ "$(sha256_file "$pkgutil_path")" = "$pkgutil_digest" ] ||
+    homebrew_bridge_fail macos_dependency_drift 65
+
+  scratch=$state_root/.homebrew-bridge.$$
+  if ! inspect_macos_package "$pkgutil_path" "$installer_path" "$protected_artifact" "$scratch" \
+      "$package_size" "$package_digest" "$package_id" "$package_version" "$team_id" \
+      "$signature_digest" "$payload_mode"; then
+    /bin/rm -rf "$scratch.expanded" "$scratch.signature" "$scratch.pkginfo"
+    homebrew_bridge_fail protected_package_invalid 65
+  fi
+  /bin/rm -rf "$scratch.expanded" "$scratch.signature" "$scratch.pkginfo"
+  current_version=$(macos_receipt_version "$pkgutil_path" "$receipt_id" "$scratch.receipt") ||
+    homebrew_bridge_fail package_pre_state_unavailable 70
+  /bin/rm -f "$scratch.receipt"
+  [ "$current_version" != "$receipt_version" ] || return 0
+  "$installer_path" -pkg "$protected_artifact" -target / ${verbose:+"$verbose"} ||
+    homebrew_bridge_fail package_installer_failed 70
+  current_version=$(macos_receipt_version "$pkgutil_path" "$receipt_id" "$scratch.receipt") ||
+    homebrew_bridge_fail package_post_state_unavailable 70
+  /bin/rm -f "$scratch.receipt"
+  [ "$current_version" = "$receipt_version" ] || homebrew_bridge_fail package_post_state_mismatch 70
+}
+
+if [ "$homebrew_bridge" = true ]; then
+  run_homebrew_bridge "$@"
+  exit 0
+fi
+
 fixture_pause() {
   local phase=$1 marker
   [ "$fixture_mode" = true ] && [ "${MACHINE_UTILITIES_U2_PAUSE_AT:-}" = "$phase" ] || return 0
@@ -505,23 +719,27 @@ run_internal_launcher() {
     [ "$0" = "$broker_path" ] && [ "$(sha256_file "$broker_path")" = "$launch_broker_digest" ] || exit 75
   fi
   if [ "$broker_platform" = macos ]; then
+    chown_internal=$root_prefix/usr/sbin/chown
     installer_internal=$root_prefix/usr/sbin/installer
     pkgutil_internal=$root_prefix/usr/sbin/pkgutil
     pmset_internal=$root_prefix/usr/bin/pmset
     systemsetup_internal=$root_prefix/usr/sbin/systemsetup
     /usr/bin/awk -F '|' '
-      NR==1{if($0!="macos-context|1")exit 1;next}
-      NR>=2&&NR<=5{if(NF!=3||$1!="binary"||$2!~/^(installer|pkgutil|pmset|systemsetup)$/||
-        length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$2))exit 1;previous=$2;next}
-      {exit 1} END{if(NR!=5||!seen["installer"]||!seen["pkgutil"]||!seen["pmset"]||!seen["systemsetup"])exit 1}
+      BEGIN{binary[2]="chown";binary[3]="installer";binary[4]="pkgutil";binary[5]="pmset";binary[6]="systemsetup"}
+      NR==1{if($0!="macos-context|2")exit 1;next}
+      NR>=2&&NR<=6{if(NF!=3||$1!="binary"||$2!=binary[NR]||
+        length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++)exit 1;next}
+      {exit 1} END{if(NR!=6)exit 1}
     ' "$platform_context_internal" || exit 75
+    chown_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="chown"{print $3}' "$platform_context_internal")
     installer_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="installer"{print $3}' "$platform_context_internal")
     pkgutil_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pkgutil"{print $3}' "$platform_context_internal")
     pmset_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pmset"{print $3}' "$platform_context_internal")
     systemsetup_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="systemsetup"{print $3}' "$platform_context_internal")
-    for dependency_internal in "$installer_internal" "$pkgutil_internal" "$pmset_internal" "$systemsetup_internal"; do
+    for dependency_internal in "$chown_internal" "$installer_internal" "$pkgutil_internal" "$pmset_internal" "$systemsetup_internal"; do
       protected_file "$dependency_internal" 33554432 && [ -x "$dependency_internal" ] || exit 75
     done
+      [ "$(sha256_file "$chown_internal")" = "$chown_expected" ] &&
       [ "$(sha256_file "$installer_internal")" = "$installer_expected" ] &&
       [ "$(sha256_file "$pkgutil_internal")" = "$pkgutil_expected" ] &&
       [ "$(sha256_file "$pmset_internal")" = "$pmset_expected" ] &&
@@ -1369,6 +1587,7 @@ fi
   function version(v){return v~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/}
   function uint(v){return v~/^(0|[1-9][0-9]*)$/ && (v+0)<=2147483647}
   function package_id(v){return v~/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/}
+  function app_name(v){return length(v)<=128&&v~/^[A-Za-z0-9][A-Za-z0-9._+() -]*[.]app$/&&v!~/[.][.]/}
   function setting_value(id,v) {
     if(id=="timezone")return v~/^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/&&length(v)<=255
     if(id=="network-time-server")return v~/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/&&v!~/\.\./
@@ -1403,6 +1622,10 @@ fi
         ($4!="script-free" && $4!="sealed-cask-payload-v1") || !uint($5) || $5=="0" ||
         $5+0>2147483647 || !digest($6) || !package_id($7) || !version($8) ||
         $9!~/^[A-Z0-9]{10}$/ || !digest($10) || !package_id($11) || !version($12)) exit 1
+    next
+  }
+  $1=="macos-cask-app" {
+    if (NF!=4 || $2!="macos.install-signed-pkg.v1" || !token($3) || !app_name($4)) exit 1
     next
   }
   $1=="macos-setting" {
@@ -2252,24 +2475,28 @@ revalidate_execution_snapshot() {
     [ "$fresh_precondition_digest" = "$requested_precondition_digest" ]
 }
 else
+  readonly chown_path=$root_prefix/usr/sbin/chown
   readonly installer_path=$root_prefix/usr/sbin/installer
   readonly pkgutil_path=$root_prefix/usr/sbin/pkgutil
   readonly pmset_path=$root_prefix/usr/bin/pmset
   readonly systemsetup_path=$root_prefix/usr/sbin/systemsetup
   /usr/bin/awk -F '|' '
-    NR==1{if($0!="macos-context|1")exit 1;next}
-    NR>=2&&NR<=5{if(NF!=3||$1!="binary"||$2!~/^(installer|pkgutil|pmset|systemsetup)$/||
-      length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$2))exit 1;previous=$2;next}
-    {exit 1} END{if(NR!=5||!seen["installer"]||!seen["pkgutil"]||!seen["pmset"]||!seen["systemsetup"])exit 1}
+    BEGIN{binary[2]="chown";binary[3]="installer";binary[4]="pkgutil";binary[5]="pmset";binary[6]="systemsetup"}
+    NR==1{if($0!="macos-context|2")exit 1;next}
+    NR>=2&&NR<=6{if(NF!=3||$1!="binary"||$2!=binary[NR]||
+      length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++)exit 1;next}
+    {exit 1} END{if(NR!=6)exit 1}
   ' "$macos_context" || reject invalid_macos_context
+  chown_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="chown"{print $3}' "$macos_context")
   installer_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="installer"{print $3}' "$macos_context")
   pkgutil_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pkgutil"{print $3}' "$macos_context")
   pmset_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pmset"{print $3}' "$macos_context")
   systemsetup_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="systemsetup"{print $3}' "$macos_context")
-  for dependency in "$installer_path" "$pkgutil_path" "$pmset_path" "$systemsetup_path"; do
+  for dependency in "$chown_path" "$installer_path" "$pkgutil_path" "$pmset_path" "$systemsetup_path"; do
     protected_file "$dependency" 33554432 && [ -x "$dependency" ] || reject macos_dependency_drift
   done
-  [ "$(sha256_file "$installer_path")" = "$installer_digest" ] &&
+  [ "$(sha256_file "$chown_path")" = "$chown_digest" ] &&
+    [ "$(sha256_file "$installer_path")" = "$installer_digest" ] &&
     [ "$(sha256_file "$pkgutil_path")" = "$pkgutil_digest" ] &&
     [ "$(sha256_file "$pmset_path")" = "$pmset_digest" ] &&
     [ "$(sha256_file "$systemsetup_path")" = "$systemsetup_digest" ] || reject macos_dependency_drift

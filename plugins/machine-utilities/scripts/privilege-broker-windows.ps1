@@ -1285,7 +1285,8 @@ function Read-WinGetProviderContext([byte[]]$Bytes) {
     return [pscustomobject]@{
         StateIdentifier = [string]$Fields.'state-identifier'
         SourceId = [string]$Fields.'source-id'; SourceName = [string]$Fields.'source-name'
-        SourceType = [string]$Fields.'source-type'; SourceArgumentSha256 = [string]$Fields.'source-argument-sha256'
+        SourceType = [string]$Fields.'source-type'; SourceArgument = $SourceArgument
+        SourceArgumentSha256 = [string]$Fields.'source-argument-sha256'
         SourceOrigin = [string]$Fields.'source-origin'; SourceTrust = [string]$Fields.'source-trust'
         SourceExplicit = [string]$Fields.'source-explicit'; SourceLastUpdateMinimum = $LastUpdateMinimum
         DeploymentFileSetSha256 = [string]$Fields.'deployment-file-set-sha256'
@@ -1345,6 +1346,286 @@ function Get-WinGetExpectedSettingsSha256([object]$Request, [object]$Generation)
         '"autoUpdateIntervalInMinutes":0},"interactivity":{"disable":true},"installBehavior":{' +
         '"skipDependencies":false,"requirements":{' + $Requirements + '}},"experimentalFeatures":{"resume":false}}'
     return Get-Sha256Bytes ([Text.Encoding]::UTF8.GetBytes($Settings))
+}
+
+function Read-WinGetModuleLock([byte[]]$Bytes) {
+    $Lines = ConvertFrom-CanonicalAsciiBytes $Bytes 1048576 "winget_module_lock"
+    if ($Lines.Count -lt 10 -or $Lines[0] -cne "winget-module-lock|1" -or
+        $Lines[-1] -cne "end-lock|") { throw "invalid_winget_module_lock" }
+    $Scalar = [ordered]@{}; $Files = [ordered]@{}; $Signatures = [ordered]@{}
+    foreach ($Line in @($Lines | Select-Object -Skip 1 | Select-Object -SkipLast 1)) {
+        $Parts = $Line.Split('|')
+        if ($Parts.Count -lt 2) { throw "invalid_winget_module_lock" }
+        switch -CaseSensitive ($Parts[0]) {
+            { $_ -cin @("module", "version", "package-url", "package-sha256") } {
+                if ($Parts.Count -ne 2 -or $Scalar.Contains($_)) { throw "invalid_winget_module_lock" }
+                $Scalar[$_] = $Parts[1]
+            }
+            "manifest" {
+                if ($Parts.Count -ne 3 -or $Scalar.Contains("manifest") -or -not (Test-Digest $Parts[2])) {
+                    throw "invalid_winget_module_lock"
+                }
+                $Scalar.manifest = $Parts[1]; $Scalar.'manifest-sha256' = $Parts[2]
+            }
+            "signature" {
+                if ($Parts.Count -ne 3 -or $Parts[2] -cne "Microsoft Corporation" -or
+                    $Signatures.Contains($Parts[1])) { throw "invalid_winget_module_lock" }
+                $Signatures[$Parts[1]] = $Parts[2]
+            }
+            "file" {
+                if ($Parts.Count -ne 3 -or $Files.Contains($Parts[1]) -or -not (Test-Digest $Parts[2])) {
+                    throw "invalid_winget_module_lock"
+                }
+                $Files[$Parts[1]] = $Parts[2]
+            }
+            default { throw "invalid_winget_module_lock" }
+        }
+    }
+    foreach ($Name in @("module", "version", "package-url", "package-sha256", "manifest", "manifest-sha256")) {
+        if (-not $Scalar.Contains($Name)) { throw "invalid_winget_module_lock" }
+    }
+    if ($Scalar.module -cne "Microsoft.WinGet.Client" -or $Scalar.version -cne "1.29.280" -or
+        -not (Test-Digest $Scalar.'package-sha256') -or $Scalar.manifest -cne "Microsoft.WinGet.Client.psd1" -or
+        $Files.Count -lt 1 -or -not $Files.Contains($Scalar.manifest) -or
+        $Files[$Scalar.manifest] -cne $Scalar.'manifest-sha256') { throw "invalid_winget_module_lock" }
+    foreach ($Path in @($Files.Keys) + @($Signatures.Keys)) {
+        if ($Path -notmatch '^[A-Za-z0-9._/\[\]-]+$' -or $Path.Contains('\') -or
+            [IO.Path]::IsPathRooted($Path) -or $Path -match '(^|/)\.\.?(?:/|$)' -or
+            ($Signatures.Contains($Path) -and -not $Files.Contains($Path))) {
+            throw "invalid_winget_module_lock"
+        }
+    }
+    return [pscustomobject]@{ Module = $Scalar.module; Version = $Scalar.version
+        Manifest = $Scalar.manifest; Files = $Files; Signatures = $Signatures }
+}
+
+function Open-ProtectedWinGetModule([string]$Root, [object]$Generation, [switch]$Import) {
+    $Lock = Read-WinGetModuleLock ([IO.File]::ReadAllBytes($Generation.Files.ProviderLock))
+    $ModuleRoot = Join-Path $Generation.Root "winget/Microsoft.WinGet.Client"
+    Assert-NonReparsePath $ModuleRoot $Root
+    $Observed = [ordered]@{}
+    foreach ($Path in [IO.Directory]::EnumerateFiles($ModuleRoot, "*", [IO.SearchOption]::AllDirectories)) {
+        Assert-NonReparsePath $Path $Root
+        $Relative = [IO.Path]::GetRelativePath($ModuleRoot, $Path).Replace('\', '/')
+        if ($Observed.Contains($Relative)) { throw "winget_module_file_set_mismatch" }
+        $Observed[$Relative] = Get-HeldFileSha256 $Path 268435456
+    }
+    if ($Observed.Count -ne $Lock.Files.Count) { throw "winget_module_file_set_mismatch" }
+    foreach ($Entry in $Lock.Files.GetEnumerator()) {
+        if (-not $Observed.Contains($Entry.Key) -or $Observed[$Entry.Key] -cne $Entry.Value) {
+            throw "winget_module_file_hash_mismatch"
+        }
+    }
+    $FileSetBytes = ConvertTo-CanonicalAsciiBytes (@("winget-module-files|1") + @(
+        $Lock.Files.GetEnumerator() | ForEach-Object { "file|$($_.Key)|$($_.Value)" }) + @("end-files|"))
+    $IdentityBytes = ConvertTo-CanonicalAsciiBytes (@("winget-module-publishers|1") + @(
+        $Lock.Signatures.GetEnumerator() | ForEach-Object { "signature|$($_.Key)|$($_.Value)" }) + @("end-publishers|"))
+    $FileSetSha256 = Get-Sha256Bytes $FileSetBytes
+    $IdentitySha256 = Get-Sha256Bytes $IdentityBytes
+    if ($Generation.ProviderContext.DeploymentFileSetSha256 -cne $FileSetSha256 -or
+        $Generation.ProviderContext.AppInstallerIdentitySha256 -cne $IdentitySha256) {
+        throw "deployment_identity_drift"
+    }
+    $ManifestPath = Join-Path $ModuleRoot $Lock.Manifest
+    if ($Import) {
+        Remove-Module -Name $Lock.Module -Force -ErrorAction SilentlyContinue
+        Import-Module -Name $ManifestPath -Force -ErrorAction Stop
+        $Loaded = @(Get-Module -Name $Lock.Module)
+        if ($Loaded.Count -ne 1 -or [string]$Loaded[0].Version -cne $Lock.Version -or
+            -not [IO.Path]::GetFullPath($Loaded[0].Path).Equals([IO.Path]::GetFullPath($ManifestPath),
+                [StringComparison]::OrdinalIgnoreCase)) { throw "winget_module_identity_drift" }
+        $Sources = @(Microsoft.WinGet.Client\Get-WinGetSource -Name $Generation.ProviderContext.SourceName -ErrorAction Stop)
+        if ($Sources.Count -ne 1 -or $Sources[0].Name -cne $Generation.ProviderContext.SourceName -or
+            $Sources[0].Type -cne $Generation.ProviderContext.SourceType -or
+            $Sources[0].Argument -cne $Generation.ProviderContext.SourceArgument -or
+            (Get-Sha256Utf8Text ([string]$Sources[0].Argument)) -cne
+                $Generation.ProviderContext.SourceArgumentSha256 -or
+            ([string]$Sources[0].TrustLevel).ToLowerInvariant() -cne $Generation.ProviderContext.SourceTrust -or
+            ([bool]$Sources[0].Explicit).ToString().ToLowerInvariant() -cne
+                $Generation.ProviderContext.SourceExplicit) { throw "winget_source_evidence_mismatch" }
+    }
+    return [pscustomobject]@{ Lock = $Lock; ManifestPath = $ManifestPath; FileSetSha256 = $FileSetSha256
+        IdentitySha256 = $IdentitySha256; Version = $Lock.Version }
+}
+
+function Get-WinGetModuleConstraint([object]$Request, [object]$Generation) {
+    if ($Request.Fields.'action-id' -ceq "winget.inventory-machine.v1") { return $null }
+    [void](Get-WinGetExpectedSettingsSha256 $Request $Generation)
+    $Prefix = if ($Request.Fields.'action-id' -ceq "winget.install-machine-package.v1") {
+        "winget-install"
+    } elseif ($Request.Fields.'action-id' -ceq "winget.upgrade-machine-package.v1") {
+        "winget-upgrade"
+    } else { throw "invalid_winget_action" }
+    $Matches = @(ConvertFrom-CanonicalAsciiBytes ([IO.File]::ReadAllBytes($Generation.Files.Constraints)) `
+        4194304 "constraints" | Where-Object {
+            $Parts = $_.Split('|'); $Parts.Count -ge 3 -and $Parts[0] -ceq $Prefix -and
+                $Parts[1] -ceq $Request.Fields.'action-id' -and $Parts[2] -ceq $Request.Fields.'policy-token'
+        })
+    if ($Matches.Count -ne 1) { throw "invalid_winget_constraints" }
+    $Fields = $Matches[0].Split('|')
+    if ($Fields[8] -ceq "neutral") { throw "unsupported_architecture" }
+    if ($Fields[10].Contains(',')) { throw "unsupported_installer_type_set" }
+    return $Fields
+}
+
+function Get-WinGetSourceStateSha256([object]$Context) {
+    return Get-Sha256Bytes (ConvertTo-CanonicalAsciiBytes @(
+        "source-state|2", "source|$($Context.SourceId)|$($Context.SourceName)|$($Context.SourceType)|" +
+            "$($Context.SourceArgumentSha256)|$($Context.SourceOrigin)|$($Context.SourceTrust)|$($Context.SourceExplicit)",
+        "end-source-state|"))
+}
+
+function Get-WinGetPackageStateSha256([string]$PackageId, [string]$InstalledVersion,
+    [string]$CandidateVersion, [string]$Architecture, [string]$Locale, [string]$InstallerType,
+    [string]$SourceStateSha256) {
+    foreach ($Value in @($PackageId, $InstalledVersion, $CandidateVersion, $Architecture, $Locale, $InstallerType)) {
+        if (-not (Test-ResultAtomOrDash $Value)) { throw "invalid_winget_package_state" }
+    }
+    if (-not (Test-Digest $SourceStateSha256)) { throw "invalid_winget_package_state" }
+    return Get-Sha256Bytes (ConvertTo-CanonicalAsciiBytes @(
+        "winget-package-state|1",
+        "package|$PackageId|$InstalledVersion|$CandidateVersion|machine|$Architecture|$Locale|$InstallerType",
+        "source-state-sha256|$SourceStateSha256", "end-package-state|"))
+}
+
+function Resolve-WinGetModulePackage([object]$Generation, [string[]]$Constraint) {
+    $Id = $Constraint[3]; $Source = $Constraint[4]
+    $Found = @(Microsoft.WinGet.Client\Find-WinGetPackage -Id $Id -Source $Source `
+        -MatchOption EqualsCaseInsensitive -ErrorAction Stop)
+    if ($Found.Count -ne 1 -or $Found[0].Id -cne $Id -or $Found[0].Source -cne $Source) {
+        throw "ambiguous_package"
+    }
+    $Installed = @(Microsoft.WinGet.Client\Get-WinGetPackage -Id $Id -Source $Source `
+        -MatchOption EqualsCaseInsensitive -ErrorAction Stop)
+    if ($Installed.Count -gt 1 -or ($Installed.Count -eq 1 -and $Installed[0].Id -cne $Id)) {
+        throw "installed_state_drift"
+    }
+    $InstalledVersion = if ($Installed.Count -eq 1) { [string]$Installed[0].InstalledVersion } else { "-" }
+    if ($Constraint[0] -ceq "winget-install") {
+        $Candidate = $Constraint[11]
+        if ($Found[0].AvailableVersions -cnotcontains $Candidate) { throw "unsupported_version" }
+    } else {
+        if ($Installed.Count -ne 1) { throw "package_state_drift" }
+        $Candidate = $null; $SelectedInfo = $null
+        foreach ($Version in @($Found[0].AvailableVersions)) {
+            if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9.+:_~-]{0,127}$') { continue }
+            $Info = $Found[0].GetPackageVersionInfo($Version)
+            if ($Info.CompareToVersion($Constraint[11]) -ceq "Lesser" -or
+                $Info.CompareToVersion($Constraint[12]) -ceq "Greater") { continue }
+            [int]$Major = 0
+            if ($Version -notmatch '^([0-9]{1,10})(?:[.+:_~-]|$)' -or
+                -not [int]::TryParse($Matches[1], [ref]$Major) -or $Major -gt [int]$Constraint[13]) { continue }
+            if ($null -eq $SelectedInfo -or $SelectedInfo.CompareToVersion($Version) -ceq "Lesser") {
+                $Candidate = $Version; $SelectedInfo = $Info
+            }
+        }
+        if ($null -eq $Candidate -or $Installed[0].CompareToVersion($Candidate) -cne "Lesser") {
+            throw "unsupported_version"
+        }
+    }
+    $SourceState = Get-WinGetSourceStateSha256 $Generation.ProviderContext
+    $PreState = Get-WinGetPackageStateSha256 $Id $InstalledVersion $Candidate $Constraint[8] `
+        $Constraint[9] $Constraint[10] $SourceState
+    return [pscustomobject]@{ Found = $Found[0]; InstalledVersion = $InstalledVersion
+        CandidateVersion = $Candidate; PreStateSha256 = $PreState; SourceStateSha256 = $SourceState }
+}
+
+function Get-WinGetModulePrecondition([string]$Root, [object]$Request, [object]$Generation) {
+    [void](Open-ProtectedWinGetModule $Root $Generation -Import)
+    $Constraint = Get-WinGetModuleConstraint $Request $Generation
+    if ($null -eq $Constraint) { return Get-WinGetSourceStateSha256 $Generation.ProviderContext }
+    return (Resolve-WinGetModulePackage $Generation $Constraint).PreStateSha256
+}
+
+function Invoke-WinGetModuleOperation([string]$Root, [object]$Request, [object]$Generation,
+    [ref]$LaunchCommitted) {
+    $Attestation = Open-ProtectedWinGetModule $Root $Generation -Import
+    $Context = $Generation.ProviderContext
+    $Constraint = Get-WinGetModuleConstraint $Request $Generation
+    $Packages = New-Object Collections.Generic.List[string]
+    $SourceState = Get-WinGetSourceStateSha256 $Context
+    $PreState = $SourceState; $PostState = $SourceState
+    $ProviderStatus = "not-applicable"; $ExtendedError = "-"; $InstallerError = "-"
+    $RebootRequired = $false; $State = "completed"; $Reason = "inventory_verified"
+    if ($null -eq $Constraint) {
+        $ConstraintLines = ConvertFrom-CanonicalAsciiBytes ([IO.File]::ReadAllBytes($Generation.Files.Constraints)) `
+            4194304 "constraints"
+        $Seen = @{}; $Index = 0
+        foreach ($Line in $ConstraintLines) {
+            $Fields = $Line.Split('|')
+            if ($Fields.Count -lt 11 -or $Fields[0] -cnotin @("winget-install", "winget-upgrade")) { continue }
+            $Key = "$($Fields[3])|$($Fields[4])"
+            if ($Seen.ContainsKey($Key)) { continue }; $Seen[$Key] = $true
+            $Installed = @(Microsoft.WinGet.Client\Get-WinGetPackage -Id $Fields[3] -Source $Fields[4] `
+                -MatchOption EqualsCaseInsensitive -ErrorAction Stop)
+            if ($Installed.Count -gt 1) { throw "installed_state_drift" }
+            if ($Installed.Count -eq 1) {
+                foreach ($Value in @($Fields[3], [string]$Installed[0].InstalledVersion)) {
+                    if (-not (Test-ResultAtomOrDash $Value)) { throw "invalid_winget_inventory" }
+                }
+                [void]$Packages.Add("package|$Index|-|$($Fields[3])|$($Installed[0].InstalledVersion)|-|machine|-|-|-|-")
+                [void]$Packages.Add("post-package|$Index|$($Installed[0].InstalledVersion)|machine")
+                $Index++
+            }
+        }
+    } else {
+        $Resolution = Resolve-WinGetModulePackage $Generation $Constraint
+        $PreState = $Resolution.PreStateSha256
+        if ($Request.Fields.'precondition-sha256' -cne $PreState) { throw "invalid_precondition" }
+        $Parameters = [ordered]@{
+            Id = $Constraint[3]; Version = $Resolution.CandidateVersion; Source = $Constraint[4]
+            MatchOption = "EqualsCaseInsensitive"; Scope = "System"; Architecture = $Constraint[8]
+            Locale = $Constraint[9]; InstallerType = $Constraint[10]; Mode = "Silent"
+            Confirm = $false; ErrorAction = "Stop"
+        }
+        $LaunchCommitted.Value = $true
+        $Mutation = if ($Constraint[0] -ceq "winget-install") {
+            @(Microsoft.WinGet.Client\Install-WinGetPackage @Parameters)
+        } else { @(Microsoft.WinGet.Client\Update-WinGetPackage @Parameters) }
+        if ($Mutation.Count -ne 1 -or $Mutation[0].Id -cne $Constraint[3] -or
+            $Mutation[0].Source -cne $Constraint[4]) { throw "provider_failure" }
+        $ProviderStatus = ([string]$Mutation[0].Status).ToLowerInvariant()
+        $InstallerError = ([uint32]$Mutation[0].InstallerErrorCode).ToString(
+            [Globalization.CultureInfo]::InvariantCulture)
+        $ExtendedError = "0x" + ([uint32]$Mutation[0].ExtendedErrorCode.HResult).ToString("x8")
+        $RebootRequired = [bool]$Mutation[0].RebootRequired
+        if (-not $Mutation[0].Succeeded()) { throw "provider_failure" }
+        $Post = @(Microsoft.WinGet.Client\Get-WinGetPackage -Id $Constraint[3] -Source $Constraint[4] `
+            -MatchOption EqualsCaseInsensitive -ErrorAction Stop)
+        $PostVersion = if ($Post.Count -eq 1) { [string]$Post[0].InstalledVersion } else { "-" }
+        $PostState = Get-WinGetPackageStateSha256 $Constraint[3] $PostVersion `
+            $Resolution.CandidateVersion $Constraint[8] $Constraint[9] $Constraint[10] $SourceState
+        if ($PostVersion -cne $Resolution.CandidateVersion) {
+            $State = "partial"; $Reason = "post_state_unverified"
+        } elseif ($RebootRequired) {
+            $State = "partial"; $Reason = "reboot_required"
+        } else { $Reason = "post_state_verified" }
+        [void]$Packages.Add("package|0|$($Request.Fields.'policy-token')|$($Constraint[3])|" +
+            "$($Resolution.InstalledVersion)|$($Resolution.CandidateVersion)|machine|$($Constraint[8])|" +
+            "$($Constraint[9])|$($Constraint[10])|-")
+        [void]$Packages.Add("post-package|0|$PostVersion|machine")
+    }
+    $SourceLine = "source|$($Context.SourceId)|$($Context.SourceName)|$($Context.SourceType)|" +
+        "$($Context.SourceArgumentSha256)|$($Context.SourceOrigin)|$($Context.SourceTrust)|" +
+        "$($Context.SourceExplicit)|$($Context.SourceLastUpdateMinimum)"
+    $Lines = @(
+        "winget-helper-result|1", "request-id|$($Request.Fields.'request-id')",
+        "action-id|$($Request.Fields.'action-id')", "state|$State", "reason|$Reason",
+        "provider-lock-sha256|$($Generation.Digests.ProviderLock)",
+        "deployment-file-set-sha256|$($Attestation.FileSetSha256)",
+        "app-installer-identity-sha256|$($Attestation.IdentitySha256)",
+        "provider-version|$($Attestation.Version)", "state-identifier-sha256|-",
+        "provider-runtime-roots-sha256|$($Attestation.FileSetSha256)", "settings-sha256|-", $SourceLine,
+        "dependency-authority|module-managed", "installer-hash-authority|module-default-manifest-hash",
+        "dependency-closure|not-exposed-by-module", "dependency-provenance|not-exposed-by-module",
+        "windows-features|module-managed", "package-count|$([int]($Packages.Count / 2))"
+    ) + @($Packages) + @(
+        "provider-status|$ProviderStatus", "provider-extended-error|$ExtendedError",
+        "provider-installer-error|$InstallerError", "reboot-required|$($RebootRequired.ToString().ToLowerInvariant())",
+        "pre-state-sha256|$PreState", "post-state-sha256|$PostState", "end-result|")
+    $Bytes = ConvertTo-CanonicalAsciiBytes $Lines
+    return [pscustomobject]@{ State = $State; Reason = $Reason; Bytes = $Bytes
+        Sha256 = Get-Sha256Bytes $Bytes }
 }
 
 function Read-WinGetSourceEvidence([string]$Line, [object]$ProviderContext, [bool]$AllowAbsent) {
@@ -1463,12 +1744,20 @@ function Read-WinGetProvisionResult([byte[]]$Bytes, [object]$ProvisionRequest,
     }
     $Source = Read-WinGetSourceEvidence $Lines[12] $Generation.ProviderContext ($Fields.state -cne "completed")
     if ($Fields.state -ceq "completed") {
-        foreach ($Name in @($Expected.Keys) + @('provider-runtime-roots-sha256')) {
-            if ($Fields[$Name] -ceq "-") { throw "winget_provision_result_binding_mismatch" }
-        }
-        if ($Fields.reason -cne "provider_state_provisioned") {
-            throw "winget_provision_result_binding_mismatch"
-        }
+        if ($Fields.reason -ceq "module_state_verified") {
+            if ($Fields.'state-identifier-sha256' -cne "-" -or $Fields.'settings-sha256' -cne "-" -or
+                $Fields.'provider-runtime-roots-sha256' -cne $Fields.'deployment-file-set-sha256') {
+                throw "winget_provision_result_binding_mismatch"
+            }
+            foreach ($Name in @('generation-sha256', 'provider-lock-sha256',
+                'deployment-file-set-sha256', 'app-installer-identity-sha256', 'provider-version')) {
+                if ($Fields[$Name] -ceq "-") { throw "winget_provision_result_binding_mismatch" }
+            }
+        } elseif ($Fields.reason -ceq "provider_state_provisioned") {
+            foreach ($Name in @($Expected.Keys) + @('provider-runtime-roots-sha256')) {
+                if ($Fields[$Name] -ceq "-") { throw "winget_provision_result_binding_mismatch" }
+            }
+        } else { throw "winget_provision_result_binding_mismatch" }
     }
     return [pscustomobject]@{ State = [string]$Fields.state; Reason = [string]$Fields.reason
         Fields = $Fields; SourceLine = $Lines[12]; Source = $Source; Bytes = $Bytes
@@ -1689,13 +1978,22 @@ function Invoke-WinGetProvisionMarker([string]$Root, [string]$StateRoot, [string
         }
         $ClaimBytes = $Claim.Bytes
     } finally { $Claim.Stream.Dispose() }
-    $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-    if ($Architecture -cnotin @("x64", "arm64")) { throw "unsupported_architecture" }
-    $HelperPath = Join-Path $Generation.Root "winget/win-$Architecture/MachineUtilities.WinGetBroker.exe"
-    Assert-NonReparsePath $HelperPath $Root
-    $Native = Invoke-FixedProcess $HelperPath @("provision") $ClaimBytes
-    $Result = Read-WinGetProvisionResult $Native.Bytes $Provision $Generation $Native.ExitCode
-    Write-AtomicBytes $ReceiptPath $Native.Bytes
+    $Attestation = Open-ProtectedWinGetModule $Root $Generation -Import
+    $Context = $Generation.ProviderContext
+    $SourceLine = "source|$($Context.SourceId)|$($Context.SourceName)|$($Context.SourceType)|" +
+        "$($Context.SourceArgumentSha256)|$($Context.SourceOrigin)|$($Context.SourceTrust)|" +
+        "$($Context.SourceExplicit)|$($Context.SourceLastUpdateMinimum)"
+    $ReceiptBytes = ConvertTo-CanonicalAsciiBytes @(
+        "winget-provider-provision-result|1", "state|completed", "reason|module_state_verified",
+        "enrollment-epoch|$($Provision.Epoch)", "generation-sha256|$($Generation.GenerationDigest)",
+        "provider-lock-sha256|$($Generation.Digests.ProviderLock)",
+        "deployment-file-set-sha256|$($Attestation.FileSetSha256)",
+        "app-installer-identity-sha256|$($Attestation.IdentitySha256)",
+        "provider-version|$($Attestation.Version)", "state-identifier-sha256|-",
+        "provider-runtime-roots-sha256|$($Attestation.FileSetSha256)", "settings-sha256|-",
+        $SourceLine, "end-provision-result|")
+    $Result = Read-WinGetProvisionResult $ReceiptBytes $Provision $Generation 0
+    Write-AtomicBytes $ReceiptPath $ReceiptBytes
     Protect-BrokerPath $ReceiptPath
     if ($IsWindows) { Assert-ExactSddl $ReceiptPath $script:ProtectedFileSddl }
     return $Result
@@ -3671,23 +3969,11 @@ function Invoke-BrokerReadinessProbes {
     $ActionRows = New-Object Collections.Generic.List[string]
     $ProfileRows = New-Object Collections.Generic.List[string]
     if ($WinGetBindings.Count -gt 0) {
-        $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-        if ($Architecture -cnotin @("x64", "arm64")) { throw "unsupported_architecture" }
-        $HelperPath = Join-Path $Generation.Root "winget/win-$Architecture/MachineUtilities.WinGetBroker.exe"
-        Assert-NonReparsePath $HelperPath $Root
-        $ProvisionRequest = New-ReadinessProbeRequest $Request $Generation $WinGetBindings[0].Action `
-            $WinGetBindings[0].Token "windows-system-v1" $script:EmptySha256
-        [void](Get-WinGetProvisionReceipt $Root $StateRoot $ProvisionRequest $Generation)
         foreach ($Binding in $WinGetBindings) {
             $ProbeRequest = New-ReadinessProbeRequest $Request $Generation $Binding.Action $Binding.Token `
                 $Binding.Context $script:EmptySha256
-            # This validates the exact protected action/token constraint before the
-            # helper receives its fixed, empty-precondition request.
-            [void](Get-WinGetExpectedSettingsSha256 $ProbeRequest $Generation)
-            $Native = Invoke-FixedProcess $HelperPath @("probe") `
-                (Get-HelperRequestBytes $ProbeRequest $Generation.Digests.ProviderLock)
-            $Probe = Read-WinGetPreconditionProbe $Native.Bytes $ProbeRequest $Native.ExitCode
-            [void]$ActionRows.Add("action|$($Binding.Action)|$($Binding.Context)|$($Binding.Token)|$($Probe.PreconditionSha256)")
+            $Precondition = Get-WinGetModulePrecondition $Root $ProbeRequest $Generation
+            [void]$ActionRows.Add("action|$($Binding.Action)|$($Binding.Context)|$($Binding.Token)|$Precondition")
         }
     }
     $ProfileRowsByToken = @{}
@@ -4861,33 +5147,19 @@ try {
     }
     $Action = $Request.Fields.'action-id'
     if ($Action.StartsWith("winget.", [StringComparison]::Ordinal)) {
-        $Mode = if ($Action -ceq "winget.inventory-machine.v1") { "inventory" } elseif (
-            $Action -ceq "winget.install-machine-package.v1") { "install" } else { "upgrade" }
-        $Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-        if ($Architecture -cnotin @("x64", "arm64")) { throw "unsupported_architecture" }
-        $HelperPath = Join-Path $Generation.Root "winget/win-$Architecture/MachineUtilities.WinGetBroker.exe"
-        Assert-NonReparsePath $HelperPath $Root
-        $ProvisionReceipt = Get-WinGetProvisionReceipt $Root $StateRoot $Request $Generation
-        $HelperInput = Get-HelperRequestBytes $Request $Generation.Digests.ProviderLock
-        Write-Journal $ClaimRoot $JournalRoot $Request "executing" "native_launch_pending" @{}
-        Write-PublicResult $PublicRoot "active" $Request "executing" "native_launch_pending"
-        $LiveIdentityPath = Join-Path $ClaimRoot "live.identity"
-        $StableJobName = "Global\MachineUtilitiesBroker-$($Request.Fields.'request-id')"
-        $Native = Invoke-FixedProcess $HelperPath @($Mode) $HelperInput `
-            -LiveIdentityPath $LiveIdentityPath -StableJobName $StableJobName `
-            -LifecycleRequest $Request -ClaimRoot $ClaimRoot -JournalRoot $JournalRoot `
-            -PublicRoot $PublicRoot -LaunchCommitted ([ref]$NativeCommitted)
-        Write-Journal $ClaimRoot $JournalRoot $Request "verifying" "native_result_received" @{}
-        $Result = Read-HelperResult $Native.Bytes $Request $Generation $ProvisionReceipt $Native.ExitCode
-        $StateDigest = Get-Sha256Text ("exit-code|$($Native.ExitCode)`n")
+        Write-Journal $ClaimRoot $JournalRoot $Request "executing" "module_operation_pending" @{}
+        Write-PublicResult $PublicRoot "active" $Request "executing" "module_operation_pending"
+        $Result = Invoke-WinGetModuleOperation $Root $Request $Generation ([ref]$NativeCommitted)
+        Write-Journal $ClaimRoot $JournalRoot $Request "verifying" "module_result_received" @{}
+        $StateDigest = Get-Sha256Text ("state|$($Result.State)`n")
         Write-Journal $ClaimRoot $JournalRoot $Request $Result.State $Result.Reason @{
             state = $StateDigest; result = $Result.Sha256 }
         $Terminalized = $true
         Write-PublicResult $PublicRoot "last" $Request $Result.State $Result.Reason `
             (Get-HeldFileSha256 (Join-Path $ClaimRoot "journal") 65536)
         if ([IO.File]::Exists((Join-Path $PublicRoot "active"))) { [IO.File]::Delete((Join-Path $PublicRoot "active")) }
-        [Console]::OpenStandardOutput().Write($Native.Bytes, 0, $Native.Bytes.Count)
-        if ($Native.ExitCode -ne 0) { exit 70 }
+        [Console]::OpenStandardOutput().Write($Result.Bytes, 0, $Result.Bytes.Count)
+        if ($Result.State -cne "completed") { exit 70 }
     } else {
         $Authorization = Get-ProfileAuthorization $Generation $Request ([IO.File]::ReadAllBytes((Join-Path $ClaimRoot "payload")) )
         Assert-ProfileTask $Authorization.TargetSid $ProgramData

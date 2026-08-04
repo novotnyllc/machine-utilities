@@ -186,24 +186,101 @@ function Read-ReleaseFiles([byte[]]$Bytes) {
         "scripts/privilege-broker-windows.ps1", "scripts/profile-worker-windows.ps1",
         "scripts/enroll-privilege-windows.ps1", "scripts/register-profile-task-windows.ps1",
         "generation/policy.actions", "generation/policy.constraints", "generation/winget.context",
-        "generation/windows-winget-provider.lock",
-        "generation/winget/win-x64/MachineUtilities.WinGetBroker.exe",
-        "generation/winget/win-x64/MachineUtilities.WinGetBroker.deps.json",
-        "generation/winget/win-x64/MachineUtilities.WinGetBroker.runtimeconfig.json",
-        "generation/winget/win-x64/Microsoft.Management.Deployment.dll",
-        "generation/winget/win-x64/Microsoft.Management.Deployment.dll.manifest",
-        "generation/winget/win-x64/Microsoft.Management.Deployment.winmd",
-        "generation/winget/win-x64/WindowsPackageManager.dll",
-        "generation/winget/win-arm64/MachineUtilities.WinGetBroker.exe",
-        "generation/winget/win-arm64/MachineUtilities.WinGetBroker.deps.json",
-        "generation/winget/win-arm64/MachineUtilities.WinGetBroker.runtimeconfig.json",
-        "generation/winget/win-arm64/Microsoft.Management.Deployment.dll",
-        "generation/winget/win-arm64/Microsoft.Management.Deployment.dll.manifest",
-        "generation/winget/win-arm64/Microsoft.Management.Deployment.winmd",
-        "generation/winget/win-arm64/WindowsPackageManager.dll")) {
+        "generation/windows-winget-provider.lock")) {
         if (-not $Seen.ContainsKey($Required)) { throw "missing_release_file" }
     }
     return [pscustomobject]@{ Files = $Files; Digest = Get-Sha256Bytes $Bytes }
+}
+
+function Read-WinGetModuleLock([byte[]]$Bytes) {
+    $Lines = ConvertFrom-CanonicalAsciiBytes $Bytes 1048576 "winget_module_lock"
+    if ($Lines.Count -lt 10 -or $Lines[0] -cne "winget-module-lock|1" -or
+        $Lines[-1] -cne "end-lock|") { throw "invalid_winget_module_lock" }
+    $Scalar = [ordered]@{}; $Files = [ordered]@{}; $Signatures = [ordered]@{}
+    foreach ($Line in @($Lines | Select-Object -Skip 1 | Select-Object -SkipLast 1)) {
+        $Parts = $Line.Split('|')
+        if ($Parts.Count -lt 2) { throw "invalid_winget_module_lock" }
+        switch -CaseSensitive ($Parts[0]) {
+            { $_ -cin @("module", "version", "package-url", "package-sha256") } {
+                if ($Parts.Count -ne 2 -or $Scalar.Contains($_)) { throw "invalid_winget_module_lock" }
+                $Scalar[$_] = $Parts[1]
+            }
+            "manifest" {
+                if ($Parts.Count -ne 3 -or $Scalar.Contains("manifest") -or -not (Test-Digest $Parts[2])) {
+                    throw "invalid_winget_module_lock"
+                }
+                $Scalar.manifest = $Parts[1]; $Scalar.'manifest-sha256' = $Parts[2]
+            }
+            "signature" {
+                if ($Parts.Count -ne 3 -or $Parts[2] -cne "Microsoft Corporation" -or
+                    $Signatures.Contains($Parts[1])) { throw "invalid_winget_module_lock" }
+                $Signatures[$Parts[1]] = $Parts[2]
+            }
+            "file" {
+                if ($Parts.Count -ne 3 -or $Files.Contains($Parts[1]) -or -not (Test-Digest $Parts[2])) {
+                    throw "invalid_winget_module_lock"
+                }
+                $Files[$Parts[1]] = $Parts[2]
+            }
+            default { throw "invalid_winget_module_lock" }
+        }
+    }
+    foreach ($Name in @("module", "version", "package-url", "package-sha256", "manifest", "manifest-sha256")) {
+        if (-not $Scalar.Contains($Name)) { throw "invalid_winget_module_lock" }
+    }
+    if ($Scalar.module -cne "Microsoft.WinGet.Client" -or $Scalar.version -cne "1.29.280" -or
+        $Scalar.'package-url' -cne "https://www.powershellgallery.com/api/v2/package/Microsoft.WinGet.Client/1.29.280" -or
+        -not (Test-Digest $Scalar.'package-sha256') -or
+        $Scalar.manifest -cne "Microsoft.WinGet.Client.psd1" -or $Files.Count -lt 1 -or
+        -not $Files.Contains($Scalar.manifest) -or
+        $Files[$Scalar.manifest] -cne $Scalar.'manifest-sha256') { throw "invalid_winget_module_lock" }
+    foreach ($Path in @($Files.Keys) + @($Signatures.Keys)) {
+        if ($Path -notmatch '^[A-Za-z0-9._/\[\]-]+$' -or $Path.Contains('\') -or
+            [IO.Path]::IsPathRooted($Path) -or $Path -match '(^|/)\.\.?(?:/|$)' -or
+            ($Signatures.Contains($Path) -and -not $Files.Contains($Path))) {
+            throw "invalid_winget_module_lock"
+        }
+    }
+    return [pscustomobject]@{ Module = $Scalar.module; Version = $Scalar.version
+        PackageUrl = $Scalar.'package-url'; PackageSha256 = $Scalar.'package-sha256'
+        Manifest = $Scalar.manifest; Files = $Files; Signatures = $Signatures }
+}
+
+function Install-ProtectedWinGetModule([string]$GenerationStage, [string]$TransactionRoot) {
+    $LockPath = Join-Path $GenerationStage "windows-winget-provider.lock"
+    $Lock = Read-WinGetModuleLock (Read-HeldBytes $LockPath 1048576)
+    $Scratch = Join-Path $TransactionRoot "winget-module"
+    if ([IO.Directory]::Exists($Scratch)) { [IO.Directory]::Delete($Scratch, $true) }
+    [void][IO.Directory]::CreateDirectory($Scratch)
+    $Archive = Join-Path $Scratch "Microsoft.WinGet.Client.zip"
+    $Expanded = Join-Path $Scratch "expanded"
+    Invoke-WebRequest -Uri $Lock.PackageUrl -OutFile $Archive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+        $Lock.PackageSha256) { throw "winget_module_package_hash_mismatch" }
+    Expand-Archive -LiteralPath $Archive -DestinationPath $Expanded
+    $Observed = [ordered]@{}
+    foreach ($Path in [IO.Directory]::EnumerateFiles($Expanded, "*", [IO.SearchOption]::AllDirectories)) {
+        $Relative = [IO.Path]::GetRelativePath($Expanded, $Path).Replace('\', '/')
+        if ($Observed.Contains($Relative)) { throw "winget_module_file_set_mismatch" }
+        $Observed[$Relative] = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    if ($Observed.Count -ne $Lock.Files.Count) { throw "winget_module_file_set_mismatch" }
+    foreach ($Entry in $Lock.Files.GetEnumerator()) {
+        if (-not $Observed.Contains($Entry.Key) -or $Observed[$Entry.Key] -cne $Entry.Value) {
+            throw "winget_module_file_hash_mismatch"
+        }
+    }
+    foreach ($Relative in $Lock.Signatures.Keys) {
+        $Signature = Get-AuthenticodeSignature -FilePath (Join-Path $Expanded $Relative)
+        if ($Signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $Signature.SignerCertificate -or
+            $Signature.SignerCertificate.Subject -notmatch '(^|, )O=Microsoft Corporation(,|$)') {
+            throw "winget_module_signature_invalid"
+        }
+    }
+    $Destination = Join-Path $GenerationStage "winget/Microsoft.WinGet.Client"
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Destination))
+    [IO.Directory]::Move($Expanded, $Destination)
 }
 
 function Get-ProfileRootIdentityRecord([string]$Sid, [string]$FinalPath, [uint32]$VolumeSerial, [uint64]$FileId) {
@@ -1440,11 +1517,23 @@ function Read-WinGetProvisionReceipt([byte[]]$Bytes, [object]$Manifest, [string]
         }
     }
     if ($Fields.state -ceq "completed") {
-        foreach ($Name in $Expected.Keys) {
-            if ($Fields[$Name] -cne $Expected[$Name]) { throw "winget_provision_result_binding_mismatch" }
-        }
-        if (-not (Test-Digest $Fields.'provider-runtime-roots-sha256')) { throw "winget_provision_result_binding_mismatch" }
-        if ($Fields.reason -cne "provider_state_provisioned") { throw "winget_provision_result_binding_mismatch" }
+        if ($Fields.reason -ceq "module_state_verified") {
+            if ($Fields.'state-identifier-sha256' -cne "-" -or $Fields.'settings-sha256' -cne "-" -or
+                $Fields.'provider-runtime-roots-sha256' -cne $Fields.'deployment-file-set-sha256') {
+                throw "winget_provision_result_binding_mismatch"
+            }
+            foreach ($Name in @('generation-sha256', 'provider-lock-sha256',
+                'deployment-file-set-sha256', 'app-installer-identity-sha256', 'provider-version')) {
+                if ($Fields[$Name] -ceq "-") { throw "winget_provision_result_binding_mismatch" }
+            }
+        } elseif ($Fields.reason -ceq "provider_state_provisioned") {
+            foreach ($Name in $Expected.Keys) {
+                if ($Fields[$Name] -cne $Expected[$Name]) { throw "winget_provision_result_binding_mismatch" }
+            }
+            if (-not (Test-Digest $Fields.'provider-runtime-roots-sha256')) {
+                throw "winget_provision_result_binding_mismatch"
+            }
+        } else { throw "winget_provision_result_binding_mismatch" }
     }
     Assert-WinGetProvisionSourceEvidence $Lines[12] $Context ($Fields.state -cne "completed")
     return [pscustomobject]@{ State = $Fields.state; Reason = $Fields.reason; Bytes = $Bytes }
@@ -1476,7 +1565,9 @@ function Wait-WinGetProvisionReceipt([string]$Root, [object]$Paths, [byte[]]$Exp
 function Get-WinGetProvisionDisposition([object]$Receipt) {
     switch -CaseSensitive ($Receipt.State) {
         "completed" {
-            if ($Receipt.Reason -cne "provider_state_provisioned") { throw "winget_provision_result_binding_mismatch" }
+            if ($Receipt.Reason -cnotin @("module_state_verified", "provider_state_provisioned")) {
+                throw "winget_provision_result_binding_mismatch"
+            }
             return "continue"
         }
         "rejected" { return "rollback" }
@@ -3284,21 +3375,7 @@ function Invoke-SelfTest {
             "generation/policy.actions", "generation/policy.constraints", "generation/windows-winget-provider.lock",
             "generation/winget.context", "scripts/enroll-privilege-windows.ps1",
             "scripts/privilege-broker-windows.ps1", "scripts/profile-worker-windows.ps1",
-            "scripts/register-profile-task-windows.ps1",
-            "generation/winget/win-x64/MachineUtilities.WinGetBroker.exe",
-            "generation/winget/win-x64/MachineUtilities.WinGetBroker.deps.json",
-            "generation/winget/win-x64/MachineUtilities.WinGetBroker.runtimeconfig.json",
-            "generation/winget/win-x64/Microsoft.Management.Deployment.dll",
-            "generation/winget/win-x64/Microsoft.Management.Deployment.dll.manifest",
-            "generation/winget/win-x64/Microsoft.Management.Deployment.winmd",
-            "generation/winget/win-x64/WindowsPackageManager.dll",
-            "generation/winget/win-arm64/MachineUtilities.WinGetBroker.exe",
-            "generation/winget/win-arm64/MachineUtilities.WinGetBroker.deps.json",
-            "generation/winget/win-arm64/MachineUtilities.WinGetBroker.runtimeconfig.json",
-            "generation/winget/win-arm64/Microsoft.Management.Deployment.dll",
-            "generation/winget/win-arm64/Microsoft.Management.Deployment.dll.manifest",
-            "generation/winget/win-arm64/Microsoft.Management.Deployment.winmd",
-            "generation/winget/win-arm64/WindowsPackageManager.dll")
+            "scripts/register-profile-task-windows.ps1")
         $FixtureEntryMapBytes = ConvertTo-CanonicalAsciiBytes @(
             "profile-entry-map|1",
             "entry|.codex/settings.json|json-scalar|codex-settings|codex|codex-settings",
@@ -3323,7 +3400,7 @@ function Invoke-SelfTest {
                 "file|$_|$FileDigest"
             }) + @("end-files|")
         $Files = Read-ReleaseFiles (ConvertTo-CanonicalAsciiBytes $FileLines)
-        if ($Files.Files.Count -ne 24) { throw "release file self-test failed" }
+        if ($Files.Files.Count -ne 10) { throw "release file self-test failed" }
         $FixtureProfileRecords = @(Assert-ProfileReleaseArtifactCompleteness $Files $FixtureProfileConstraintsBytes `
             "S-1-5-21-1-2-3-1001" $FixtureProfileRootId)
         if ($FixtureProfileRecords.Count -ne 1 -or $FixtureProfileRecords[0].EntryMapSha256 -cne $FixtureEntryMapDigest) {
@@ -3809,6 +3886,16 @@ Quota Limit: 67,890 bytes
             $GenerationDigest $FixtureProvisionContext
         if ((Get-WinGetProvisionDisposition $FixtureCompletedProvision) -cne "continue") {
             throw "WinGet completed provision self-test failed"
+        }
+        $FixtureModuleProvision = Read-WinGetProvisionReceipt (ConvertTo-CanonicalAsciiBytes @(
+            "winget-provider-provision-result|1", "state|completed", "reason|module_state_verified",
+            "enrollment-epoch|7", "generation-sha256|$GenerationDigest", "provider-lock-sha256|$('b' * 64)",
+            "deployment-file-set-sha256|$('b' * 64)", "app-installer-identity-sha256|$('c' * 64)",
+            "provider-version|1.29.280", "state-identifier-sha256|-",
+            "provider-runtime-roots-sha256|$('b' * 64)", "settings-sha256|-",
+            $FixtureSourceLine, "end-provision-result|")) $Manifest $GenerationDigest $FixtureProvisionContext
+        if ((Get-WinGetProvisionDisposition $FixtureModuleProvision) -cne "continue") {
+            throw "WinGet module provision self-test failed"
         }
         foreach ($StateCase in @("rejected", "partial")) {
             $FixtureNonterminalProvision = Read-WinGetProvisionReceipt (ConvertTo-CanonicalAsciiBytes @(
@@ -4484,8 +4571,7 @@ try {
     foreach ($File in $ReleaseFiles.Files) {
         $Source = Join-Path $StageRoot $File.Path
         Assert-ProtectedWindowsPath $Source $BootstrapRoot
-        if ($File.Path.StartsWith("scripts/", [StringComparison]::Ordinal) -or
-            [IO.Path]::GetFileName($File.Path) -ceq "MachineUtilities.WinGetBroker.exe") {
+        if ($File.Path.StartsWith("scripts/", [StringComparison]::Ordinal)) {
             Assert-AuthenticodePublisher $Source $Receipt.'publisher-thumbprint'
         }
         $Destination = if ($File.Path.StartsWith("scripts/", [StringComparison]::Ordinal)) {
@@ -4493,6 +4579,7 @@ try {
         } else { Join-Path $GenerationStage $File.Path.Substring("generation/".Length) }
         Copy-VerifiedFile $Source $Destination $File.Sha256
     }
+    Install-ProtectedWinGetModule $GenerationStage $TransactionRoot
     $OpenSshIdentityPath = Join-Path $GenerationStage "openssh.identity"
     Write-AtomicBytes $OpenSshIdentityPath (Get-SystemOpenSshIdentityBytes)
     $OpenSshIdentityDigest = Get-Sha256Bytes (Read-HeldBytes $OpenSshIdentityPath 4096)

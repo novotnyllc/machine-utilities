@@ -3164,6 +3164,16 @@ test_u1_contracts() {
   if MACHINE_UTILITIES_CONFIG="$tmp/u1-invalid-route.json" "$cli" validate-config >/dev/null 2>&1; then
     fail "U1 accepted command-bearing automation transport"
   fi
+  jq '.machines["test-apt"].privilege_broker.automation_transport.management_networks =
+    ["999.999.999.999/32"]' "$tmp/config.json" >"$tmp/u1-invalid-ipv4-route.json"
+  chmod 600 "$tmp/u1-invalid-ipv4-route.json"
+  if MACHINE_UTILITIES_CONFIG="$tmp/u1-invalid-ipv4-route.json" "$cli" validate-config >/dev/null 2>&1; then
+    fail "U1 accepted malformed IPv4 management network octets"
+  fi
+  jq '.machines["test-apt"].privilege_broker.automation_transport.management_networks =
+    ["2001:db8::/64"]' "$tmp/config.json" >"$tmp/u1-ipv6-route.json"
+  chmod 600 "$tmp/u1-ipv6-route.json"
+  MACHINE_UTILITIES_CONFIG="$tmp/u1-ipv6-route.json" "$cli" validate-config
   jq '.private_key_path = "relative-key"' "$tmp/identity-a.json" >"$tmp/u1-invalid-identity.json"
   chmod 600 "$tmp/u1-invalid-identity.json"
   if MACHINE_UTILITIES_IDENTITY="$tmp/u1-invalid-identity.json" "$cli" validate-config >/dev/null 2>&1; then
@@ -5189,9 +5199,7 @@ SH
       scripts/enroll-windows-sftp.ps1 scripts/prepare-ssh-identity \
       scripts/privilege-broker-posix scripts/privilege-broker-windows.ps1 \
       scripts/profile-worker-windows.ps1 scripts/register-profile-task-windows.ps1 \
-      scripts/windows-native-canary-runner.ps1 windows/WinGetBroker/BrokerCore.cs \
-      windows/WinGetBroker/Program.cs windows/WinGetBroker/WinGetBroker.csproj \
-      windows/WinGetBroker/packages.lock.json; do
+      scripts/windows-native-canary-runner.ps1; do
     jq -e --arg path "$u5_integrity_path" '.files | any(.path == $path)' \
       "$plugin_cache/integrity.json" >/dev/null ||
       fail "U5 release integrity omitted $u5_integrity_path"
@@ -5232,20 +5240,37 @@ test_macos_privilege_contracts() {
 $macos_contracts
 EOF
 
+  macos_app_constraint_record='macos-cask-app|macos.install-signed-pkg.v1|visual-studio-code|Visual Studio Code.app'
   macos_constraint_record="macos-pkg|macos.install-signed-pkg.v1|fixture-cask|sealed-cask-payload-v1|16|$(printf 'a%.0s' {1..64})|com.example.fixture|1.2.3|TEAMID1234|$(printf 'b%.0s' {1..64})|com.example.fixture|1.2.3"
-  printf '%s\n' "$macos_constraint_record" >"$tmp/macos-constraint-group"
+  printf '%s\n%s\n' "$macos_app_constraint_record" "$macos_constraint_record" >"$tmp/macos-constraint-group"
   macos_constraint_digest=$(shasum -a 256 "$tmp/macos-constraint-group" | awk '{print $1}')
   awk -F '|' -v OFS='|' -v digest="$macos_constraint_digest" '
     $2 == "macos.install-signed-pkg.v1" { $4="enabled"; $6=digest } { print }
   ' "$macos_policy" >"$tmp/macos-sealed-policy"
   macos_policy_digest=$(shasum -a 256 "$tmp/macos-sealed-policy" | awk '{print $1}')
-  printf 'constraints|1|generation=1|policy-sha256=%s\n%s\n' \
-    "$macos_policy_digest" "$macos_constraint_record" >"$tmp/macos-sealed.constraints"
+  printf 'constraints|1|generation=1|policy-sha256=%s\n%s\n%s\n' \
+    "$macos_policy_digest" "$macos_app_constraint_record" "$macos_constraint_record" \
+    >"$tmp/macos-sealed.constraints"
   "$cli" inspect-privilege-constraints "$tmp/macos-sealed-policy" \
     "$tmp/macos-sealed.constraints" >"$tmp/macos-sealed-constraints.json"
   jq -e '.actions[] | select(.action_id == "macos.install-signed-pkg.v1") |
-    .policy_tokens == ["fixture-cask"]' "$tmp/macos-sealed-constraints.json" >/dev/null ||
-    fail "sealed cask payload constraint was not accepted canonically"
+    .policy_tokens == ["fixture-cask","visual-studio-code"]' \
+    "$tmp/macos-sealed-constraints.json" >/dev/null ||
+    fail "sealed package and app-target cask constraints were not accepted canonically"
+  macos_invalid_app_constraint=${macos_app_constraint_record/Visual Studio Code.app/..\/Other.app}
+  printf '%s\n' "$macos_invalid_app_constraint" >"$tmp/macos-invalid-app-group"
+  macos_invalid_app_digest=$(shasum -a 256 "$tmp/macos-invalid-app-group" | awk '{print $1}')
+  awk -F '|' -v OFS='|' -v digest="$macos_invalid_app_digest" '
+    $2 == "macos.install-signed-pkg.v1" { $4="enabled"; $6=digest } { print }
+  ' "$macos_policy" >"$tmp/macos-invalid-app-policy"
+  macos_invalid_app_policy_digest=$(shasum -a 256 "$tmp/macos-invalid-app-policy" | awk '{print $1}')
+  printf 'constraints|1|generation=1|policy-sha256=%s\n%s\n' \
+    "$macos_invalid_app_policy_digest" "$macos_invalid_app_constraint" \
+    >"$tmp/macos-invalid-app.constraints"
+  if "$cli" inspect-privilege-constraints "$tmp/macos-invalid-app-policy" \
+      "$tmp/macos-invalid-app.constraints" >/dev/null 2>&1; then
+    fail "protected app-target constraint accepted path traversal"
+  fi
   for macos_policy_parser in "$cli" "$macos_broker" \
       "$plugin_cache/scripts/enroll-privilege-posix" "$plugin_cache/scripts/collect-posix" \
       "$plugin_cache/scripts/collect-windows.ps1"; do
@@ -5386,6 +5411,122 @@ EOF
   if grep -Eq "(^|[[:space:]\"'])((/[^[:space:]\"']*)?brew)([[:space:]\"']|$)" "$macos_broker"; then
     fail "protected macOS broker contains a root Homebrew path"
   fi
+  macos_apply_functions="$tmp/macos-apply-functions.sh"
+  sed -n '/^execute_plan_operation()/,/^}/p' "$cli" >"$macos_apply_functions"
+  jq -n '{type:"package-upgrade",kind:"package",id:"homebrew-cask:fixture-cask",
+    candidate_version:"2.0",argv:["env","HOMEBREW_NO_AUTO_UPDATE=1","brew","upgrade","--cask","fixture-cask"]}' \
+    >"$tmp/macos-cask-operation.json"
+  mkdir -p "$tmp/macos-homebrew/bin" "$tmp/macos-homebrew/repository/Library/Homebrew"
+  : >"$tmp/macos-homebrew/repository/Library/Homebrew/brew.rb"
+  cat >"$tmp/macos-homebrew/bin/brew" <<'SH'
+#!/bin/sh
+if [ "$1" = --repository ]; then
+  printf '%s\n' "$MACHINE_UTILITIES_TEST_BREW_REPOSITORY"
+  exit 0
+fi
+printf '%s\n' "$@" >"$MACHINE_UTILITIES_TEST_BREW_LOG"
+SH
+  chmod 755 "$tmp/macos-homebrew/bin/brew"
+  (
+    # shellcheck source=/dev/null
+    . "$macos_apply_functions"
+    # Referenced by the extracted execute_plan_operation function.
+    # shellcheck disable=SC2034
+    plugin_root=$plugin_cache
+    PATH="$tmp/macos-homebrew/bin:$PATH"
+    MACHINE_UTILITIES_TEST_BREW_REPOSITORY="$tmp/macos-homebrew/repository"
+    MACHINE_UTILITIES_TEST_BREW_LOG="$tmp/macos-homebrew/invocation"
+    export PATH MACHINE_UTILITIES_TEST_BREW_REPOSITORY MACHINE_UTILITIES_TEST_BREW_LOG
+    execute_plan_operation "$tmp/macos-cask-operation.json" "$tmp/config.json" test-host
+  ) || fail "ordinary-user Homebrew cask transaction did not start through the typed bridge hook"
+  grep -Fqx -- "-r$plugin_cache/scripts/homebrew-bridge.rb" "$tmp/macos-homebrew/invocation" &&
+    grep -Fqx "$tmp/macos-homebrew/repository/Library/Homebrew/brew.rb" "$tmp/macos-homebrew/invocation" &&
+    grep -Fqx fixture-cask "$tmp/macos-homebrew/invocation" ||
+    fail "Homebrew cask transaction did not bind the packaged bridge hook and selected cask"
+  grep -Fq -- '--homebrew-bridge-v1' "$macos_broker" &&
+    grep -Fq 'prepare-app' "$macos_broker" &&
+    grep -Fq 'macos-cask-app' "$macos_broker" &&
+    grep -Fq 'exact_sealed_package_not_enrolled' "$macos_broker" &&
+    grep -Fq 'unsupported_privileged_cask_artifact' "$macos_broker" ||
+    fail "Homebrew bridge does not fail closed around the exact sealed package contract"
+  if command -v ruby >/dev/null 2>&1; then
+    ruby -c "$plugin_cache/scripts/homebrew-bridge.rb" >/dev/null ||
+      fail "Homebrew bridge hook is not valid Ruby"
+  fi
+
+  macos_bridge_root=$tmp/macos-app-bridge
+  macos_bridge_generation=$macos_bridge_root/etc/machine-utilities/generations/1
+  macos_bridge_broker=$macos_bridge_root/usr/local/libexec/machine-utilities/posix-broker
+  mkdir -p "$macos_bridge_generation" "$macos_bridge_root/etc/machine-utilities/generations" \
+    "$macos_bridge_root/var/lib/machine-utilities" "$macos_bridge_root/usr/local/libexec/machine-utilities" \
+    "$macos_bridge_root/usr/sbin" "$macos_bridge_root/Applications/Visual Studio Code.app/Contents"
+  chmod 755 "$macos_bridge_root" "$macos_bridge_root/etc" "$macos_bridge_root/etc/machine-utilities" \
+    "$macos_bridge_root/etc/machine-utilities/generations" "$macos_bridge_generation" \
+    "$macos_bridge_root/usr" "$macos_bridge_root/usr/local" "$macos_bridge_root/usr/local/libexec" \
+    "$macos_bridge_root/usr/local/libexec/machine-utilities" "$macos_bridge_root/usr/sbin" \
+    "$macos_bridge_root/Applications" "$macos_bridge_root/Applications/Visual Studio Code.app" \
+    "$macos_bridge_root/Applications/Visual Studio Code.app/Contents"
+  chmod 700 "$macos_bridge_root/var" "$macos_bridge_root/var/lib" \
+    "$macos_bridge_root/var/lib/machine-utilities"
+  cat >"$macos_bridge_root/usr/sbin/chown" <<SH
+#!/bin/sh
+printf '%s\n' "\$@" >'$tmp/macos-app-chown.log'
+SH
+  chmod 755 "$macos_bridge_root/usr/sbin/chown"
+  cp "$macos_broker" "$macos_bridge_broker"
+  chmod 755 "$macos_bridge_broker"
+  macos_bridge_app_record='macos-cask-app|macos.install-signed-pkg.v1|visual-studio-code|Visual Studio Code.app'
+  printf '%s\n' "$macos_bridge_app_record" >"$tmp/macos-app-constraint-group"
+  macos_bridge_group_digest=$(shasum -a 256 "$tmp/macos-app-constraint-group" | awk '{print $1}')
+  awk -F '|' -v OFS='|' -v digest="$macos_bridge_group_digest" '
+    $2 == "macos.install-signed-pkg.v1" { $4="enabled"; $6=digest } { print }
+  ' "$macos_policy" >"$macos_bridge_generation/policy.actions"
+  macos_bridge_policy_digest=$(shasum -a 256 "$macos_bridge_generation/policy.actions" | awk '{print $1}')
+  printf 'constraints|1|generation=1|policy-sha256=%s\n%s\n' \
+    "$macos_bridge_policy_digest" "$macos_bridge_app_record" \
+    >"$macos_bridge_generation/policy.constraints"
+  printf 'identity|1|test-mac|%s|machine-utilities|fleet.example|SHA256:%s|1|SHA256:%s|machine-utilities-posix,machine-utilities-windows\n' \
+    "$(id -u)" "$(printf 'A%.0s' {1..43})" "$(printf 'B%.0s' {1..43})" \
+    >"$macos_bridge_generation/host.identity"
+  cat >"$macos_bridge_generation/macos.context" <<EOF
+macos-context|2
+binary|chown|$(shasum -a 256 "$macos_bridge_root/usr/sbin/chown" | awk '{print $1}')
+binary|installer|$(printf 'a%.0s' {1..64})
+binary|pkgutil|$(printf 'b%.0s' {1..64})
+binary|pmset|$(printf 'c%.0s' {1..64})
+binary|systemsetup|$(printf 'd%.0s' {1..64})
+EOF
+  printf '%s\n' "$(shasum -a 256 "$macos_bridge_broker" | awk '{print $1}')" \
+    >"$macos_bridge_generation/broker.sha256"
+  chmod 644 "$macos_bridge_generation"/*
+  ln -s generations/1 "$macos_bridge_root/etc/machine-utilities/active"
+  MACHINE_UTILITIES_U2_FIXTURE_ROOT="$macos_bridge_root" MACHINE_UTILITIES_U2_FIXTURE_PLATFORM=macos \
+    SUDO_UID="$(id -u)" SUDO_USER=machine-utilities \
+    "$macos_bridge_broker" --homebrew-bridge-v1 prepare-app visual-studio-code ||
+    fail "typed app-target bridge rejected the exact protected cask target"
+  printf '%s\n' -R -P -h -- "$(id -u)" \
+    "$macos_bridge_root/Applications/Visual Studio Code.app" >"$tmp/macos-app-chown.expected"
+  cmp -s "$tmp/macos-app-chown.expected" "$tmp/macos-app-chown.log" ||
+    fail "typed app-target bridge did not derive the fixed non-following chown invocation"
+  for macos_bad_bridge_args in \
+      'prepare-app ../visual-studio-code' \
+      'prepare-app visual-studio-code-insiders' \
+      'prepare-app visual-studio-code /Applications/Other.app'; do
+    # shellcheck disable=SC2086
+    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$macos_bridge_root" MACHINE_UTILITIES_U2_FIXTURE_PLATFORM=macos \
+        SUDO_UID="$(id -u)" SUDO_USER=machine-utilities \
+        "$macos_bridge_broker" --homebrew-bridge-v1 $macos_bad_bridge_args >/dev/null 2>&1; then
+      fail "typed app-target bridge accepted traversal, another token, or a caller path"
+    fi
+  done
+  mv "$macos_bridge_root/Applications/Visual Studio Code.app" \
+    "$macos_bridge_root/Applications/Visual Studio Code.real.app"
+  ln -s 'Visual Studio Code.real.app' "$macos_bridge_root/Applications/Visual Studio Code.app"
+  if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$macos_bridge_root" MACHINE_UTILITIES_U2_FIXTURE_PLATFORM=macos \
+      SUDO_UID="$(id -u)" SUDO_USER=machine-utilities \
+      "$macos_bridge_broker" --homebrew-bridge-v1 prepare-app visual-studio-code >/dev/null 2>&1; then
+    fail "typed app-target bridge accepted a symlink target"
+  fi
   grep -Fq 'policy_token_not_found' "$macos_broker" &&
     grep -Fq 'macos.install-signed-pkg.v1)' "$macos_broker" &&
     grep -Fq 'macos.apply-system-setting.v1)' "$macos_broker" ||
@@ -5398,9 +5539,10 @@ EOF
   grep -Fq '/usr/bin/pmset' "$macos_collector" &&
     grep -Fq '/etc/localtime' "$macos_collector" &&
     grep -Fq '/etc/ntp.conf' "$macos_collector" &&
-    grep -Fq 'binary[4]="pmset"' "$macos_collector" &&
-    grep -Fq 'if(NR!=5)' "$macos_collector" ||
-    fail "macOS readiness does not attest pmset and native unprivileged sources"
+    grep -Fq 'binary[5]="pmset"' "$macos_collector" &&
+    grep -Fq 'if(NR!=6)' "$macos_collector" &&
+    grep -Fq 'binary[2]="chown"' "$macos_collector" ||
+    fail "macOS readiness does not attest chown, pmset, and native unprivileged sources"
   if grep -Eq '/usr/bin/sudo|systemsetup|observe-macos-preconditions|broker\.observe-macos-preconditions' \
       "$tmp/macos-collector-contract"; then
     fail "macOS readiness invokes a privileged broker or systemsetup for observation"
