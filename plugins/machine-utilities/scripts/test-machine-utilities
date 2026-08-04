@@ -63,6 +63,25 @@ assert_contains "$remote_control_text" 'does not require or preflight the Machin
 assert_ordered "$remote_control_reference" \
   'codex plugin marketplace upgrade MARKETPLACE --json' \
   'codex plugin add PLUGIN@MARKETPLACE --json'
+assert_contains "$remote_control_text" 'applicable Codex and Claude harnesses'
+assert_contains "$remote_control_text" 'native PowerShell only'
+assert_contains "$remote_control_text" '`claude plugin list --json`'
+assert_contains "$remote_control_text" 'compare every non-target record by `id`, `version`, `enabled`, and'
+assert_contains "$remote_control_text" 'unrelated plugin diff to be empty'
+assert_contains "$remote_control_text" 'claude plugin install PLUGIN@MARKETPLACE --scope user'
+assert_contains "$remote_control_text" 'the Codex record must be installed and the Claude record must have'
+assert_contains "$remote_control_text" 'mark only the Claude harness unavailable'
+assert_contains "$remote_control_text" 'WSL or SSH are prohibited'
+assert_contains "$remote_control_text" 'Treat Codex and Claude harness failures independently'
+case $remote_control_text in
+  *'Claude is not applicable to `codex-remote-control`'*)
+    fail "remote-control routine still excludes native Claude"
+    ;;
+esac
+assert_ordered "$remote_control_reference" \
+  'claude plugin marketplace update MARKETPLACE' \
+  'claude plugin update PLUGIN@MARKETPLACE --scope user'
+assert_contains "$fleet_agents_text" 'may run the native Claude CLI in the visible native PowerShell'
 
 readiness_skill="$script_dir/../skills/fleet-readiness/SKILL.md"
 [ -f "$readiness_skill" ] || fail "fleet-readiness skill is missing"

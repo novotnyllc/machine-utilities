@@ -110,6 +110,8 @@ mutation. Run every SSH operation through the target user's configured login
 shell (`$SHELL -lc`) so user-level paths such as `$HOME/.local/bin` are
 available. Never use raw non-login SSH command execution or infer that tooling
 is absent from its restricted `PATH`. For Windows Codex tasks read and follow
-`"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
+`"$SKILL_DIR/../../references/codex-remote-control.md"`; its explicit routine
+named-plugin path may run the native Claude CLI in the visible native PowerShell
+task. Outside that narrow path, Claude reports the transport control surface as
 unsupported rather than using WSL. Re-inventory after changes and report
 unresolved provenance as unknown, not guessed.

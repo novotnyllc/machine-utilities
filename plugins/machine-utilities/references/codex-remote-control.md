@@ -32,27 +32,41 @@ Do not collapse these states into a generic task-control failure.
 
 An explicit named-plugin refresh does not require a full native inventory or
 sealed plan. Resolve the host, saved project, plugin, marketplace, requested
-version, and applicable Codex harness from the controller's configured scope.
-Use the capability check above, create a visible task in the configured saved
-project, and run native PowerShell only. Capture `codex plugin list --json`
-before and after, retaining the exact `PLUGIN@MARKETPLACE` record. In the task,
-run only these commands in order:
+version, and applicable Codex and Claude harnesses from the controller's
+configured scope. Use the capability check above, create a visible task in the
+configured saved project, and run native PowerShell only. Before and after each
+applicable harness, capture `codex plugin list --json`; for Claude, capture
+`claude plugin list --json`. Retain the exact `PLUGIN@MARKETPLACE` record and,
+for Claude, compare every non-target record by `id`, `version`, `enabled`, and
+`scope` and require the unrelated plugin diff to be empty. In the task, run
+only these mutation commands in order for each applicable harness:
 
 ```powershell
+# Codex
 codex plugin marketplace upgrade MARKETPLACE --json
 codex plugin add PLUGIN@MARKETPLACE --json
+
+# Claude
+claude plugin marketplace update MARKETPLACE
+claude plugin update PLUGIN@MARKETPLACE --scope user
 ```
 
-Require the post-state record to be installed, enabled, and equal the requested
-version. Do not use WSL, update another plugin, synchronize settings or skills,
-or claim success from manager output alone. Record a failed postcondition as
+The Codex add is idempotent. For Claude, use `plugin update` when the exact
+plugin is installed; if it is absent, replace only that second Claude command
+with `claude plugin install PLUGIN@MARKETPLACE --scope user`. Require each
+matching post-state record to be present, enabled, and equal the requested
+version; the Codex record must be installed and the Claude record must have
+user scope. If native PowerShell cannot find
+`claude`, mark only the Claude harness unavailable. WSL or SSH are prohibited.
+Treat Codex and Claude harness failures independently: preserve each before/after
+record and attempt the other applicable harness. Do not update a runtime,
+settings, skills, provenance, or another plugin, and do not claim success from
+manager output alone. Record a failed postcondition as
 `executor_or_plugin_failure` while preserving before-state and command output;
 keep executor version/hash mismatch separate as `executor_mismatch` only when
 an executor load or verification was attempted. This manager-native refresh
 does not require or preflight the Machine Utilities executor, because that
 would prevent it from repairing a stale Machine Utilities installation.
-Claude is not applicable to `codex-remote-control`; do not infer its state from
-WSL.
 
 Use the full protocol below for inventory, broad reconciliation, settings,
 provenance, conversions, ambiguous scope, and sealed-plan mutations.
