@@ -711,17 +711,27 @@ process_uid() {
   printf '%s' "$value"
 }
 process_executable() {
-  local pid=$1 candidate canonical
+  local pid=$1 candidate canonical mode process_name readlink_binary
   [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
   case $(platform_boundary) in
     macos) candidate=$(/bin/ps -o comm= -p "$pid" 2>/dev/null | /usr/bin/awk 'NR == 1 {$1=$1; print; exit}') ;;
     linux)
       if [ -x /usr/bin/readlink ]; then
-        candidate=$(/usr/bin/readlink "/proc/$pid/exe" 2>/dev/null)
+        readlink_binary=/usr/bin/readlink
       elif [ -x /bin/readlink ]; then
-        candidate=$(/bin/readlink "/proc/$pid/exe" 2>/dev/null)
+        readlink_binary=/bin/readlink
       else
         return 1
+      fi
+      if ! candidate=$($readlink_binary "/proc/$pid/exe" 2>&1); then
+        case $candidate in *': Permission denied') ;; *) return 1 ;; esac
+        [ -n "${agent_peer_executable-}" ] || return 1
+        mode=$(file_mode "$agent_peer_executable") || return 1
+        case $mode in [2367][0-7][0-7][0-7]) ;; *) return 1 ;; esac
+        [ -d "/proc/$pid" ] && [ ! -L "/proc/$pid" ] || return 1
+        IFS= read -r process_name <"/proc/$pid/comm" || return 1
+        [ "$process_name" = "${agent_peer_executable##*/}" ] || return 1
+        candidate=$agent_peer_executable
       fi
       ;;
     *) return 1 ;;
@@ -735,7 +745,7 @@ process_start_identity() {
   [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
   case $(platform_boundary) in
     macos) value=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null | /usr/bin/awk '{$1=$1; print; exit}') ;;
-    linux) value=$(/usr/bin/awk '{sub(/^.*\\) /, ""); print $20; exit}' "/proc/$pid/stat" 2>/dev/null) ;;
+    linux) value=$(/usr/bin/awk '{sub(/^.*\) /, ""); print $20; exit}' "/proc/$pid/stat" 2>/dev/null) ;;
     *) return 1 ;;
   esac
   [ -n "$value" ] || return 1

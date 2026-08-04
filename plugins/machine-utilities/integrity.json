@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/certify-ssh-node",
-      "sha256": "d13b8f30780cd8dfd619b7be0df420b80cf5db353739bd49ae0fbe22b3a3eff8"
+      "sha256": "851657fb197ca7e74275df4610290669ac2ebe39d4e35d226d90cb29c0ccc0c9"
     },
     {
       "path": "scripts/collect-posix",
