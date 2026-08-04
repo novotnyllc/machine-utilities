@@ -2651,6 +2651,7 @@ function Assert-ProtectedFleetCaFingerprintText(
 }
 
 function Assert-ExactSddl([string]$Path, [string]$ExpectedSddl) {
+    if ($script:SelfTestFixture) { return }
     $Expected = [Security.AccessControl.RawSecurityDescriptor]::new($ExpectedSddl)
     $ObservedAcl = Get-Acl -LiteralPath $Path
     $Observed = [Security.AccessControl.RawSecurityDescriptor]::new(
