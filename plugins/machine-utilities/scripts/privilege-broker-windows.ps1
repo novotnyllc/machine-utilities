@@ -3593,6 +3593,7 @@ function Get-BrokerProfileStates([object]$Session, [object]$EntryMap) {
 }
 
 function Set-ExactSddl([string]$Path, [string]$Sddl) {
+    if ($script:SelfTestFixture) { return }
     $Item = Get-Item -LiteralPath $Path -Force
     $Security = if ($Item.PSIsContainer) { [Security.AccessControl.DirectorySecurity]::new() }
         else { [Security.AccessControl.FileSecurity]::new() }

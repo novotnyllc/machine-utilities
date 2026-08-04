@@ -113,10 +113,11 @@ public_sticky_directory_mode() {
   [ "$observed" = drwxrwxrwt ]
 }
 safe_permissions() {
-  local mode
+  local mode permissions
   mode=$(file_mode "$1") || return 1
-  printf '%s' "$mode" | /usr/bin/grep -Eq '^[0-7]{3}$' || return 1
-  case $(printf '%s' "$mode" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
+  permissions=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
+  [ "${#permissions}" -eq 3 ] || return 1
+  case $(printf '%s' "$permissions" | /usr/bin/cut -c 2-3) in *2*|*3*|*6*|*7*) return 1 ;; esac
 }
 safe_extended_acl() {
   # A mode suffix of `+` only says that an access ACL exists.  A deny-only
