@@ -41,7 +41,14 @@ jobs:
         shell: bash
         run: |
           set -eu
-          plugins/machine-utilities/scripts/prepare-ssh-identity self-test
+          if ! plugins/machine-utilities/scripts/prepare-ssh-identity self-test; then
+            if [[ "$RUNNER_OS" == Linux ]]; then
+              timeout 20s /bin/bash -p -x plugins/machine-utilities/scripts/prepare-ssh-identity self-test \
+                >"$RUNNER_TEMP/prepare-ssh-identity.trace" 2>&1 || true
+              tail -n 160 "$RUNNER_TEMP/prepare-ssh-identity.trace"
+            fi
+            exit 1
+          fi
           plugins/machine-utilities/scripts/certify-ssh-node self-test
           plugins/machine-utilities/scripts/enroll-ssh-posix self-test
       - name: Validate fleet skill frontmatter
