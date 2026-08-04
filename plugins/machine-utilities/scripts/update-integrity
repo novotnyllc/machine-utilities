@@ -35,6 +35,7 @@ for relative in \
   references/privilege-policy.default \
   references/windows-winget-provider.lock \
   scripts/apply-windows.ps1 \
+  scripts/codex-plugin-hooks.mjs \
   scripts/certify-ssh-node \
   scripts/collect-posix \
   scripts/collect-windows.ps1 \

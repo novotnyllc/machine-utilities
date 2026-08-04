@@ -7,6 +7,7 @@ plugin_version=$(jq -r '.version' "$script_dir/../.codex-plugin/plugin.json")
 pwsh_command=$(command -v pwsh 2>/dev/null || true)
 real_git=$(command -v git)
 real_stat=$(command -v stat)
+real_node=$(command -v node)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-test.XXXXXX")
 cleanup_test_tmp() {
   if [ "${MACHINE_UTILITIES_TEST_KEEP_TMP:-false}" = true ]; then
@@ -53,7 +54,13 @@ assert_contains "$fleet_agents_text" 'report the requested version'
 assert_contains "$fleet_agents_text" 'claude plugin install PLUGIN@MARKETPLACE --scope user'
 assert_ordered "$fleet_agents_skill" \
   'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'codex plugin add PLUGIN@MARKETPLACE --json'
+  'update-codex-plugin PLUGIN@MARKETPLACE'
+assert_contains "$fleet_agents_text" 'never send or interpolate'
+assert_contains "$fleet_agents_text" '"$TARGET_CLI" verify-executor'
+assert_contains "$fleet_agents_text" 'previously resolved and verified `"$TARGET_CLI"`'
+assert_contains "$fleet_agents_text" 'integrity-gated `-ApproveCodexPluginHooks` path'
+assert_contains "$fleet_agents_text" 'only pre-helper fallback'
+assert_contains "$fleet_agents_text" 'codex plugin add machine-utilities@novotnyllc --json'
 assert_ordered "$fleet_agents_skill" \
   'claude plugin marketplace update MARKETPLACE' \
   'claude plugin update PLUGIN@MARKETPLACE --scope user'
@@ -93,7 +100,7 @@ done
 assert_contains "$remote_control_text" 'does not require or preflight the Machine Utilities executor'
 assert_ordered "$remote_control_reference" \
   'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'codex plugin add PLUGIN@MARKETPLACE --json'
+  'codex-plugin-hooks.mjs" update PLUGIN@MARKETPLACE'
 assert_contains "$remote_control_text" 'applicable Codex and Claude harnesses'
 assert_contains "$remote_control_text" 'native PowerShell only'
 assert_contains "$remote_control_text" '`claude plugin list --json`'
@@ -423,6 +430,78 @@ cat >"$tmp/bin/codex" <<'SH'
 version=1.2.3
 [ -z "${CODEX_STATE_FILE:-}" ] || [ ! -f "$CODEX_STATE_FILE" ] ||
   version=$(cat "$CODEX_STATE_FILE")
+if [ "${1:-}" = app-server ] && [ "${2:-}" = --stdio ]; then
+  while IFS= read -r request; do
+    method=$(printf '%s\n' "$request" | jq -r '.method // empty')
+    id=$(printf '%s\n' "$request" | jq -r '.id // empty')
+    case $method in
+      initialize)
+        jq -cn --argjson id "$id" '{id:$id,result:{codexHome:"fixture"}}'
+        ;;
+      initialized) ;;
+      hooks/list)
+        cwd=$(printf '%s\n' "$request" | jq -r '.params.cwds[0]')
+        scenario=${CODEX_HOOK_SCENARIO:-update}
+        writes=${CODEX_HOOK_WRITES_FILE:-/nonexistent}
+        if [ "$scenario" = warning ] || [ "$scenario" = error ]; then
+          jq -cn --argjson id "$id" --arg cwd "$cwd" \
+            --arg scenario "$scenario" \
+            '{id:$id,result:{data:[{cwd:$cwd,hooks:[],
+              warnings:(if $scenario == "warning" then ["fixture warning"] else [] end),
+              errors:(if $scenario == "error" then [{message:"fixture error"}] else [] end)}]}}'
+          continue
+        fi
+        trusted_status=trusted
+        modified_status=modified
+        removed_status=trusted
+        untrusted_status=untrusted
+        if [ "$scenario" = approve ]; then
+          trusted_status=untrusted
+          modified_status=modified
+          removed_status=untrusted
+          [ ! -f "$writes" ] || {
+            trusted_status=trusted
+            modified_status=trusted
+            removed_status=trusted
+            untrusted_status=trusted
+          }
+        elif [ "$version" = 1.3.0 ] && [ -f "$writes" ]; then
+          grep -q 'stable-trusted' "$writes" && trusted_status=trusted
+          grep -q 'stable-modified' "$writes" && modified_status=trusted
+        fi
+        if [ "$version" = 1.3.0 ]; then
+          hooks=$(jq -cn \
+            --arg trusted "$trusted_status" --arg modified "$modified_status" \
+            --arg untrusted "$untrusted_status" '[
+              {key:"example@test-market:hooks/hooks.json:session_start:0:0",pluginId:"example@test-market",currentHash:"sha256:stable-trusted-new",trustStatus:$trusted,enabled:false},
+              {key:"example@test-market:hooks/hooks.json:post_tool_use:0:0",pluginId:"example@test-market",currentHash:"sha256:stable-modified-new",trustStatus:$modified,enabled:true},
+              {key:"example@test-market:hooks/hooks.json:pre_tool_use:0:0",pluginId:"example@test-market",currentHash:"sha256:untrusted",trustStatus:$untrusted,enabled:true},
+              {key:"example@test-market:hooks/hooks.json:stop:0:0",pluginId:"example@test-market",currentHash:"sha256:new",trustStatus:"untrusted",enabled:true},
+              {key:"other@test-market:hooks/hooks.json:stop:0:0",pluginId:"other@test-market",currentHash:"sha256:other",trustStatus:"trusted",enabled:false}
+            ]')
+        else
+          hooks=$(jq -cn \
+            --arg trusted "$trusted_status" --arg modified "$modified_status" \
+            --arg removed "$removed_status" --arg untrusted "$untrusted_status" '[
+              {key:"example@test-market:hooks/hooks.json:session_start:0:0",pluginId:"example@test-market",currentHash:"sha256:stable-trusted-old",trustStatus:$trusted,enabled:false},
+              {key:"example@test-market:hooks/hooks.json:post_tool_use:0:0",pluginId:"example@test-market",currentHash:"sha256:stable-modified-old",trustStatus:$modified,enabled:true},
+              {key:"example@test-market:hooks/hooks.json:session_end:0:0",pluginId:"example@test-market",currentHash:"sha256:removed",trustStatus:$removed,enabled:true},
+              {key:"example@test-market:hooks/hooks.json:pre_tool_use:0:0",pluginId:"example@test-market",currentHash:"sha256:untrusted",trustStatus:$untrusted,enabled:true},
+              {key:"other@test-market:hooks/hooks.json:stop:0:0",pluginId:"other@test-market",currentHash:"sha256:other",trustStatus:"trusted",enabled:false}
+            ]')
+        fi
+        jq -cn --argjson id "$id" --arg cwd "$cwd" --argjson hooks "$hooks" \
+          '{id:$id,result:{data:[{cwd:$cwd,hooks:$hooks,warnings:[],errors:[]}]}}'
+        ;;
+      config/batchWrite)
+        printf '%s\n' "$request" | jq -c '.params' >>"$CODEX_HOOK_WRITES_FILE"
+        jq -cn --argjson id "$id" '{id:$id,result:{}}'
+        ;;
+      *) exit 64 ;;
+    esac
+  done
+  exit 0
+fi
 if [ "${1:-}" = --version ]; then
   printf '%s\n' 'codex fixture'
   exit 0
@@ -449,6 +528,7 @@ fi
 exit 64
 SH
 chmod +x "$tmp/bin/codex"
+ln -s "$real_node" "$tmp/bin/node"
 
 cat >"$tmp/bin/claude" <<SH
 #!/usr/bin/env bash
@@ -742,6 +822,7 @@ export SKILLS_UPDATE_MARKER="$tmp/skills-updated"
 export AGENT_EXEC_MARKER="$tmp/agent-executed"
 export RUNTIME_UPDATE_MARKER="$tmp/runtime-updated"
 export CODEX_STATE_FILE="$tmp/codex-state"
+export CODEX_HOOK_WRITES_FILE="$tmp/codex-hook-writes.jsonl"
 export CLAUDE_STATE_FILE="$tmp/claude-state"
 export SSH_COMMAND_LOG="$tmp/ssh-commands"
 export SCP_COMMAND_LOG="$tmp/scp-commands"
@@ -751,6 +832,54 @@ export SHELL="$tmp/bin/login-shell"
 export REAL_GIT="$real_git"
 export GIT_CLONE_FIXTURE="$tmp/clone-example.git"
 export GIT_PULL_MARKER="$tmp/git-pull-executed"
+
+printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
+approve_result=$(CODEX_HOOK_SCENARIO=approve \
+  "$cli" approve-codex-plugin-hooks example@test-market)
+[ "$(printf '%s\n' "$approve_result" | jq -r '.approved')" -eq 4 ] ||
+  fail "explicit Codex plugin hook approval did not approve every current matching hook"
+jq -e -s '
+  length == 1 and
+  (.[0].edits | length) == 4 and
+  all(.[0].edits[];
+    .mergeStrategy == "replace" and
+    (.keyPath | startswith("hooks.state.\"example@test-market:")) and
+    (.keyPath | endswith(".trusted_hash"))) and
+  ([.[0].edits[].keyPath | select(contains("other@test-market") or endswith(".enabled"))] | length) == 0
+' "$CODEX_HOOK_WRITES_FILE" >/dev/null ||
+  fail "explicit Codex hook approval changed unrelated or non-trust state"
+
+for hook_discovery_failure in warning error; do
+  rm -f "$CODEX_HOOK_WRITES_FILE"
+  if CODEX_HOOK_SCENARIO=$hook_discovery_failure \
+    "$cli" approve-codex-plugin-hooks example@test-market >/dev/null 2>&1; then
+    fail "Codex hook approval ignored hooks/list $hook_discovery_failure"
+  fi
+  [ ! -e "$CODEX_HOOK_WRITES_FILE" ] ||
+    fail "Codex hook approval wrote trust after discovery $hook_discovery_failure"
+done
+
+rm -f "$CODEX_HOOK_WRITES_FILE"
+printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
+update_result=$(CODEX_HOOK_SCENARIO=update \
+  node "$script_dir/codex-plugin-hooks.mjs" update example@test-market)
+[ "$(printf '%s\n' "$update_result" | jq -r '.refreshed')" -eq 2 ] ||
+  fail "Codex plugin update did not refresh both retained trusted/modified hooks"
+[ "$(cat "$CODEX_STATE_FILE")" = 1.3.0 ] ||
+  fail "Codex hook wrapper did not run the exact native plugin add"
+jq -e -s '
+  length == 1 and
+  (.[0].edits | length) == 2 and
+  any(.[0].edits[]; .keyPath | contains("session_start")) and
+  any(.[0].edits[]; .keyPath | contains("post_tool_use")) and
+  ([.[0].edits[].keyPath |
+    select(contains("session_end") or contains("pre_tool_use") or
+      contains(":stop:") or contains("other@test-market") or endswith(".enabled"))] | length) == 0
+' "$CODEX_HOOK_WRITES_FILE" >/dev/null ||
+  fail "Codex plugin update trusted a removed, new, untrusted, unrelated, or enabled entry"
+
+rm -f "$CODEX_HOOK_WRITES_FILE"
+printf '%s\n' 1.2.3 >"$CODEX_STATE_FILE"
 
 fake_darwin_bin="$tmp/fake-darwin-bin"
 fake_darwin_home="$tmp/fake-darwin-home"
@@ -5894,6 +6023,18 @@ EOF
 [ "$(jq -r '.verified' "$tmp/executor.json")" = true ] ||
   fail "executor status was not verified"
 "$cli" verify-executor "$tmp/executor.json" >/dev/null
+if [ -n "$pwsh_command" ]; then
+  rm -f "$CODEX_HOOK_WRITES_FILE"
+  windows_hook_approval=$(CODEX_HOOK_SCENARIO=approve "$pwsh_command" -NoLogo -NoProfile \
+    -File "$plugin_cache/scripts/apply-windows.ps1" \
+    -ApproveCodexPluginHooks example@test-market \
+    -ExecutorRequirementPath "$tmp/executor.json")
+  [ "$(printf '%s\n' "$windows_hook_approval" | jq -r '.approved')" = true ] ||
+    fail "native Windows hook approval path did not complete"
+  [ "$(jq -s '.[0].edits | length' "$CODEX_HOOK_WRITES_FILE")" -eq 4 ] ||
+    fail "native Windows hook approval path did not trust exact current hooks"
+  rm -f "$CODEX_HOOK_WRITES_FILE"
+fi
 mkdir -p "$tmp/gnu-stat-bin"
 cat >"$tmp/gnu-stat-bin/stat" <<'SH'
 #!/usr/bin/env bash

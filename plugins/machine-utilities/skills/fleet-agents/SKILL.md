@@ -42,19 +42,27 @@ guess an SSH alias or substitute WSL for native Windows.
 Before changing a target, capture a bounded `agents` inventory and retain only
 the exact plugin's Codex and Claude records as the before-state. Treat the two
 harnesses independently and refresh each available, applicable runtime.
-For local execution run the manager directly. For SSH, use the configured
-alias and execute through the target login shell (`$SHELL -lc`). Run only these
-manager-native command sequences, in order, substituting the authorized names:
+For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
+SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
+target's installed Machine Utilities version from its active Codex plugin
+record, and set `TARGET_CLI` to that target cache's
+`machine-utilities/VERSION/scripts/machine-utilities`; never send or interpolate
+the controller's `SKILL_DIR` or `CLI`. Require `"$TARGET_CLI" verify-executor`
+to pass before using it. Run only these target-native command sequences, in
+order, substituting the authorized names:
 
 ```text
 codex plugin marketplace upgrade MARKETPLACE --json
-codex plugin add PLUGIN@MARKETPLACE --json
+"$TARGET_CLI" update-codex-plugin PLUGIN@MARKETPLACE
 
 claude plugin marketplace update MARKETPLACE
 claude plugin update PLUGIN@MARKETPLACE --scope user
 ```
 
-The Codex add is idempotent. For Claude, use `plugin update` when the exact
+The Codex wrapper snapshots only that plugin's already trusted or modified hook
+keys, runs the exact idempotent `codex plugin add PLUGIN@MARKETPLACE --json`,
+refreshes trust for those same stable keys, and leaves new or previously
+untrusted hooks untrusted. For Claude, use `plugin update` when the exact
 plugin is installed; if it is absent, replace only that second Claude command
 with `claude plugin install PLUGIN@MARKETPLACE --scope user`. Do not update any
 other plugin or synchronize unrelated runtimes, settings, skills, provenance,
@@ -63,6 +71,14 @@ Recapture the bounded `agents` inventory after each harness attempt. Require the
 exact `PLUGIN@MARKETPLACE` record to be installed and enabled. Post-state must
 report the requested version. A failure in one harness does not erase the other
 harness's evidence or success.
+
+The only pre-helper fallback is a separately approved self-update of
+`machine-utilities@novotnyllc` from an integrity-verified release that lacks
+`update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
+`codex plugin add machine-utilities@novotnyllc --json`, recapture inventory,
+reload the new target-native plugin, and require its version `0.2.16` executor
+and integrity verification before any other mutation. Never use that raw-add
+fallback for another plugin or once the helper command is available.
 
 For a configured `codex-remote-control` target, follow the routine-refresh
 path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible
@@ -89,7 +105,8 @@ postcondition fails.
 The executor supports exact `codex update` and `claude update` runtime updates,
 plus updates for skills-cli, JSM, and Claude plugins.
 Codex replacement uses the native idempotent `codex plugin add
-PLUGIN@MARKETPLACE --json` operation. An already-current runtime is a successful
+PLUGIN@MARKETPLACE --json` operation through the same hook-preserving wrapper.
+An already-current runtime is a successful
 no-op after it remains present in post-inventory. For a missing runtime, use the
 official installer interactively or delegate a manager-owned install to
 `fleet-update`; downloaded installer pipelines, removals, and provider
@@ -103,6 +120,19 @@ possible. Do not write Claude Desktop internal state or undocumented Codex
 Desktop preferences. Claude's supported Remote Control default lives in the
 shared Code settings file; the invoking agent must check Codex Desktop host
 enablement manually.
+
+Codex hook approval is target-local state, not a portable settings allowlist.
+After the user explicitly approves the current hooks for one exact plugin and
+host scope, local runs
+`"$CLI" approve-codex-plugin-hooks PLUGIN@MARKETPLACE`; SSH runs the same command
+through the previously resolved and verified `"$TARGET_CLI"` in the target login
+shell. Native Windows uses the integrity-gated `-ApproveCodexPluginHooks` path
+in `"$SKILL_DIR/../../references/codex-remote-control.md"`. Each path discovers
+hooks with a fresh Codex app server, writes only matching `trusted_hash` leaves,
+preserves disabled and unrelated hook state, and verifies every current matching
+hook is trusted. Never copy the complete `[hooks.state]` table between hosts.
+Later updates inherit approval only for the same stable hook keys; new hooks
+require a new explicit approval.
 
 Use local/SSH execution where configured. SSH uses bounded connection and
 keepalive timeouts and must match the configured native hostname/user before

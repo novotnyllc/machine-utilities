@@ -95,7 +95,7 @@ only these mutation commands in order for each applicable harness:
 ```powershell
 # Codex
 codex plugin marketplace upgrade MARKETPLACE --json
-codex plugin add PLUGIN@MARKETPLACE --json
+node "EXACT-MACHINE-UTILITIES-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update PLUGIN@MARKETPLACE
 
 # Claude
 claude plugin marketplace update MARKETPLACE
@@ -119,6 +119,20 @@ an executor load or verification was attempted. This manager-native refresh
 does not require or preflight the Machine Utilities executor, because that
 would prevent it from repairing a stale Machine Utilities installation.
 
+For an explicit Codex hook approval, first verify the exact native Machine
+Utilities root against `executor.json`, then invoke only its helper:
+
+```powershell
+pwsh -NoProfile -File "VERIFIED-MACHINE-UTILITIES-ROOT\scripts\apply-windows.ps1" `
+  -ApproveCodexPluginHooks PLUGIN@MARKETPLACE `
+  -ExecutorRequirementPath executor.json
+# The verified PowerShell boundary runs exactly:
+node "VERIFIED-MACHINE-UTILITIES-ROOT\scripts\codex-plugin-hooks.mjs" approve PLUGIN@MARKETPLACE
+```
+
+The helper writes only current matching trust hashes and verifies them. Do not
+approve through WSL, a controller-local helper, or an unverified plugin root.
+
 Use the full protocol below for inventory, broad reconciliation, settings,
 provenance, conversions, ambiguous scope, and sealed-plan mutations.
 
@@ -133,8 +147,17 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    -ExecutorRequirementPath executor.json`. If the version or any hash differs, return
    `executor_update_required` and run no collector or mutation.
 3. Updating the executor is a separately approved bootstrap action. Use
-   `codex plugin marketplace upgrade novotnyllc --json` followed by
-   `codex plugin add machine-utilities@novotnyllc --json`. For Claude local or
+   `codex plugin marketplace upgrade novotnyllc --json` followed by the current
+   integrity-verified helper:
+   `node "EXACT-MACHINE-UTILITIES-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update machine-utilities@novotnyllc`.
+   It snapshots hook trust before running the exact native plugin add. The only
+   fallback is a separately approved Machine Utilities self-update from an
+   integrity-verified release that predates this helper: after the marketplace
+   upgrade, run exactly
+   `codex plugin add machine-utilities@novotnyllc --json`, end that task, start a
+   fresh task, and verify the `0.2.16` executor and integrity manifest before any
+   other mutation. Never use raw add as a fallback for another plugin or once
+   the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by
    `claude plugin update machine-utilities@novotnyllc --scope user`. End the
    bootstrap task and start a fresh task before loading any Machine Utilities

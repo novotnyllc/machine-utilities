@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "90461115f53d6f821213202ed958ded3ada7a4be0620f5ffdcd23a8d21316e4c"
+      "sha256": "2f271ab2cf8da3c84fc1d83480b42aac69a26f4abd5e5ba86c463a85723501df"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "2901c65d9e34af91f9e81848e77cb01525e28df9d3684a980893771d0af7fcc2"
+      "sha256": "99f2dca370867a476541dea02d6f8bc10700507cd7e7e772919a1a871526f5f8"
     },
     {
       "path": "references/privilege-policy.default",
@@ -18,11 +18,15 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "86cdcbb6f7cec9db2dcce134d6e8a488958803b437ca9d3e52716e58422fed33"
+      "sha256": "acbfcc5a8a4991b77df709719a1f167fb87bcd9e5c86306588eb4ed40f601548"
     },
     {
       "path": "scripts/certify-ssh-node",
       "sha256": "851657fb197ca7e74275df4610290669ac2ebe39d4e35d226d90cb29c0ccc0c9"
+    },
+    {
+      "path": "scripts/codex-plugin-hooks.mjs",
+      "sha256": "9640f5d9ecd78bbacfde50bdd0aa82de628b4fa5cda60006757ee9c4ecd2f750"
     },
     {
       "path": "scripts/collect-posix",
@@ -54,7 +58,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "8dcd6dbbdb1bd45b2ef567e4cdb035ed0a4481bb99c3f154acfb2c709fc82ce7"
+      "sha256": "f957b9180ac235383f0b4a8c6c19b1866273bff2c1df68ba70b1e246977c591f"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -85,5 +89,5 @@
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.15"
+  "version": "0.2.16"
 }

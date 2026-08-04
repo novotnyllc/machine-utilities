@@ -6,6 +6,7 @@ param(
     [ValidatePattern("^[0-9A-Fa-f]{64}$")][string]$ExpectedPlanFileSha256,
     [Parameter(Mandatory = $true, ParameterSetName = "Apply")]
     [Parameter(Mandatory = $true, ParameterSetName = "VerifyExecutor")]
+    [Parameter(Mandatory = $true, ParameterSetName = "ApproveHooks")]
     [string]$ExecutorRequirementPath,
     [Parameter(Mandatory = $true, ParameterSetName = "Apply")]
     [ValidatePattern("^plan-[0-9a-f]{16}$")][string]$PlanId,
@@ -15,6 +16,9 @@ param(
     [ValidatePattern("^[0-9A-Fa-f]{64}$")][string]$ControllerConfigDigest,
     [Parameter(Mandatory = $true, ParameterSetName = "Apply")][string]$ResultPath,
     [Parameter(Mandatory = $true, ParameterSetName = "VerifyExecutor")][switch]$VerifyExecutor,
+    [Parameter(Mandatory = $true, ParameterSetName = "ApproveHooks")]
+    [ValidatePattern("^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")]
+    [string]$ApproveCodexPluginHooks,
     [Parameter(Mandatory = $true, ParameterSetName = "SelfTest")][switch]$SelfTest
 )
 
@@ -719,6 +723,27 @@ function Invoke-Exact([string[]]$Argv) {
     return $(if ($null -eq $NativeExitCode) { 0 } else { [int]$NativeExitCode })
 }
 
+function Invoke-CodexPluginHooks([string]$Action, [string]$PluginId) {
+    if ($Action -notin @("approve", "update")) { throw "Invalid Codex hook action" }
+    if ($PluginId -notmatch "^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$") {
+        throw "Invalid Codex plugin ID"
+    }
+    $Node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $Node) { throw "Node.js is required for Codex plugin hook refresh" }
+    $Helper = Join-Path $PSScriptRoot "codex-plugin-hooks.mjs"
+    Assert-RegularFile $Helper "Codex plugin hook helper" | Out-Null
+    & $Node.Source $Helper $Action $PluginId *> $null
+    $Succeeded = $?
+    $NativeExitCode = $LASTEXITCODE
+    if (-not $Succeeded -or ($null -ne $NativeExitCode -and $NativeExitCode -ne 0)) {
+        $Failure = [InvalidOperationException]::new("Codex plugin hook operation failed")
+        $Failure.Data["ExitCode"] = $(if ($null -eq $NativeExitCode) { 1 } else { [int]$NativeExitCode })
+        throw $Failure
+    }
+    return $(if ($null -eq $NativeExitCode) { 0 } else { [int]$NativeExitCode })
+}
+
 function Get-SafeFailureMessage([object]$ErrorRecord) {
     $Message = [string]$ErrorRecord
     if ($ErrorRecord -is [Management.Automation.ErrorRecord]) {
@@ -991,6 +1016,11 @@ if ($SelfTest) {
         if ((ConvertTo-CanonicalJson $RuntimeArgv) -ne '["codex","update"]') {
             throw "Agent runtime argv self-test failed"
         }
+        $ApprovalRejected = $false
+        try { [void](Invoke-CodexPluginHooks "invalid" "example@test-market") } catch {
+            $ApprovalRejected = $true
+        }
+        if (-not $ApprovalRejected) { throw "Codex hook approval action self-test failed" }
         $ChezmoiPullArgv = @(Get-ExactArgv ([pscustomobject]@{
             type = "chezmoi-pull"; kind = "file"; id = "chezmoi:source"
         }) $null $null)
@@ -1467,6 +1497,20 @@ if ($VerifyExecutor) {
     exit 0
 }
 
+if ($PSCmdlet.ParameterSetName -eq "ApproveHooks") {
+    Assert-RegularFile $ExecutorRequirementPath "Executor requirement" | Out-Null
+    $RequiredExecutor = Get-Content -LiteralPath $ExecutorRequirementPath -Raw | ConvertFrom-Json
+    if ($null -ne $RequiredExecutor.required_executor) {
+        $RequiredExecutor = $RequiredExecutor.required_executor
+    }
+    Assert-ExecutorShape $RequiredExecutor
+    Assert-Executor $RequiredExecutor (Get-InstalledExecutor)
+    [void](Invoke-CodexPluginHooks "approve" $ApproveCodexPluginHooks)
+    [ordered]@{ pluginId = $ApproveCodexPluginHooks; approved = $true } |
+        ConvertTo-Json -Compress
+    exit 0
+}
+
 Assert-RegularFile $ConfigPath "Worker configuration" | Out-Null
 Assert-RegularFile $PlanPath "Apply plan" | Out-Null
 Assert-RegularFile $ExecutorRequirementPath "Executor requirement" | Out-Null
@@ -1563,7 +1607,11 @@ for ($Index = 0; $Index -lt @($Plan.operations).Count; $Index++) {
         if ($Operation.type -in @("project-clone", "project-update")) {
             Prepare-ProjectMutationPath $Operation $Config $Machine
         }
-        $ExitCode = Invoke-Exact $ExpectedArgv
+        if ($Operation.type -eq "agent-update" -and [string]$Operation.id -like "codex:*") {
+            $ExitCode = Invoke-CodexPluginHooks "update" $ExpectedArgv[3]
+        } else {
+            $ExitCode = Invoke-Exact $ExpectedArgv
+        }
         [void]$OperationResults.Add([ordered]@{
             operation = $Operation
             index = $Index

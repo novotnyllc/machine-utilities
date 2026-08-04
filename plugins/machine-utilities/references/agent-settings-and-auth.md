@@ -36,6 +36,21 @@ Codex CLI, IDE, app server, and Desktop share `$CODEX_HOME/config.toml` (normall
 `cli_auth_credentials_store`. Do not inventory the entire TOML file because MCP
 sections may contain secrets.
 
+Codex stores unmanaged hook decisions under `[hooks.state]`. Treat that table as
+machine-local trust state, not as an `agent_artifacts.settings` value and never
+copy the whole table between machines. An explicit approval for an exact
+`PLUGIN@MARKETPLACE` may be applied on each selected host with
+`machine-utilities approve-codex-plugin-hooks PLUGIN@MARKETPLACE`. It uses a
+fresh `codex app-server --stdio` session to discover the target's current hook
+hashes, updates only matching `trusted_hash` leaves through `config/batchWrite`,
+and verifies the result without changing `enabled` or unrelated entries.
+
+Codex plugin updates preserve approval only for hook keys that were already
+`trusted` or `modified` before the update. The wrapper runs the exact native
+plugin add, refreshes only those same stable keys to their new current hashes,
+and fails if a new or previously untrusted hook becomes trusted. New hook keys
+always require a separate explicit approval.
+
 There is no documented persistent setting that forces Codex Desktop Remote on.
 Check and report Desktop host enablement and device pairing manually.
 Signing out disables Remote until the user turns it on again. The experimental

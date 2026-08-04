@@ -22,6 +22,8 @@ Usage:
   machine-utilities compare LEFT.jsonl RIGHT.jsonl
   machine-utilities executor-status [OUTPUT.json|-]
   machine-utilities verify-executor [REQUIREMENT.json]
+  machine-utilities approve-codex-plugin-hooks PLUGIN@MARKETPLACE
+  machine-utilities update-codex-plugin PLUGIN@MARKETPLACE
   machine-utilities privilege-status TARGET OUTPUT.jsonl|-
   machine-utilities prepare-privilege-identity FLEET-DOMAIN NODE-ID ENDPOINT-PRINCIPALS SOURCE-CIDRS OUTPUT|-
   machine-utilities prepare-privilege-enrollment TARGET OUTPUT.json|-
@@ -645,6 +647,23 @@ require_jq() {
     printf 'machine-utilities: jq is required; inventory unavailable\n' >&2
     exit 69
   fi
+}
+
+codex_plugin_hooks_command() {
+  action=$1
+  shift
+  plugin_id=$1
+  require_jq
+  printf '%s\n' "$plugin_id" |
+    jq -eR 'test("^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")' >/dev/null || {
+      printf 'machine-utilities: invalid Codex plugin ID\n' >&2
+      exit 64
+    }
+  command -v node >/dev/null 2>&1 || {
+    printf 'machine-utilities: Node.js is required for Codex hook approval\n' >&2
+    exit 69
+  }
+  node "$script_dir/codex-plugin-hooks.mjs" "$action" "$plugin_id"
 }
 
 ssh_run() {
@@ -3939,6 +3958,12 @@ EOF
             printf 'machine-utilities: unsafe Codex plugin update argv\n' >&2
             return 64
           }
+          command -v node >/dev/null 2>&1 || {
+            printf 'machine-utilities: Node.js is required for Codex plugin hook refresh\n' >&2
+            return 69
+          }
+          node "$script_dir/codex-plugin-hooks.mjs" update "$plugin_id" >/dev/null
+          return
           ;;
         claude:*)
           plugin_tail=${id#claude:}
@@ -6934,6 +6959,14 @@ case $command in
   verify-executor)
     [ $# -le 1 ] || usage
     if [ $# -eq 0 ]; then executor_status_command -; else verify_executor_requirement "$1"; fi
+    ;;
+  approve-codex-plugin-hooks)
+    [ $# -eq 1 ] || usage
+    codex_plugin_hooks_command approve "$1"
+    ;;
+  update-codex-plugin)
+    [ $# -eq 1 ] || usage
+    codex_plugin_hooks_command update "$1"
     ;;
   privilege-status) [ $# -eq 2 ] || usage; privilege_status_command "$1" "$2" ;;
   prepare-privilege-identity)
