@@ -46,7 +46,7 @@
     },
     {
       "path": "scripts/enroll-ssh-posix",
-      "sha256": "c01583e478eddc8611c8dc03ce77703a3c1968947f103674713e4faf2a2020c0"
+      "sha256": "f2b3b370812414cfe2316fdd24d1dd91f1e866578923f10459e3b95b5bc8501e"
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",

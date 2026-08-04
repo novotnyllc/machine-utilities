@@ -2129,13 +2129,21 @@ selftest_run_fixture() {
   local krl_two bad_krl request_two request_same_krl_generation same_krl_confirmation revoked_node peer_node revoked_rc peer_rc
   local new_ca dual_ca krl_three request_dual previous_fingerprint
   local krl_four request_early early_confirmation
-  selftest_make_native_fixture "$root" "$fixture_platform_name"
-  selftest_stale_lock_claim "$root"
+  selftest_make_native_fixture "$root" "$fixture_platform_name" || {
+    printf 'enroll-ssh-posix self-test: %s native fixture failed\n' "$fixture_platform_name" >&2; return 1;
+  }
+  selftest_stale_lock_claim "$root" || {
+    printf 'enroll-ssh-posix self-test: %s stale lock failed\n' "$fixture_platform_name" >&2; return 1;
+  }
   if [ "$fixture_platform_name" = linux ]; then
     MACHINE_UTILITIES_U6_FIXTURE_ROOT="$root" MACHINE_UTILITIES_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
-      /bin/bash -p -c 'source "$1" status >/dev/null; selftest_stale_lock_capture_order' bash "$self" || return 1
+      /bin/bash -p -c 'source "$1" status >/dev/null; selftest_stale_lock_capture_order' bash "$self" || {
+        printf 'enroll-ssh-posix self-test: linux stale lock capture failed\n' >&2; return 1;
+      }
   fi
-  manifest=$(selftest_make_bundle "$root" "$self")
+  manifest=$(selftest_make_bundle "$root" "$self") || {
+    printf 'enroll-ssh-posix self-test: %s bundle failed\n' "$fixture_platform_name" >&2; return 1;
+  }
   bundle=$root/var/lib/machine-utilities-bootstrap/staged/$manifest
   /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$root/input/fleet-ca"
   ca=$root/input/fleet-ca.pub
@@ -2144,7 +2152,9 @@ selftest_run_fixture() {
   /bin/chmod 0600 "$ca" "$krl"
   request=$root/input/request
   selftest_make_request "$root" "$fixture_platform_name" "$manifest" "$ca" "$krl" "$request"
-  if [ "$fixture_platform_name" = linux ]; then selftest_sshd_scope "$root" "$(/usr/bin/id -un)" || return 1; fi
+  if [ "$fixture_platform_name" = linux ]; then selftest_sshd_scope "$root" "$(/usr/bin/id -un)" || {
+    printf 'enroll-ssh-posix self-test: linux sshd scope failed\n' >&2; return 1;
+  }; fi
   selftest_make_effective "$root" "$(/usr/bin/id -un)"
   output=$root/preview.out
   if ! MACHINE_UTILITIES_U6_FIXTURE_ROOT="$root" MACHINE_UTILITIES_U6_FIXTURE_PLATFORM="$fixture_platform_name" \
