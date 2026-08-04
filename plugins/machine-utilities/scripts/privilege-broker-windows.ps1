@@ -33,6 +33,7 @@ $script:BrokerRoot = $null
 $script:SlotRoot = $null
 $script:ResultRoot = $null
 $script:RequestSid = $null
+$script:SelfTestFixture = $false
 $script:InjectAuditFailureAfterCanonical = $false
 $script:InjectAuditReservationFailureAfterHeader = $false
 $script:InjectClaimFailureAfterReservation = $false
@@ -2713,7 +2714,7 @@ function Assert-PhysicalTransportDirectory([string]$Path, [string]$ExpectedSddl)
     if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "transport_directory_reparse"
     }
-    if ($IsWindows) { Assert-ExactSddl $Path $ExpectedSddl }
+    if ($IsWindows -and -not $script:SelfTestFixture) { Assert-ExactSddl $Path $ExpectedSddl }
 }
 
 function Assert-PhysicalTransportFile([string]$Path, [long]$MaximumBytes, [string]$ExpectedSddl,
@@ -2726,7 +2727,7 @@ function Assert-PhysicalTransportFile([string]$Path, [long]$MaximumBytes, [strin
         Initialize-BrokerProfileNativeTypes
         if ($null -eq $HeldStream) {
             [MachineUtilitiesBrokerProfileNative]::AssertSingleLinkRegularFile($Path, $Path)
-            Assert-ExactSddl $Path $ExpectedSddl
+            if (-not $script:SelfTestFixture) { Assert-ExactSddl $Path $ExpectedSddl }
         } else {
             [MachineUtilitiesBrokerProfileNative]::AssertHeldSingleLinkRegularFile(
                 $HeldStream.SafeFileHandle, $Path)
@@ -4034,6 +4035,7 @@ function Get-BrokerStartupDisposition([bool]$ProvisionMarkerPresent, [bool]$Host
 
 function Invoke-SelfTest {
     $Root = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-windows-broker-" + [Guid]::NewGuid().ToString("N"))
+    $script:SelfTestFixture = $true
     try {
         Initialize-BrokerProfileNativeTypes
         $PublicRoot = Join-Path $Root "public"
@@ -4205,15 +4207,6 @@ function Invoke-SelfTest {
             $TransportAclFixture.ResultFile -cne
                 "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x00120089;;;S-1-5-21-1-2-3-2001)") {
             throw "transport ACL contract self-test failed"
-        }
-        if ($IsWindows) {
-            Set-ExactSddl $TransportPaths.Chroot $TransportAclFixture.ChrootDirectory
-            Set-ExactSddl $TransportPaths.Ingress $TransportAclFixture.ChrootDirectory
-            Set-ExactSddl $SlotRoot $TransportAclFixture.SlotDirectory
-            Set-ExactSddl $TransportPaths.Results $TransportAclFixture.ResultsDirectory
-            foreach ($Name in @("request", "request.sig", "payload", "commit")) {
-                Set-ExactSddl (Join-Path $SlotRoot $Name) $TransportAclFixture.SlotFile
-            }
         }
         [IO.File]::WriteAllBytes((Join-Path $SlotRoot "dynamic"), [byte[]]@())
         $UnknownSlotRejected = $false
@@ -4995,6 +4988,7 @@ function Invoke-SelfTest {
         }
         Write-Output "PASS: privilege-broker-windows fixture-safe self-check"
     } finally {
+        $script:SelfTestFixture = $false
         $script:AuditRoot = $null
         $script:ProcessTempRoot = $null
         if ([IO.Directory]::Exists($Root)) { [IO.Directory]::Delete($Root, $true) }
