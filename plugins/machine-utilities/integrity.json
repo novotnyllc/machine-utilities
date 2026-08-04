@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/certify-ssh-node",
-      "sha256": "04bd38a0e82edc95900220af38ebb5dfa23814e32952a43a67ced85838754bf5"
+      "sha256": "3938a2c5be9d1b94994cfaacb5f4ff93d194313fc58de628cdca474502c60413"
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
