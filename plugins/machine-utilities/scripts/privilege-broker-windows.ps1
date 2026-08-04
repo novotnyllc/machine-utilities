@@ -4206,6 +4206,15 @@ function Invoke-SelfTest {
                 "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x00120089;;;S-1-5-21-1-2-3-2001)") {
             throw "transport ACL contract self-test failed"
         }
+        if ($IsWindows) {
+            Set-ExactSddl $TransportPaths.Chroot $TransportAclFixture.ChrootDirectory
+            Set-ExactSddl $TransportPaths.Ingress $TransportAclFixture.ChrootDirectory
+            Set-ExactSddl $SlotRoot $TransportAclFixture.SlotDirectory
+            Set-ExactSddl $TransportPaths.Results $TransportAclFixture.ResultsDirectory
+            foreach ($Name in @("request", "request.sig", "payload", "commit")) {
+                Set-ExactSddl (Join-Path $SlotRoot $Name) $TransportAclFixture.SlotFile
+            }
+        }
         [IO.File]::WriteAllBytes((Join-Path $SlotRoot "dynamic"), [byte[]]@())
         $UnknownSlotRejected = $false
         try { Assert-FixedTransportLayout $Root $PublicRoot $script:RequestSid }

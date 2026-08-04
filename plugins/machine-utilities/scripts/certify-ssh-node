@@ -91,7 +91,11 @@ usage() {
 record() { printf '%s\n' "$@"; }
 
 portable_stat() {
-  /usr/bin/stat -f "$1" "$3" 2>/dev/null || /usr/bin/stat -c "$2" "$3" 2>/dev/null
+  case $(/usr/bin/uname -s) in
+    Darwin) /usr/bin/stat -f "$1" "$3" 2>/dev/null ;;
+    Linux) /usr/bin/stat -c "$2" "$3" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
 }
 file_owner() { portable_stat %Su %U "$1"; }
 file_group() { portable_stat %Sg %G "$1"; }

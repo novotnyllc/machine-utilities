@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/certify-ssh-node",
-      "sha256": "c37e9ef47730feea17b2edb7ae048ac3b9e46d2c3857e148d8ccf90681bd827a"
+      "sha256": "7a51460b7d003e267713ff0a5222dc98b7d6a7e565025a66fb689655a509d214"
     },
     {
       "path": "scripts/collect-posix",
@@ -34,7 +34,7 @@
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "995e2fa2e7f3e571fcc1b8945de255be76c79659145b45dd78188a361ca1bc4c"
+      "sha256": "b514619d7021d48616c302073296dbb1f23d10a0c85719625c718bf668347486"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/enroll-ssh-posix",
-      "sha256": "27d5a98553eb2053b5974ef4708ba6a556f9a1d9c69e5eb2fbd9dfc1e329686e"
+      "sha256": "c01583e478eddc8611c8dc03ce77703a3c1968947f103674713e4faf2a2020c0"
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",
@@ -58,15 +58,15 @@
     },
     {
       "path": "scripts/prepare-ssh-identity",
-      "sha256": "e84cae69f4f352a65252e1b5265f2a9f09fea8d25af4851a88d3dd98c17c1a40"
+      "sha256": "45556ddcd8be1fc45db9e132b25125716f4714946a980710ec2bc19529d1d044"
     },
     {
       "path": "scripts/privilege-broker-posix",
-      "sha256": "3f1f1ec0bab29abf457ea7092510737e700069379b909b4f75c6a4172d28956f"
+      "sha256": "05c75258e6e18facc6d8ce3823ba6309bb4c080ecf353bb6b7f89223bff7097f"
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "fa4381c200ed15ece3db194967e58dbb95948f3a30ae25ab87d3c1e56b7ba373"
+      "sha256": "8494dda112f30a5e90de244b456b54b765141afa19500550605cf2304568f5ec"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",
