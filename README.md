@@ -81,8 +81,8 @@ plugins/machine-utilities/scripts/machine-utilities executor-status executor.jso
 plugins/machine-utilities/scripts/machine-utilities verify-executor executor.json
 plugins/machine-utilities/scripts/machine-utilities privilege-status HOST privilege-status.jsonl
 plugins/machine-utilities/scripts/machine-utilities prepare-privilege-enrollment HOST enrollment.json
-plugins/machine-utilities/scripts/machine-utilities prepare-privilege-identity HOST identity.json
-plugins/machine-utilities/scripts/machine-utilities profile-bundle HOST bundle.json
+plugins/machine-utilities/scripts/machine-utilities prepare-privilege-identity FLEET-DOMAIN NODE-ID ENDPOINT-PRINCIPALS SOURCE-CIDRS identity.json
+plugins/machine-utilities/scripts/machine-utilities profile-bundle spec.json source-root bundle.bin
 plugins/machine-utilities/scripts/machine-utilities worker-config HOST DOMAIN worker-config.json
 plugins/machine-utilities/scripts/machine-utilities collect --target local --section all --output snapshot.jsonl
 plugins/machine-utilities/scripts/machine-utilities validate snapshot.jsonl
