@@ -2063,9 +2063,13 @@ done
 [ "$(command -v mktemp)" = /usr/bin/mktemp ] || exit 84
 private_tmp=$(/usr/bin/mktemp -d /tmp/machine-utilities-u6-dispatch-probe.XXXXXX) || exit 85
 case $private_tmp in /tmp/machine-utilities-u6-dispatch-probe.*) ;; *) exit 85 ;; esac
-mode=$(/usr/bin/stat -f %Lp "$private_tmp" 2>/dev/null || /usr/bin/stat -c %a "$private_tmp" 2>/dev/null) || exit 85
+case $(/usr/bin/uname -s) in
+  Darwin) mode=$(/usr/bin/stat -f %Lp "$private_tmp" 2>/dev/null); owner=$(/usr/bin/stat -f %Su "$private_tmp" 2>/dev/null) ;;
+  Linux) mode=$(/usr/bin/stat -c %a "$private_tmp" 2>/dev/null); owner=$(/usr/bin/stat -c %U "$private_tmp" 2>/dev/null) ;;
+  *) exit 85 ;;
+esac
 mode=$(printf '%s' "$mode" | /usr/bin/sed 's/.*\(...\)$/\1/')
-[ "$mode" = 700 ] && [ "$(/usr/bin/stat -f %Su "$private_tmp" 2>/dev/null || /usr/bin/stat -c %U "$private_tmp")" = "$expected_account" ] || exit 85
+[ "$mode" = 700 ] && [ "$owner" = "$expected_account" ] || exit 85
 /bin/rmdir "$private_tmp" || exit 85
 printf '%s\n' environment-probe-ok
 exit 73

@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          MACHINE_UTILITIES_U6_SELFTEST_TRACE=1 plugins/machine-utilities/scripts/enroll-ssh-posix self-test
+          plugins/machine-utilities/scripts/enroll-ssh-posix self-test
           plugins/machine-utilities/scripts/prepare-ssh-identity self-test
           plugins/machine-utilities/scripts/certify-ssh-node self-test
       - name: Validate fleet skill frontmatter
