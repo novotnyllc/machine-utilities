@@ -861,15 +861,16 @@ claim_stale_lock() {
 }
 
 replace_classified_stale_lock_fixture() {
-  local replacement_token retired
+  local replacement_pid replacement_token retired
   [ "$fixture_mode" = true ] &&
     [ "${MACHINE_UTILITIES_U6_TEST_REPLACE_CLASSIFIED_LOCK:-}" = replace ] || return 0
   retired=$state_root/observed-stale-lock
   [ ! -e "$retired" ] && [ ! -L "$retired" ] || return 1
   /bin/mv "$lifecycle_lock" "$retired" || return 1
   /bin/mkdir "$lifecycle_lock" && /bin/chmod 0700 "$lifecycle_lock" || return 1
-  replacement_token=$(process_token "${BASHPID:-$$}") || return 1
-  printf 'lifecycle-lock|1|%s|%s|recover\n' "${BASHPID:-$$}" "$replacement_token" |
+  replacement_pid=${BASHPID:-$$}
+  replacement_token=$(process_token "$replacement_pid") || return 1
+  printf 'lifecycle-lock|1|%s|%s|recover\n' "$replacement_pid" "$replacement_token" |
     write_atomic "$lifecycle_lock/owner" 0600
 }
 
@@ -887,15 +888,16 @@ retire_stale_lock() {
 }
 
 acquire_lifecycle_lock() {
-  local operation=$1 observed
+  local operation=$1 observed owner_pid
   if [ -e "$lifecycle_lock" ] || [ -L "$lifecycle_lock" ]; then retire_stale_lock || return $?; fi
   /bin/mkdir "$lifecycle_lock" || return 75
   /bin/chmod 0700 "$lifecycle_lock"
   if [ "$fixture_mode" = false ]; then /usr/sbin/chown root:root "$lifecycle_lock"; fi
-  observed=$(process_token "${BASHPID:-$$}") || { /bin/rmdir "$lifecycle_lock"; return 74; }
-  printf 'lifecycle-lock|1|%s|%s|%s\n' "${BASHPID:-$$}" "$observed" "$operation" |
+  owner_pid=${BASHPID:-$$}
+  observed=$(process_token "$owner_pid") || { /bin/rmdir "$lifecycle_lock"; return 74; }
+  printf 'lifecycle-lock|1|%s|%s|%s\n' "$owner_pid" "$observed" "$operation" |
     write_atomic "$lifecycle_lock/owner" 0600 || { /bin/rmdir "$lifecycle_lock" 2>/dev/null || :; return 74; }
-  read_lock && [ "$lock_pid" = "${BASHPID:-$$}" ] && [ "$lock_token" = "$observed" ]
+  read_lock && [ "$lock_pid" = "$owner_pid" ] && [ "$lock_token" = "$observed" ]
 }
 
 release_lifecycle_lock() {
@@ -1919,7 +1921,7 @@ selftest_stale_lock_claim() {
 
 selftest_stale_lock_capture_order() {
   local retired stale_directory_identity stale_owner_identity replacement_directory_identity
-  local replacement_owner_identity replacement_record replacement_token rc
+  local replacement_owner_identity replacement_pid replacement_record replacement_token rc
   [ "$fixture_mode" = true ] && [ ! -e "$state_root" ] && [ ! -L "$state_root" ] || {
     printf 'enroll-ssh-posix self-test: stale capture initial state failed\n' >&2; return 1;
   }
@@ -1933,10 +1935,11 @@ selftest_stale_lock_capture_order() {
   stale_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 1
   if MACHINE_UTILITIES_U6_TEST_REPLACE_CLASSIFIED_LOCK=replace retire_stale_lock; then rc=0; else rc=$?; fi
   [ "$rc" -eq 74 ] || { printf 'enroll-ssh-posix self-test: stale capture retirement failed\n' >&2; return 1; }
-  replacement_token=$(process_token "${BASHPID:-$$}") || {
+  replacement_pid=${BASHPID:-$$}
+  replacement_token=$(process_token "$replacement_pid") || {
     printf 'enroll-ssh-posix self-test: stale capture process token failed\n' >&2; return 1;
   }
-  replacement_record="lifecycle-lock|1|${BASHPID:-$$}|$replacement_token|recover"
+  replacement_record="lifecycle-lock|1|$replacement_pid|$replacement_token|recover"
   replacement_directory_identity=$(file_identity "$lifecycle_lock") || return 1
   replacement_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 1
   [ "$(/usr/bin/sed -n '1p' "$lifecycle_lock/owner")" = "$replacement_record" ] &&
