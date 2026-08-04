@@ -91,8 +91,11 @@ fallback for another plugin or once the helper command is available.
 
 For a configured `codex-remote-control` target, follow the routine-refresh
 path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible
-native task and native PowerShell. Lazy-discover the task-control app tools
-before declaring them unavailable.
+native task and native PowerShell. Before its task creation and every chunk or
+other work-starting follow-up, invoke the reference's exact shared
+`agent-utilities:model-routing/v1` runtime-skill contract; no local model
+policy is permitted. Lazy-discover the task-control app tools before declaring
+them unavailable.
 
 Use the sealed-plan reconciliation path below instead when the request includes
 broad drift, runtime or settings changes, provenance repair, provider
@@ -151,8 +154,9 @@ available. Never use raw non-login SSH command execution or infer that tooling
 is absent from its restricted `PATH`. For Windows Codex tasks read and follow
 `"$SKILL_DIR/../../references/codex-remote-control.md"`; its explicit routine
 named-plugin path may run the native Claude CLI in the visible native PowerShell
-task. Outside that narrow path, Claude reports the transport control surface as
-unsupported rather than using WSL. Re-inventory after changes and report
+task only after the shared routing dispatch is admitted and claimed. Outside
+that narrow path, Claude reports the transport control surface as unsupported
+rather than using WSL. Re-inventory after changes and report
 unresolved provenance as unknown, not guessed.
 
 ## Protected profile actions

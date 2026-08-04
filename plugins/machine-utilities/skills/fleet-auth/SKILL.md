@@ -59,8 +59,10 @@ chooses `encrypted-install`; otherwise keep Codex authentication per-machine.
 Matching SHA-256 proves identical bytes, not valid authentication. Prefer
 per-machine least-privilege credentials for unattended work. For Windows,
 Codex uses a visible saved-project task as described in
-`"$SKILL_DIR/../../references/codex-remote-control.md"`; Claude reports
-unsupported. Never route secrets through WSL or another machine as a bridge.
+`"$SKILL_DIR/../../references/codex-remote-control.md"`, including its exact
+shared `agent-utilities:model-routing/v1` dispatch before task creation or a
+work-starting follow-up; Claude reports unsupported. Never route secrets
+through WSL or another machine as a bridge.
 
 Protected broker records are status-only for this skill. Use
 `"$CLI" privilege-status HOST SNAPSHOT` and the shared Codex/Claude vocabulary
