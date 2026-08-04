@@ -93,7 +93,7 @@ For a configured `codex-remote-control` target, follow the routine-refresh
 path in `"$SKILL_DIR/../../references/codex-remote-control.md"`, using a visible
 native task and native PowerShell. Before its task creation and every chunk or
 other work-starting follow-up, invoke the reference's exact shared
-`agent-utilities:model-routing/v1` runtime-skill contract; no local model
+`agent-utilities/model-routing/v1` runtime-skill contract; no local model
 policy is permitted. Lazy-discover the task-control app tools before declaring
 them unavailable.
 

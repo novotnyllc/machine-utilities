@@ -45,7 +45,7 @@ remote_control_text=$(cat "$remote_control_reference")
 
 for routing_consumer in fleet-agents fleet-auth fleet-chezmoi fleet-inventory fleet-projects fleet-update; do
   routing_consumer_text=$(cat "$script_dir/../skills/$routing_consumer/SKILL.md")
-  assert_contains "$routing_consumer_text" 'agent-utilities:model-routing/v1'
+  assert_contains "$routing_consumer_text" 'agent-utilities/model-routing/v1'
 done
 
 assert_contains "$fleet_agents_text" 'MACHINE_UTILITIES_CONFIG'

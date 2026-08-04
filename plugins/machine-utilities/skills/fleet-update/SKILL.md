@@ -46,7 +46,7 @@ permission from a request to inspect or plan.
 
 Run each native manager directly on local/SSH hosts. For Windows, Codex reads
 and follows `"$SKILL_DIR/../../references/codex-remote-control.md"`, including
-its exact shared `agent-utilities:model-routing/v1` dispatch before task
+its exact shared `agent-utilities/model-routing/v1` dispatch before task
 creation or a work-starting follow-up; Claude reports unsupported. Never fall
 back through WSL. Preserve native approval
 prompts, stop per host on failure, and recapture package inventory afterward.
