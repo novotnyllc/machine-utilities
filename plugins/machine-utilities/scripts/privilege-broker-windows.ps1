@@ -2236,11 +2236,11 @@ public sealed class MachineUtilitiesSuspendedProcess : IDisposable {
       var result = new MachineUtilitiesSuspendedProcess { process=info.hProcess, thread=info.hThread,
         ProcessId=info.dwProcessId, ThreadId=info.dwThreadId };
       try {
-        result.StandardInput = new FileStream(new SafeFileHandle(stdinWrite, true), FileAccess.Write, 4096, true);
+        result.StandardInput = new FileStream(new SafeFileHandle(stdinWrite, true), FileAccess.Write, 4096, false);
         stdinWrite=IntPtr.Zero;
-        result.StandardOutput = new FileStream(new SafeFileHandle(stdoutRead, true), FileAccess.Read, 4096, true);
+        result.StandardOutput = new FileStream(new SafeFileHandle(stdoutRead, true), FileAccess.Read, 4096, false);
         stdoutRead=IntPtr.Zero;
-        result.StandardError = new FileStream(new SafeFileHandle(stderrRead, true), FileAccess.Read, 4096, true);
+        result.StandardError = new FileStream(new SafeFileHandle(stderrRead, true), FileAccess.Read, 4096, false);
         stderrRead=IntPtr.Zero;
         return result;
       } catch { result.TerminateBeforeResume(); result.Dispose(); throw; }
