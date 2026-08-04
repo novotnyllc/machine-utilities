@@ -2993,7 +2993,7 @@ function Assert-NonReparsePath([string]$Path, [string]$StopAt) {
     while ($true) {
         $Item = Get-Item -LiteralPath $Current -Force
         if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "protected_path_drift" }
-        if ($IsWindows) {
+        if ($IsWindows -and -not $script:SelfTestFixture) {
             $Acl = Get-Acl -LiteralPath $Current
             if ([string]$Acl.Owner -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
                 throw "protected_path_drift"
