@@ -799,7 +799,7 @@ u6_failpoint() {
 process_token() {
   local pid=$1 token
   if [ -r "/proc/$pid/stat" ]; then
-    token=$(/usr/bin/awk '{print $22}' "/proc/$pid/stat" 2>/dev/null) || return 1
+    token=$(/usr/bin/awk '{sub(/^.*\) /, ""); print $20; exit}' "/proc/$pid/stat" 2>/dev/null) || return 1
   else
     token=$(/bin/ps -o lstart= -p "$pid" 2>/dev/null | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]][[:space:]]*/_/g') || return 1
   fi
@@ -1920,16 +1920,22 @@ selftest_stale_lock_claim() {
 selftest_stale_lock_capture_order() {
   local retired stale_directory_identity stale_owner_identity replacement_directory_identity
   local replacement_owner_identity replacement_record replacement_token rc
-  [ "$fixture_mode" = true ] && [ ! -e "$state_root" ] && [ ! -L "$state_root" ] || return 1
+  [ "$fixture_mode" = true ] && [ ! -e "$state_root" ] && [ ! -L "$state_root" ] || {
+    printf 'enroll-ssh-posix self-test: stale capture initial state failed\n' >&2; return 1;
+  }
   retired=$state_root/observed-stale-lock
-  /bin/mkdir -p "$state_root" "$lifecycle_lock" && /bin/chmod 0700 "$state_root" "$lifecycle_lock" || return 1
+  /bin/mkdir -p "$state_root" "$lifecycle_lock" && /bin/chmod 0700 "$state_root" "$lifecycle_lock" || {
+    printf 'enroll-ssh-posix self-test: stale capture setup failed\n' >&2; return 1;
+  }
   printf 'lifecycle-lock|1|2147483647|stale|recover\n' >"$lifecycle_lock/owner"
   /bin/chmod 0600 "$lifecycle_lock/owner" || return 1
   stale_directory_identity=$(file_identity "$lifecycle_lock") || return 1
   stale_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 1
   if MACHINE_UTILITIES_U6_TEST_REPLACE_CLASSIFIED_LOCK=replace retire_stale_lock; then rc=0; else rc=$?; fi
-  [ "$rc" -eq 74 ] || return 1
-  replacement_token=$(process_token "${BASHPID:-$$}") || return 1
+  [ "$rc" -eq 74 ] || { printf 'enroll-ssh-posix self-test: stale capture retirement failed\n' >&2; return 1; }
+  replacement_token=$(process_token "${BASHPID:-$$}") || {
+    printf 'enroll-ssh-posix self-test: stale capture process token failed\n' >&2; return 1;
+  }
   replacement_record="lifecycle-lock|1|${BASHPID:-$$}|$replacement_token|recover"
   replacement_directory_identity=$(file_identity "$lifecycle_lock") || return 1
   replacement_owner_identity=$(file_identity "$lifecycle_lock/owner") || return 1
@@ -1937,8 +1943,12 @@ selftest_stale_lock_capture_order() {
     [ "$(file_identity "$retired")" = "$stale_directory_identity" ] &&
     [ "$(file_identity "$retired/owner")" = "$stale_owner_identity" ] &&
     [ "$(file_identity "$lifecycle_lock")" = "$replacement_directory_identity" ] &&
-    [ "$(file_identity "$lifecycle_lock/owner")" = "$replacement_owner_identity" ] || return 1
-  lock_is_live "$replacement_directory_identity" "$replacement_owner_identity" || return 1
+    [ "$(file_identity "$lifecycle_lock/owner")" = "$replacement_owner_identity" ] || {
+      printf 'enroll-ssh-posix self-test: stale capture snapshot failed\n' >&2; return 1;
+    }
+  lock_is_live "$replacement_directory_identity" "$replacement_owner_identity" || {
+    printf 'enroll-ssh-posix self-test: stale capture live lock failed\n' >&2; return 1;
+  }
   /bin/rm -f "$lifecycle_lock/owner" "$retired/owner" &&
     /bin/rmdir "$lifecycle_lock" "$retired" "$state_root"
 }
