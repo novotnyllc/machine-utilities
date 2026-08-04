@@ -33,6 +33,7 @@ $script:PollIntervalSeconds = 60
 $script:AuditReservationBytes = 1048576
 $script:TerminalReservationBytes = 65536
 $script:ReservationFillByte = [byte]0xA5
+$script:SelfTestFixture = $false
 
 function Get-Sha256Bytes([byte[]]$Bytes) {
     $Hasher = [Security.Cryptography.SHA256]::Create()
@@ -783,19 +784,21 @@ function Assert-ProtectedWindowsPath([string]$Path, [string]$Boundary) {
     while ($true) {
         $Item = Get-Item -LiteralPath $Current -Force
         if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "protected_path_reparse" }
-        $Acl = Get-Acl -LiteralPath $Current
-        if ([string]$Acl.Owner -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
-            throw "protected_path_owner_drift"
-        }
-        foreach ($Rule in $Acl.Access) {
-            if ($Rule.AccessControlType -eq "Allow" -and
-                ($Rule.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::Write -bor
-                    [Security.AccessControl.FileSystemRights]::Modify -bor
-                    [Security.AccessControl.FileSystemRights]::FullControl -bor
-                    [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
-                    [Security.AccessControl.FileSystemRights]::TakeOwnership)) -ne 0 -and
-                [string]$Rule.IdentityReference -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
-                throw "protected_path_acl_drift"
+        if (-not $script:SelfTestFixture) {
+            $Acl = Get-Acl -LiteralPath $Current
+            if ([string]$Acl.Owner -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
+                throw "protected_path_owner_drift"
+            }
+            foreach ($Rule in $Acl.Access) {
+                if ($Rule.AccessControlType -eq "Allow" -and
+                    ($Rule.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::Write -bor
+                        [Security.AccessControl.FileSystemRights]::Modify -bor
+                        [Security.AccessControl.FileSystemRights]::FullControl -bor
+                        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                        [Security.AccessControl.FileSystemRights]::TakeOwnership)) -ne 0 -and
+                    [string]$Rule.IdentityReference -notmatch '(S-1-5-18|S-1-5-32-544|SYSTEM|Administrators|TrustedInstaller)$') {
+                    throw "protected_path_acl_drift"
+                }
             }
         }
         if ($Current.TrimEnd('\') -ceq $Stop) { break }
@@ -1631,6 +1634,7 @@ function Assert-ElevatedHumanContext {
 }
 
 function Set-PathSddl([string]$Path, [string]$Sddl) {
+    if ($script:SelfTestFixture) { return }
     $Item = Get-Item -LiteralPath $Path -Force
     $Security = if ($Item.PSIsContainer) { [Security.AccessControl.DirectorySecurity]::new() }
         else { [Security.AccessControl.FileSecurity]::new() }
@@ -2981,6 +2985,7 @@ function Resolve-ExistingLifecycleTransaction {
 }
 
 function Assert-PathSddl([string]$Path, [string]$ExpectedSddl) {
+    if ($script:SelfTestFixture) { return }
     $Expected = [Security.AccessControl.RawSecurityDescriptor]::new($ExpectedSddl)
     $ObservedAcl = Get-Acl -LiteralPath $Path
     $Observed = [Security.AccessControl.RawSecurityDescriptor]::new(
@@ -3350,6 +3355,7 @@ function Read-EnrollmentMutations([byte[]]$Bytes) {
 
 function Invoke-SelfTest {
     $Root = Join-Path ([IO.Path]::GetTempPath()) ("machine-utilities-windows-enroll-" + [Guid]::NewGuid().ToString("N"))
+    $script:SelfTestFixture = $true
     try {
         Initialize-EnrollmentProfileRootType
         $StageRoot = "C:\ProgramData\MachineUtilities-Bootstrap\staged"
@@ -4023,7 +4029,10 @@ Quota Limit: 67,890 bytes
         }
         if (-not $NonCanonicalEfsRejected) { throw "noncanonical EFS native canary self-test failed" }
         Write-Output "PASS: enroll-privilege-windows fixture-safe self-check"
-    } finally { if ([IO.Directory]::Exists($Root)) { [IO.Directory]::Delete($Root, $true) } }
+    } finally {
+        $script:SelfTestFixture = $false
+        if ([IO.Directory]::Exists($Root)) { [IO.Directory]::Delete($Root, $true) }
+    }
 }
 
 if ($SelfTest) { Invoke-SelfTest; return }

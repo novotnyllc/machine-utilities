@@ -38,7 +38,7 @@
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
-      "sha256": "df716d9de90184c343cbd876dee706b2885f78948276ed204cd67a20f1105816"
+      "sha256": "c773c396828015db6b4222680b7ff54c81905ad010cde0d756f70f2d437d98e5"
     },
     {
       "path": "scripts/enroll-ssh-posix",
