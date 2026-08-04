@@ -724,19 +724,43 @@ process_executable() {
         return 1
       fi
       if ! candidate=$($readlink_binary "/proc/$pid/exe" 2>&1); then
-        case $candidate in *': Permission denied') ;; *) return 1 ;; esac
-        [ -n "${agent_peer_executable-}" ] || return 1
-        mode=$(file_mode "$agent_peer_executable") || return 1
-        case $mode in [2367][0-7][0-7][0-7]) ;; *) return 1 ;; esac
-        [ -d "/proc/$pid" ] && [ ! -L "/proc/$pid" ] || return 1
-        IFS= read -r process_name <"/proc/$pid/comm" || return 1
-        [ "$process_name" = "${agent_peer_executable##*/}" ] || return 1
+        case $candidate in
+          *': Permission denied') ;;
+          *) [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer readlink-reason' >&2; return 1 ;;
+        esac
+        [ -n "${agent_peer_executable-}" ] || {
+          [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer pinned-executable' >&2
+          return 1
+        }
+        mode=$(file_mode "$agent_peer_executable") || {
+          [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer executable-mode-read' >&2
+          return 1
+        }
+        case $mode in
+          [2367][0-7][0-7][0-7]) ;;
+          *) [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer executable-mode' >&2; return 1 ;;
+        esac
+        [ -d "/proc/$pid" ] && [ ! -L "/proc/$pid" ] || {
+          [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer proc-directory' >&2
+          return 1
+        }
+        IFS= read -r process_name <"/proc/$pid/comm" || {
+          [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer comm-read' >&2
+          return 1
+        }
+        [ "$process_name" = "${agent_peer_executable##*/}" ] || {
+          [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer comm-match' >&2
+          return 1
+        }
         candidate=$agent_peer_executable
       fi
       ;;
     *) return 1 ;;
   esac
-  canonical=$(canonical_existing_path "$candidate") || return 1
+  canonical=$(canonical_existing_path "$candidate") || {
+    [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer executable-canonical' >&2
+    return 1
+  }
   [ "$canonical" = "$candidate" ] || return 1
   printf '%s' "$canonical"
 }
@@ -802,11 +826,26 @@ find_agent_peer() {
   fi
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
-    candidate_uid=$(process_uid "$pid") || continue
-    [ "$candidate_uid" = "$(/usr/bin/id -u)" ] || continue
-    candidate_executable=$(process_executable "$pid") || continue
-    [ "$candidate_executable" = "$agent_peer_executable" ] || continue
-    candidate_start=$(process_start_identity "$pid") || continue
+    candidate_uid=$(process_uid "$pid") || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer uid-read' >&2
+      continue
+    }
+    [ "$candidate_uid" = "$(/usr/bin/id -u)" ] || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer uid-match' >&2
+      continue
+    }
+    candidate_executable=$(process_executable "$pid") || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer executable-read' >&2
+      continue
+    }
+    [ "$candidate_executable" = "$agent_peer_executable" ] || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer executable-match' >&2
+      continue
+    }
+    candidate_start=$(process_start_identity "$pid") || {
+      [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer start-read' >&2
+      continue
+    }
     [ -z "$matches" ] || return 1
     matches=$pid
     agent_peer_pid=$pid
@@ -814,7 +853,10 @@ find_agent_peer() {
   done <<EOF
 $candidates
 EOF
-  [ -n "$matches" ]
+  [ -n "$matches" ] || {
+    [ "$fixture_mode" = false ] || printf '%s\n' 'FAIL: certify-ssh-node self-test agent-peer no-match' >&2
+    return 1
+  }
 }
 verify_agent_socket() {
   local canonical parent mode
@@ -2104,9 +2146,11 @@ self_test() {
   normalise_fixture_public_directory "$root/native-canary" || return 1
   signer_root=$signer_fixture
   inherited_ssh_auth_sock=$agent_socket
-  verify_pinned_helper && parse_policy "$signer_fixture/$policy_name" && verify_agent_socket || return 1
-  write_fixture_native_receipt "$fixture_receipt" || return 1
-  verify_native_ca_isolation || return 1
+  verify_pinned_helper || { printf '%s\n' 'FAIL: certify-ssh-node self-test signer-helper' >&2; return 1; }
+  parse_policy "$signer_fixture/$policy_name" || { printf '%s\n' 'FAIL: certify-ssh-node self-test signer-policy' >&2; return 1; }
+  verify_agent_socket || { printf '%s\n' 'FAIL: certify-ssh-node self-test agent-socket' >&2; return 1; }
+  write_fixture_native_receipt "$fixture_receipt" || { printf '%s\n' 'FAIL: certify-ssh-node self-test receipt-write' >&2; return 1; }
+  verify_native_ca_isolation || { printf '%s\n' 'FAIL: certify-ssh-node self-test receipt-verify' >&2; return 1; }
   [ "$(file_mode "$root/native-canary")" = 755 ] && [ "$(file_mode "$fixture_receipt")" = 644 ] &&
     [ "$(file_owner "$fixture_receipt")" = "$(/usr/bin/id -un)" ] &&
     [ "$(file_group "$fixture_receipt")" = "$(/usr/bin/id -gn)" ] && [ -r "$fixture_receipt" ] || return 1
