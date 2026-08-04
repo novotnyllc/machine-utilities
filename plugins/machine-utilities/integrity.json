@@ -66,7 +66,7 @@
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
-      "sha256": "1b707bebd91223ace53a9003deab971c2f033c6625b80c451eaae13fe107ad22"
+      "sha256": "3f0f85c0c63e0a6bddf5edb6feff723256a10bfc02c3fda89967472bda688987"
     },
     {
       "path": "scripts/profile-worker-windows.ps1",

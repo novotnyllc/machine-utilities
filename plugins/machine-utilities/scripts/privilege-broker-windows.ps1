@@ -2220,7 +2220,8 @@ public sealed class MachineUtilitiesSuspendedProcess : IDisposable {
         throw new Win32Exception(Marshal.GetLastWin32Error());
       var pairs = new System.Collections.Generic.List<string>();
       foreach (System.Collections.DictionaryEntry pair in environment)
-        pairs.Add((string)pair.Key + "=" + (string)pair.Value);
+        pairs.Add(Convert.ToString(pair.Key, System.Globalization.CultureInfo.InvariantCulture) + "=" +
+          Convert.ToString(pair.Value, System.Globalization.CultureInfo.InvariantCulture));
       pairs.Sort(StringComparer.OrdinalIgnoreCase);
       environmentBlock = Marshal.StringToHGlobalUni(string.Join("\0", pairs.ToArray()) + "\0\0");
       var command = new StringBuilder(Quote(file));
