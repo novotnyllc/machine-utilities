@@ -28,20 +28,24 @@ Use manager-native ownership:
 - local source skills: update their owning repository; do not overwrite them
   with a package manager.
 
-## Routine named-plugin refresh
+## Routine marketplace refresh
 
 An explicit request to update or refresh one named marketplace plugin is
-mutation authorization for exactly that plugin, marketplace, requested hosts,
-and applicable harnesses. Do not require a fleet-wide inventory/readiness
-matrix or a sealed-plan round trip for this routine path. Resolve every target
+mutation authorization for that marketplace's already-installed plugins on the
+requested hosts and applicable harnesses. A marketplace upgrade and its plugin
+updates are one operation: after refreshing the catalog, update every installed
+plugin owned by that marketplace, not only the plugin that prompted the refresh.
+Do not install other catalog entries that were not already installed. Do not require a
+fleet-wide inventory/readiness matrix or a sealed-plan round trip for this
+routine path. Resolve every target
 from `MACHINE_UTILITIES_CONFIG`, falling back to
 `${XDG_CONFIG_HOME:-$HOME/.config}/machine-utilities/config.json`, and use each
 target's configured `local`, `ssh`, or `codex-remote-control` transport. Never
 guess an SSH alias or substitute WSL for native Windows.
 
-Before changing a target, capture a bounded `agents` inventory and retain only
-the exact plugin's Codex and Claude records as the before-state. Treat the two
-harnesses independently and refresh each available, applicable runtime.
+Before changing a target, capture a bounded `agents` inventory and freeze a
+de-duplicated set of every installed plugin owned by the marketplace. Treat the
+two harnesses independently and refresh each available, applicable runtime.
 For local execution set `TARGET_CLI="$CLI"` and verify the loaded executor. For
 SSH, use the configured alias and target login shell (`$SHELL -lc`), resolve the
 target's installed Machine Utilities version from its active Codex plugin
@@ -49,34 +53,39 @@ record, and set `TARGET_CLI` to that target cache's
 `machine-utilities/VERSION/scripts/machine-utilities`; never send or interpolate
 the controller's `SKILL_DIR` or `CLI`. Require `"$TARGET_CLI" verify-executor`
 to pass before using it. Run only these target-native command sequences, in
-order, substituting the authorized names:
+order, substituting the authorized marketplace and each installed plugin ID:
 
 ```text
+codex plugin list --json
 codex plugin marketplace upgrade MARKETPLACE --json
-"$TARGET_CLI" update-codex-plugin PLUGIN@MARKETPLACE
+"$TARGET_CLI" update-codex-plugin EACH_INSTALLED_PLUGIN@MARKETPLACE
 
+claude plugin list --json
 claude plugin marketplace update MARKETPLACE
-claude plugin update PLUGIN@MARKETPLACE --scope user
+claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
 ```
 
-The Codex wrapper snapshots only that plugin's already trusted or modified hook
+Require every frozen ID to end in the exact `@MARKETPLACE` suffix and attempt
+every ID even if another update fails. Do not add IDs that appear only after the
+catalog refresh. Update `machine-utilities@novotnyllc` last when present, then
+recapture inventory and re-resolve its installed executor. The Codex wrapper
+snapshots only each plugin's already trusted or modified hook
 keys, runs the exact idempotent `codex plugin add PLUGIN@MARKETPLACE --json`,
 refreshes trust for those same stable keys, and leaves new or previously
-untrusted hooks untrusted. For Claude, use `plugin update` when the exact
-plugin is installed; if it is absent, replace only that second Claude command
-with `claude plugin install PLUGIN@MARKETPLACE --scope user`. Do not update any
-other plugin or synchronize unrelated runtimes, settings, skills, provenance,
-or configuration. Manager output is progress evidence, not post-state.
-Recapture the bounded `agents` inventory after each harness attempt. Require the
-exact `PLUGIN@MARKETPLACE` record to be installed and enabled. Post-state must
-report the requested version. A failure in one harness does not erase the other
-harness's evidence or success.
+untrusted hooks untrusted. Do not synchronize unrelated marketplaces, runtimes,
+settings, skills, provenance, or configuration. Manager output is progress
+evidence, not post-state. Recapture the bounded `agents` inventory after each
+harness attempt. Require every frozen marketplace plugin record to remain
+installed with its enabled state and Claude scope preserved; require every
+outside-marketplace record to be unchanged. Report before/after versions per
+plugin. A failure in one plugin or harness does not erase other evidence or stop
+the remaining marketplace plugins from being attempted.
 
 The only pre-helper fallback is a separately approved self-update of
 `machine-utilities@novotnyllc` from an integrity-verified release that lacks
 `update-codex-plugin`. After upgrading the `novotnyllc` marketplace, run exactly
 `codex plugin add machine-utilities@novotnyllc --json`, recapture inventory,
-reload the new target-native plugin, and require its version `0.2.16` executor
+reload the new target-native plugin, and require its version `0.2.17` executor
 and integrity verification before any other mutation. Never use that raw-add
 fallback for another plugin or once the helper command is available.
 

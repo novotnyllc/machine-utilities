@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "2f271ab2cf8da3c84fc1d83480b42aac69a26f4abd5e5ba86c463a85723501df"
+      "sha256": "2d558b6ff44ae946eafa897522c5a0a1ad8ed028cfde435a73ab9218e95cf548"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "99f2dca370867a476541dea02d6f8bc10700507cd7e7e772919a1a871526f5f8"
+      "sha256": "ba4544ee5bac2223552a7b098d3858f39265110b4841d421d55af9d7a592e693"
     },
     {
       "path": "references/privilege-policy.default",
@@ -26,7 +26,7 @@
     },
     {
       "path": "scripts/codex-plugin-hooks.mjs",
-      "sha256": "9640f5d9ecd78bbacfde50bdd0aa82de628b4fa5cda60006757ee9c4ecd2f750"
+      "sha256": "b22a57e2f5fd1e0cd24806115f79fa0fdd5454cc34707b34e9551b142aa1ea89"
     },
     {
       "path": "scripts/collect-posix",
@@ -89,5 +89,5 @@
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.16"
+  "version": "0.2.17"
 }

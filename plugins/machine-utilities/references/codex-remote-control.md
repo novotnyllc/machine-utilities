@@ -78,40 +78,41 @@ record `task_cleanup_failed` on conflict or cleanup failure. Archive failure
 also records `task_cleanup_failed`; it never authorizes reuse or unarchiving of
 an older task.
 
-## Routine named-plugin refresh
+## Routine marketplace refresh
 
 An explicit named-plugin refresh does not require a full native inventory or
-sealed plan. Resolve the host, saved project, plugin, marketplace, requested
-version, and applicable Codex and Claude harnesses from the controller's
-configured scope. Use the capability check and fresh-task binding above,
+sealed plan. Resolve the host, saved project, marketplace, and applicable Codex
+and Claude harnesses from the controller's configured scope. Use the capability check and fresh-task binding above,
 create a new visible task in the configured saved project, and run native PowerShell only.
 Before and after each
 applicable harness, capture `codex plugin list --json`; for Claude, capture
-`claude plugin list --json`. Retain the exact `PLUGIN@MARKETPLACE` record and,
-for Claude, compare every non-target record by `id`, `version`, `enabled`, and
-`scope` and require the unrelated plugin diff to be empty. In the task, run
-only these mutation commands in order for each applicable harness:
+`claude plugin list --json`. Freeze a de-duplicated set of every installed
+record owned by the exact marketplace. In the task, run only these mutation
+commands in order for each applicable harness:
 
 ```powershell
 # Codex
+codex plugin list --json
 codex plugin marketplace upgrade MARKETPLACE --json
-node "EXACT-MACHINE-UTILITIES-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update PLUGIN@MARKETPLACE
+node "EXACT-MACHINE-UTILITIES-PLUGIN-ROOT\scripts\codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE
 
 # Claude
+claude plugin list --json
 claude plugin marketplace update MARKETPLACE
-claude plugin update PLUGIN@MARKETPLACE --scope user
+claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user
 ```
 
-The Codex add is idempotent. For Claude, use `plugin update` when the exact
-plugin is installed; if it is absent, replace only that second Claude command
-with `claude plugin install PLUGIN@MARKETPLACE --scope user`. Require each
-matching post-state record to be present, enabled, and equal the requested
-version; the Codex record must be installed and the Claude record must have
-user scope. If native PowerShell cannot find
+Reject any frozen ID without the exact `@MARKETPLACE` suffix. Attempt every
+frozen marketplace plugin even when another one fails; do not install entries
+absent from the pre-refresh set. Update `machine-utilities@novotnyllc` last when
+present, then recapture and re-resolve its installed executor. The Codex add is
+idempotent and preserves approved stable hook keys. Require each pre-existing marketplace record to remain
+present with enabled state and Claude scope preserved; require outside-marketplace
+records to be unchanged. Report every before/after version. If native PowerShell cannot find
 `claude`, mark only the Claude harness unavailable. WSL or SSH are prohibited.
 Treat Codex and Claude harness failures independently: preserve each before/after
 record and attempt the other applicable harness. Do not update a runtime,
-settings, skills, provenance, or another plugin, and do not claim success from
+settings, skills, provenance, or another marketplace, and do not claim success from
 manager output alone. Record a failed postcondition as
 `executor_or_plugin_failure` while preserving before-state and command output;
 keep executor version/hash mismatch separate as `executor_mismatch` only when
@@ -155,7 +156,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    integrity-verified release that predates this helper: after the marketplace
    upgrade, run exactly
    `codex plugin add machine-utilities@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.2.16` executor and integrity manifest before any
+   fresh task, and verify the `0.2.17` executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by

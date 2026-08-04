@@ -1,6 +1,6 @@
 {
   "name": "machine-utilities",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "description": "Inventory and reconcile packages, agent tooling, projects, dotfiles, remote Macs, SSH, startup tasks, and portable authentication across mixed-machine fleets.",
   "author": {
     "name": "Claire Novotny LLC",

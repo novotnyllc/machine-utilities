@@ -47,14 +47,17 @@ assert_contains "$fleet_agents_text" 'MACHINE_UTILITIES_CONFIG'
 assert_contains "$fleet_agents_text" '${XDG_CONFIG_HOME:-$HOME/.config}/machine-utilities/config.json'
 assert_contains "$fleet_agents_text" "use each"
 assert_contains "$fleet_agents_text" 'guess an SSH alias'
-assert_contains "$fleet_agents_text" 'Do not require a fleet-wide inventory/readiness'
-assert_contains "$fleet_agents_text" 'other plugin or synchronize unrelated'
-assert_contains "$fleet_agents_text" 'record to be installed and enabled'
-assert_contains "$fleet_agents_text" 'report the requested version'
-assert_contains "$fleet_agents_text" 'claude plugin install PLUGIN@MARKETPLACE --scope user'
+assert_contains "$fleet_agents_text" 'fleet-wide inventory/readiness matrix'
+assert_contains "$fleet_agents_text" 'update every installed'
+assert_contains "$fleet_agents_text" 'Do not install other catalog entries'
+assert_contains "$fleet_agents_text" 'EACH_INSTALLED_PLUGIN@MARKETPLACE'
+assert_contains "$fleet_agents_text" 'freeze a'
+assert_contains "$fleet_agents_text" 'outside-marketplace record to be unchanged'
+assert_contains "$fleet_agents_text" 'Update `machine-utilities@novotnyllc` last'
+assert_contains "$fleet_agents_text" 'Report before/after versions per'
 assert_ordered "$fleet_agents_skill" \
   'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'update-codex-plugin PLUGIN@MARKETPLACE'
+  'update-codex-plugin EACH_INSTALLED_PLUGIN@MARKETPLACE'
 assert_contains "$fleet_agents_text" 'never send or interpolate'
 assert_contains "$fleet_agents_text" '"$TARGET_CLI" verify-executor'
 assert_contains "$fleet_agents_text" 'previously resolved and verified `"$TARGET_CLI"`'
@@ -63,7 +66,7 @@ assert_contains "$fleet_agents_text" 'only pre-helper fallback'
 assert_contains "$fleet_agents_text" 'codex plugin add machine-utilities@novotnyllc --json'
 assert_ordered "$fleet_agents_skill" \
   'claude plugin marketplace update MARKETPLACE' \
-  'claude plugin update PLUGIN@MARKETPLACE --scope user'
+  'claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user'
 assert_contains "$remote_control_text" '`list_projects`'
 assert_contains "$remote_control_text" '`create_thread`'
 assert_contains "$remote_control_text" '`wait_threads`'
@@ -100,14 +103,17 @@ done
 assert_contains "$remote_control_text" 'does not require or preflight the Machine Utilities executor'
 assert_ordered "$remote_control_reference" \
   'codex plugin marketplace upgrade MARKETPLACE --json' \
-  'codex-plugin-hooks.mjs" update PLUGIN@MARKETPLACE'
-assert_contains "$remote_control_text" 'applicable Codex and Claude harnesses'
+  'codex-plugin-hooks.mjs" update EACH_INSTALLED_PLUGIN@MARKETPLACE'
+assert_contains "$remote_control_text" 'applicable Codex'
+assert_contains "$remote_control_text" 'Claude harnesses'
 assert_contains "$remote_control_text" 'native PowerShell only'
 assert_contains "$remote_control_text" '`claude plugin list --json`'
-assert_contains "$remote_control_text" 'compare every non-target record by `id`, `version`, `enabled`, and'
-assert_contains "$remote_control_text" 'unrelated plugin diff to be empty'
-assert_contains "$remote_control_text" 'claude plugin install PLUGIN@MARKETPLACE --scope user'
-assert_contains "$remote_control_text" 'the Codex record must be installed and the Claude record must have'
+assert_contains "$remote_control_text" 'de-duplicated set'
+assert_contains "$remote_control_text" 'Attempt every'
+assert_contains "$remote_control_text" 'do not install'
+assert_contains "$remote_control_text" 'outside-marketplace'
+assert_contains "$remote_control_text" 'Update `machine-utilities@novotnyllc` last'
+assert_contains "$remote_control_text" 'Report every before/after version'
 assert_contains "$remote_control_text" 'mark only the Claude harness unavailable'
 assert_contains "$remote_control_text" 'WSL or SSH are prohibited'
 assert_contains "$remote_control_text" 'Treat Codex and Claude harness failures independently'
@@ -118,7 +124,7 @@ case $remote_control_text in
 esac
 assert_ordered "$remote_control_reference" \
   'claude plugin marketplace update MARKETPLACE' \
-  'claude plugin update PLUGIN@MARKETPLACE --scope user'
+  'claude plugin update EACH_INSTALLED_PLUGIN@MARKETPLACE --scope user'
 assert_contains "$fleet_agents_text" 'may run the native Claude CLI in the visible native PowerShell'
 
 readiness_skill="$script_dir/../skills/fleet-readiness/SKILL.md"

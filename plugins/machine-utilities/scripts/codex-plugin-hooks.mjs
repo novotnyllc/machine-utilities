@@ -87,7 +87,7 @@ class AppServer {
       clientInfo: {
         name: "machine_utilities",
         title: "Machine Utilities",
-        version: "0.2.16",
+        version: "0.2.17",
       },
       capabilities: {},
     });
