@@ -13,7 +13,8 @@ usage() {
 }
 
 result() {
-  printf 'enrollment|1\nstate|%s\nreason|%s\nplatform-boundary|%s\n' "$1" "$2" "$3"
+  printf 'enrollment|1\nstate|%s\nreason|%s\nplatform-boundary|%s\n' \
+    "$1" "$2" "${platform_boundary:-$3}"
 }
 
 fixture_root=${MACHINE_UTILITIES_U2_FIXTURE_ROOT:-}
@@ -24,7 +25,11 @@ if [ -n "$fixture_root" ]; then
   [ "$(/usr/bin/id -u)" -ne 0 ] || { result rejected fixture_mode_refuses_root fixture; exit 64; }
   root_prefix=${fixture_root%/}
   protected_owner=$(/usr/bin/id -un)
-  platform=linux
+  case ${MACHINE_UTILITIES_U2_FIXTURE_PLATFORM:-linux} in
+    linux) platform=linux ;;
+    macos) platform=Darwin ;;
+    *) result rejected fixture_platform_invalid fixture; exit 64 ;;
+  esac
   fixture_mode=true
 else
   root_prefix=
@@ -39,25 +44,36 @@ fi
 
 case $platform in
   Darwin)
-    result unsupported no_cataloged_action macos
-    exit 69
+    platform_boundary=macos
+    required_context=macos-root-v1
+    protected_group=wheel
     ;;
   wsl)
     result unsupported unsupported_security_boundary wsl
     exit 69
     ;;
-  Linux|linux) ;;
+  Linux|linux)
+    platform_boundary=linux
+    required_context=posix-root-v1
+    protected_group=root
+    ;;
   *) result unsupported unsupported_platform unknown; exit 69 ;;
 esac
+readonly protected_group
 
 [ "$fixture_mode" = true ] || [ "$(/usr/bin/id -u)" -eq 0 ] || {
-  result needs_human_enrollment authenticated_bootstrap_required linux
+  result needs_human_enrollment authenticated_bootstrap_required "$platform_boundary"
   exit 77
 }
 
 readonly config_root=$root_prefix/etc/machine-utilities
 readonly state_root=$root_prefix/var/lib/machine-utilities
-readonly broker_path=$root_prefix/usr/libexec/machine-utilities/posix-broker
+if [ "$platform_boundary" = macos ]; then
+  readonly broker_system_path=/usr/local/libexec/machine-utilities/posix-broker
+else
+  readonly broker_system_path=/usr/libexec/machine-utilities/posix-broker
+fi
+readonly broker_path=$root_prefix$broker_system_path
 readonly sudoers_path=$root_prefix/etc/sudoers.d/machine-utilities-posix-broker
 readonly bootstrap_root=$root_prefix/var/lib/machine-utilities-bootstrap
 readonly ssh_keygen=/usr/bin/ssh-keygen
@@ -79,14 +95,12 @@ capture_current_process_id() {
   local destination=$1 observed pid_file
   if [ -n "${BASHPID:-}" ]; then
     observed=$BASHPID
-  elif [ "$fixture_mode" = true ]; then
+  else
     # Bash 3 keeps $$ bound to the top-level shell even inside a `( ... )`
     # function body. A directly spawned child observes the actual calling
-    # shell as its PPID. This compatibility probe is fixture-only: its temp is
-    # protected inside the fixture root (and therefore covered by the test
-    # root cleanup trap), while production fails closed on an old Bash rather
-    # than expanding the elevated trusted-helper set.
-    pid_file=$(/usr/bin/mktemp "$root_prefix/.machine-utilities-pid.XXXXXX") || return 1
+    # shell as its PPID. The probe uses only the native system shell and a
+    # protected, single-use file; this is the production path for macOS Bash 3.
+    pid_file=$(/usr/bin/mktemp "$root_prefix/var/lib/.machine-utilities-pid.XXXXXX") || return 1
     /bin/chmod 0600 "$pid_file" || { /bin/rm -f "$pid_file"; return 1; }
     protected_file "$pid_file" 128 && exact_mode "$pid_file" 600 || {
       /bin/rm -f "$pid_file"
@@ -101,8 +115,6 @@ capture_current_process_id() {
       return 1
     }
     /bin/rm -f "$pid_file" || return 1
-  else
-    return 1
   fi
   [[ $observed =~ ^[1-9][0-9]{0,9}$ ]] || return 1
   printf -v "$destination" '%s' "$observed"
@@ -132,8 +144,17 @@ safe_permissions() {
 }
 
 protected_directory() {
-  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
-    safe_permissions "$1"
+  if [ -d "$1" ] && [ ! -L "$1" ] && [ "$(file_owner "$1")" = "$protected_owner" ] &&
+    safe_permissions "$1"; then
+    return 0
+  fi
+  [ "$fixture_mode" = false ] && [ "$platform_boundary" = macos ] && [ -L "$1" ] || return 1
+  [ "$(file_owner "$1")" = root ] && safe_permissions "$1" && protected_directory /private || return 1
+  case $1 in
+    /etc) [ "$(/usr/bin/readlink /etc)" = private/etc ] && protected_directory /private/etc ;;
+    /var) [ "$(/usr/bin/readlink /var)" = private/var ] && protected_directory /private/var ;;
+    *) return 1 ;;
+  esac
 }
 
 protected_file() {
@@ -187,7 +208,7 @@ ensure_revocation_reserve() {
   if ! /bin/dd if=/dev/zero of="$reserve_tmp" bs=1024 count=$((desired_bytes / 1024)) \
       >/dev/null 2>&1 ||
     ! /bin/chmod 0600 "$reserve_tmp" ||
-    { [ "$fixture_mode" = false ] && ! /usr/bin/chown root:root "$reserve_tmp"; } ||
+    { [ "$fixture_mode" = false ] && ! /usr/bin/chown root:"$protected_group" "$reserve_tmp"; } ||
     ! durable_sync "$reserve_tmp" || ! revocation_reserve_file_valid "$reserve_tmp"; then
     /bin/rm -f "$reserve_tmp" 2>/dev/null || true
     durable_sync "$state_root" 2>/dev/null || true
@@ -271,6 +292,9 @@ verify_bootstrap_bundle() {
   found_source_authority=false
   found_release=false
   found_release_signature=false
+  found_macos_context=false
+  macos_package_count=0
+  unexpected_platform_asset=false
   found_ca=false
   found_signers=false
   found_krl=false
@@ -281,7 +305,15 @@ verify_bootstrap_bundle() {
     [ -z "$previous" ] || [[ $previous < $relative ]] || return 1
     previous=$relative
     candidate=$bundle/$relative
-    protected_file "$candidate" 33554432 && [ "$(sha256_file "$candidate")" = "$expected_digest" ] || return 1
+    candidate_maximum=33554432
+    case $relative in macos/packages/*.pkg) candidate_maximum=2147483647 ;; esac
+    protected_file "$candidate" "$candidate_maximum" &&
+      [ "$(sha256_file "$candidate")" = "$expected_digest" ] || return 1
+    case $platform_boundary:$relative in
+      macos:apt.conf|macos:apt.context|macos:apt/*|linux:macos.context|linux:macos/*)
+        unexpected_platform_asset=true
+        ;;
+    esac
     case $relative in
       privilege-broker-posix) found_broker=true ;;
       enroll-privilege-posix) found_enrollment=true ;;
@@ -295,19 +327,33 @@ verify_bootstrap_bundle() {
       apt/source-authority) found_source_authority=true ;;
       apt/metadata/Release) found_release=true ;;
       apt/metadata/Release.gpg) found_release_signature=true ;;
+      macos.context) found_macos_context=true ;;
+      macos/packages/*.pkg) macos_package_count=$((macos_package_count + 1)) ;;
       fleet-ca.pub) found_ca=true ;;
       allowed_signers) found_signers=true ;;
       revoked.krl) found_krl=true ;;
     esac
   done <"$bundle/bootstrap.manifest"
-  [ "$found_broker" = true ] && [ "$found_enrollment" = true ] &&
+  [ "$unexpected_platform_asset" = false ] &&
+    [ "$found_broker" = true ] && [ "$found_enrollment" = true ] &&
     [ "$found_policy" = true ] && [ "$found_constraints" = true ] &&
-    [ "$found_identity" = true ] && [ "$found_context" = true ] &&
-    [ "$found_apt_config" = true ] && [ "$found_apt_context" = true ] &&
-    [ "$found_apt_source" = true ] && [ "$found_source_authority" = true ] &&
-    [ "$found_release" = true ] && [ "$found_release_signature" = true ] &&
-    [ "$found_ca" = true ] &&
+    [ "$found_identity" = true ] && [ "$found_context" = true ] && [ "$found_ca" = true ] &&
     [ "$found_signers" = true ] && [ "$found_krl" = true ] || return 1
+  case $platform_boundary in
+    linux)
+      [ "$found_apt_config" = true ] && [ "$found_apt_context" = true ] &&
+        [ "$found_apt_source" = true ] && [ "$found_source_authority" = true ] &&
+        [ "$found_release" = true ] && [ "$found_release_signature" = true ] &&
+        [ "$found_macos_context" = false ] && [ "$macos_package_count" -eq 0 ] || return 1
+      ;;
+    macos)
+      [ "$found_macos_context" = true ] && [ "$found_apt_config" = false ] &&
+        [ "$found_apt_context" = false ] && [ "$found_apt_source" = false ] &&
+        [ "$found_source_authority" = false ] && [ "$found_release" = false ] &&
+        [ "$found_release_signature" = false ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
   if [ "$fixture_mode" = false ]; then
     [ "$0" = "$bundle/enroll-privilege-posix" ] || return 1
   fi
@@ -326,6 +372,8 @@ verify_bootstrap_bundle() {
       expected["apt.install-package-version.v1"]="posix-root-v1|package-source-version-closure-set-sha256"
       expected["apt.update-metadata.v1"]="posix-root-v1|none"
       expected["apt.upgrade-package.v1"]="posix-root-v1|package-source-channel-set-sha256"
+      expected["macos.apply-system-setting.v1"]="macos-root-v1|macos-system-setting-sha256"
+      expected["macos.install-signed-pkg.v1"]="macos-root-v1|macos-signed-pkg-sha256"
       expected["profile.apply-managed-bundle.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
       expected["profile.inventory-managed-state.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
       expected["winget.install-machine-package.v1"]="windows-system-v1|winget-package-version-set-sha256"
@@ -337,15 +385,24 @@ verify_bootstrap_bundle() {
     {if(NF!=6||$1!="action"||!($2 in expected)||seen[$2]++||($3"|"$5)!=expected[$2]||
        ($4!="enabled"&&$4!="disabled")||($5=="none"?$6!="-":($6!="-"&&(length($6)!=64||$6!~/^[0-9a-f]+$/)))||
        (previous!=""&&previous>=$2))exit 1;previous=$2}
-    END{if(NR!=10)exit 1;for(id in expected)if(!seen[id])exit 1}
+    END{if(NR!=12)exit 1;for(id in expected)if(!seen[id])exit 1}
   ' "$bundle/policy.actions" || return 1
 
   /usr/bin/awk -F '|' -v policy_digest="$policy_digest" '
     function token(v){return v~/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/}
     function atom(v){return v~/^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/}
+    function package_id(v){return v~/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/}
     function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
     function version(v){return v~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/}
     function uint(v){return v~/^(0|[1-9][0-9]*)$/&&(v+0)<=2147483647}
+    function team_id(v){return v~/^[A-Z0-9]{10}$/}
+    function setting_value(id,v) {
+      if(id=="timezone")return v~/^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/&&length(v)<=255
+      if(id=="network-time-server")return v~/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/&&v!~/\.\./
+      if(id=="wake-on-network-access"||id=="restart-after-power-failure")return v=="on"||v=="off"
+      if(id=="computer-sleep"||id=="display-sleep")return v=="Never"||(v~/^[1-9][0-9]{0,2}$/&&(v+0)<=180)
+      return 0
+    }
     $0!~/^[ -~]+$/||length($0)>2048{exit 1}
     NR==1{if(NF!=4||$1!="constraints"||$2!="1"||$3!~/^generation=[1-9][0-9]{0,9}$/||
       $4!="policy-sha256="policy_digest)exit 1;next}
@@ -356,6 +413,12 @@ verify_bootstrap_bundle() {
       !atom($5)||!version($6)||!digest($7)||!digest($8))exit 1;next}
     $1=="apt-upgrade"{if(NF!=9||$2!="apt.upgrade-package.v1"||!token($3)||!atom($4)||
       !atom($5)||!version($6)||!version($7)||!uint($8)||!digest($9))exit 1;next}
+    $1=="macos-pkg"{if(NF!=12||$2!="macos.install-signed-pkg.v1"||!token($3)||
+      ($4!="script-free"&&$4!="sealed-cask-payload-v1")||!uint($5)||$5=="0"||
+      !digest($6)||!package_id($7)||!version($8)||!team_id($9)||!digest($10)||
+      !package_id($11)||!version($12))exit 1;next}
+    $1=="macos-setting"{if(NF!=5||$2!="macos.apply-system-setting.v1"||!token($3)||
+      !setting_value($4,$5))exit 1;next}
     $1=="profile"{if(NF!=9||!token($2)||$3!~/^S-[0-9]+(-[0-9]+){1,14}$/||!atom($4)||
       !digest($5)||!digest($6)||($7!="managed-only"&&$7!="managed-and-prune")||
       !uint($8)||$8=="0"||!uint($9)||$9=="0")exit 1;next}
@@ -369,6 +432,21 @@ verify_bootstrap_bundle() {
       $15!="provider-enforced-manifest-hash"||$16!="source-delegated-all")exit 1;next}
     {exit 1}
   ' "$bundle/policy.constraints" || return 1
+  if [ "$platform_boundary" = macos ]; then
+    constraint_package_count=0
+    while IFS='|' read -r kind _ policy_token payload_mode package_size package_digest _ _ _ _ _ _ extra; do
+      [ "$kind" = macos-pkg ] || continue
+      case $payload_mode in script-free|sealed-cask-payload-v1) ;; *) return 1 ;; esac
+      [ -z "$extra" ] || return 1
+      package_path=$bundle/macos/packages/$policy_token.pkg
+      protected_file "$package_path" 2147483647 &&
+        [ "$(file_size "$package_path")" = "$package_size" ] &&
+        [ "$(sha256_file "$package_path")" = "$package_digest" ] &&
+        [ "$(manifest_file_digest "macos/packages/$policy_token.pkg")" = "$package_digest" ] || return 1
+      constraint_package_count=$((constraint_package_count + 1))
+    done <"$bundle/policy.constraints"
+    [ "$constraint_package_count" -eq "$macos_package_count" ] || return 1
+  fi
 }
 
 manifest_file_digest() {
@@ -379,16 +457,18 @@ manifest_file_digest() {
 copy_manifest_file() {
   relative=$1
   destination=$2
+  maximum=33554432
+  case $relative in macos/packages/*.pkg) maximum=2147483647 ;; esac
   expected=$(manifest_file_digest "$relative")
   digest "$expected" || return 1
   source_path=$bundle/$relative
-  protected_file "$source_path" 33554432 || return 1
+  protected_file "$source_path" "$maximum" || return 1
   exec 3<"$source_path" || return 1
   /bin/cat <&3 >"$destination" || { exec 3<&-; return 1; }
   exec 3<&-
   [ "$(sha256_file "$destination")" = "$expected" ] || return 1
   /bin/chmod 0644 "$destination"
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$destination"; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$destination"; fi
 }
 
 exact_mode() {
@@ -411,7 +491,7 @@ durable_sync() {
 durable_replace() {
   local temporary=$1 destination=$2 mode=$3
   /bin/chmod "$mode" "$temporary" || return 1
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$temporary" || return 1; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$temporary" || return 1; fi
   durable_sync || return 1
   /bin/mv -f "$temporary" "$destination" || return 1
   durable_sync
@@ -463,7 +543,7 @@ validate_host_and_context() {
     [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] || return 1
   [ "$(/usr/bin/wc -l <"$bundle/host.identity" | /usr/bin/tr -d ' ')" = 1 ] || return 1
   [ "$(/usr/bin/sed -n '1p' "$bundle/context.canary")" = \
-    'context|1|platform=linux|required=posix-root-v1|principal=root|console-session=none' ] &&
+    "context|1|platform=$platform_boundary|required=$required_context|principal=root|console-session=none" ] &&
     [ "$(/usr/bin/wc -l <"$bundle/context.canary" | /usr/bin/tr -d ' ')" = 1 ] || return 1
   if [ "$fixture_mode" = false ]; then
     observed_uid=$(/usr/bin/id -u "$request_user" 2>/dev/null) || return 1
@@ -496,7 +576,7 @@ path_identity_mode() {
 }
 
 path_set_digest() {
-  local listing label candidate member relative answer
+  local listing label candidate member relative answer maximum
   listing=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/machine-utilities-path-set.XXXXXX") || return 1
   : >"$listing" || { /bin/rm -f "$listing"; return 1; }
   while [ "$#" -gt 0 ]; do
@@ -533,7 +613,9 @@ path_set_digest() {
         }
       done < <(/usr/bin/find "$candidate" -mindepth 1 -type d -print | /usr/bin/sort)
       while IFS= read -r member; do
-        protected_file "$member" 33554432 || { /bin/rm -f "$listing"; return 1; }
+        maximum=33554432
+        case $member in */macos/packages/*.pkg) maximum=2147483647 ;; esac
+        protected_file "$member" "$maximum" || { /bin/rm -f "$listing"; return 1; }
         printf '%s/%s|file|owner=%s|mode=%s|sha256=%s\n' "$label" "${member#"$candidate"/}" \
           "$(file_owner "$member")" "$(path_identity_mode "$member")" \
           "$(sha256_file "$member")" >>"$listing" || { /bin/rm -f "$listing"; return 1; }
@@ -555,7 +637,50 @@ context_value() {
 }
 
 context_binary() {
-  /usr/bin/awk -F '|' -v name="$1" '$1=="binary"&&$2==name{print $3;exit}' "$bundle/apt.context"
+  local name=$1 context=${2:-apt.context}
+  /usr/bin/awk -F '|' -v name="$name" '$1=="binary"&&$2==name{print $3;exit}' "$bundle/$context"
+}
+
+validate_macos_context() {
+  local dependency name expected_digest
+  /usr/bin/awk -F '|' '
+    BEGIN { binary[2]="installer"; binary[3]="pkgutil"; binary[4]="pmset"; binary[5]="systemsetup" }
+    $0!~/^[ -~]+$/ { exit 1 }
+    NR==1 { if(NF!=2||$1!="macos-context"||$2!="1")exit 1; next }
+    NR>=2&&NR<=5 { if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||$3!~/^[0-9a-f]+$/)exit 1; next }
+    { exit 1 }
+    END { if(NR!=5)exit 1 }
+  ' "$bundle/macos.context" || return 1
+  for name in installer pkgutil pmset systemsetup; do
+    case $name in pmset) dependency=$root_prefix/usr/bin/pmset ;; *) dependency=$root_prefix/usr/sbin/$name ;; esac
+    expected_digest=$(context_binary "$name" macos.context) || return 1
+    digest "$expected_digest" && validate_protected_ancestors "$dependency" &&
+      protected_file "$dependency" 33554432 && [ -x "$dependency" ] &&
+      [ "$(sha256_file "$dependency")" = "$expected_digest" ] || return 1
+  done
+}
+
+validate_macos_packages() {
+  local generation_root=${1:-$bundle} package_root package_count=0 file_count=0
+  local kind policy_token package_size package_digest extra package_path member
+  package_root=$generation_root/macos/packages
+  protected_directory "$generation_root/macos" && exact_mode "$generation_root/macos" 755 &&
+    protected_directory "$package_root" && exact_mode "$package_root" 755 || return 1
+  while IFS='|' read -r kind _ policy_token payload_mode package_size package_digest _ _ _ _ _ _ extra; do
+    [ "$kind" = macos-pkg ] || continue
+    case $payload_mode in script-free|sealed-cask-payload-v1) ;; *) return 1 ;; esac
+    [ -z "$extra" ] || return 1
+    package_path=$package_root/$policy_token.pkg
+    protected_file "$package_path" 2147483647 && exact_mode "$package_path" 644 &&
+      [ "$(file_size "$package_path")" = "$package_size" ] &&
+      [ "$(sha256_file "$package_path")" = "$package_digest" ] || return 1
+    package_count=$((package_count + 1))
+  done <"$generation_root/policy.constraints"
+  while IFS= read -r member; do
+    [ -f "$member" ] && [ ! -L "$member" ] || return 1
+    file_count=$((file_count + 1))
+  done < <(/usr/bin/find "$package_root" -mindepth 1 -maxdepth 1 -print | /usr/bin/sort)
+  [ "$package_count" -eq "$file_count" ]
 }
 
 validate_apt_source_authority() {
@@ -797,7 +922,12 @@ validate_apt_context() {
 }
 
 validate_candidate_semantics() {
-  validate_host_and_context && validate_apt_context && /bin/bash -n "$bundle/privilege-broker-posix" || return 1
+  validate_host_and_context && /bin/bash -n "$bundle/privilege-broker-posix" || return 1
+  case $platform_boundary in
+    linux) validate_apt_context || return 1 ;;
+    macos) validate_macos_context || return 1 ;;
+    *) return 1 ;;
+  esac
   observed_ca=$("$ssh_keygen" -lf "$bundle/fleet-ca.pub" -E sha256 2>/dev/null |
     /usr/bin/awk 'NR==1{print $2}')
   [ "$observed_ca" = "$ca_fingerprint" ] || return 1
@@ -810,8 +940,8 @@ current_constraints_digest=absent
 current_broker_digest=absent
 current_identity_digest=absent
 current_context_digest=absent
-current_apt_context_digest=absent
-current_source_authority_digest=absent
+current_platform_context_digest=absent
+current_platform_artifacts_digest=absent
 load_current_generation() {
   current_epoch=0
   current_target=absent
@@ -820,16 +950,15 @@ load_current_generation() {
   current_broker_digest=absent
   current_identity_digest=absent
   current_context_digest=absent
-  current_apt_context_digest=absent
-  current_source_authority_digest=absent
+  current_platform_context_digest=absent
+  current_platform_artifacts_digest=absent
   if [ -L "$config_root/active" ]; then
     current_target=$(/usr/bin/readlink "$config_root/active") || return 1
     [[ $current_target =~ ^generations/([1-9][0-9]{0,9})$ ]] || return 1
     current_epoch=${BASH_REMATCH[1]}
     current_generation=$config_root/$current_target
     protected_directory "$current_generation" || return 1
-    for current_file in policy.actions policy.constraints broker.sha256 ssh-keygen.sha256 host.identity context.canary apt.context \
-      apt/source-authority; do
+    for current_file in policy.actions policy.constraints broker.sha256 ssh-keygen.sha256 host.identity context.canary; do
       protected_file "$current_generation/$current_file" 1048576 || return 1
     done
     current_policy_digest=$(sha256_file "$current_generation/policy.actions")
@@ -837,8 +966,21 @@ load_current_generation() {
     current_broker_digest=$(/usr/bin/sed -n '1p' "$current_generation/broker.sha256")
     current_identity_digest=$(sha256_file "$current_generation/host.identity")
     current_context_digest=$(sha256_file "$current_generation/context.canary")
-    current_apt_context_digest=$(sha256_file "$current_generation/apt.context")
-    current_source_authority_digest=$(sha256_file "$current_generation/apt/source-authority")
+    case $platform_boundary in
+      linux)
+        protected_file "$current_generation/apt.context" 1048576 &&
+          protected_file "$current_generation/apt/source-authority" 1048576 || return 1
+        current_platform_context_digest=$(sha256_file "$current_generation/apt.context")
+        current_platform_artifacts_digest=$(sha256_file "$current_generation/apt/source-authority")
+        ;;
+      macos)
+        protected_file "$current_generation/macos.context" 1048576 &&
+          protected_directory "$current_generation/macos/packages" || return 1
+        current_platform_context_digest=$(sha256_file "$current_generation/macos.context")
+        current_platform_artifacts_digest=$(path_set_digest packages "$current_generation/macos/packages")
+        ;;
+      *) return 1 ;;
+    esac
     digest "$current_broker_digest" || return 1
   elif [ -e "$config_root/active" ]; then
     return 1
@@ -851,8 +993,9 @@ record_value_from() {
 
 validate_public_enrollment_receipt() {
   local expected_epoch=$1 generation=$2 receipt public_scope receipt_broker receipt_policy
-  local receipt_constraints receipt_identity receipt_context receipt_apt receipt_authority receipt_sudoers
+  local receipt_constraints receipt_identity receipt_context receipt_platform receipt_artifacts receipt_sudoers
   local receipt_ca receipt_signers receipt_krl receipt_uid receipt_principal receipt_endpoints
+  local expected_context_label expected_artifacts_label
   receipt=$root_prefix/var/lib/machine-utilities-public/enrollment
   protected_file "$receipt" 8192 && exact_mode "$receipt" 644 || return 1
   /usr/bin/awk -F '|' '
@@ -872,8 +1015,14 @@ validate_public_enrollment_receipt() {
   ' "$receipt" || return 1
   # The fixed field order is part of the public contract. Check the labels
   # separately so the value grammar above cannot accidentally accept aliases.
+  expected_context_label='apt-context-sha256'
+  expected_artifacts_label='source-authority-sha256'
+  if [ "$platform_boundary" = macos ]; then
+    expected_context_label='platform-context-sha256'
+    expected_artifacts_label='platform-artifacts-sha256'
+  fi
   [ "$(/usr/bin/awk -F '|' 'NR>=5&&NR<=17{printf "%s%s",sep,$1;sep=","}' "$receipt")" = \
-    'manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,apt-context-sha256,source-authority-sha256,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256' ] || return 1
+    "manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,$expected_context_label,$expected_artifacts_label,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256" ] || return 1
   public_scope=$(record_value_from "$receipt" scope)
   if [ "$fixture_mode" = true ]; then [ "$public_scope" = fixture ] || return 1
   else [ "$public_scope" = native ] || return 1
@@ -884,8 +1033,8 @@ validate_public_enrollment_receipt() {
   receipt_constraints=$(record_value_from "$receipt" constraints-sha256)
   receipt_identity=$(record_value_from "$receipt" host-identity-sha256)
   receipt_context=$(record_value_from "$receipt" context-canary-sha256)
-  receipt_apt=$(record_value_from "$receipt" apt-context-sha256)
-  receipt_authority=$(record_value_from "$receipt" source-authority-sha256)
+  receipt_platform=$(record_value_from "$receipt" "$expected_context_label")
+  receipt_artifacts=$(record_value_from "$receipt" "$expected_artifacts_label")
   receipt_ca=$(record_value_from "$receipt" fleet-ca-sha256)
   receipt_signers=$(record_value_from "$receipt" allowed-signers-sha256)
   receipt_krl=$(record_value_from "$receipt" revoked-krl-sha256)
@@ -899,12 +1048,21 @@ validate_public_enrollment_receipt() {
     [ "$receipt_constraints" = "$(sha256_file "$generation/policy.constraints")" ] &&
     [ "$receipt_identity" = "$(sha256_file "$generation/host.identity")" ] &&
     [ "$receipt_context" = "$(sha256_file "$generation/context.canary")" ] &&
-    [ "$receipt_apt" = "$(sha256_file "$generation/apt.context")" ] &&
-    [ "$receipt_authority" = "$(sha256_file "$generation/apt/source-authority")" ] &&
     [ "$receipt_ca" = "$(sha256_file "$config_root/trust/fleet-ca.pub")" ] &&
     [ "$receipt_signers" = "$(sha256_file "$config_root/trust/allowed_signers")" ] &&
     [ "$receipt_krl" = "$(sha256_file "$config_root/trust/revoked.krl")" ] &&
     [ "$receipt_sudoers" = "$(sha256_file "$sudoers_path")" ] || return 1
+  case $platform_boundary in
+    linux)
+      [ "$receipt_platform" = "$(sha256_file "$generation/apt.context")" ] &&
+        [ "$receipt_artifacts" = "$(sha256_file "$generation/apt/source-authority")" ] || return 1
+      ;;
+    macos)
+      [ "$receipt_platform" = "$(sha256_file "$generation/macos.context")" ] &&
+        [ "$receipt_artifacts" = "$(path_set_digest packages "$generation/macos/packages")" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
   IFS='|' read -r identity_type identity_version _identity_host identity_uid identity_principal \
     _identity_domain identity_ca _identity_ca_generation _identity_host_fingerprint identity_endpoints identity_extra \
     <"$generation/host.identity" || return 1
@@ -915,23 +1073,31 @@ validate_public_enrollment_receipt() {
 }
 
 validate_public_canary_receipt() {
-  local expected_epoch=$1 canary scope broker_digest sudoers_digest
+  local expected_epoch=$1 canary scope broker_digest sudoers_digest digest_line sudoers_line
   canary=$root_prefix/var/lib/machine-utilities-public/canary
   protected_file "$canary" 4096 && exact_mode "$canary" 644 || return 1
-  /usr/bin/awk -F '|' '
+  /usr/bin/awk -F '|' -v platform="$platform_boundary" '
     $0!~/^[ -~]+$/||length($0)>512{exit 1}
     NR==1{if($0!="enrollment-canary|1")exit 1;next}
-    NR==2{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;next}
+    NR==2{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;scope=$2;next}
     NR==3{if(NF!=2||$1!="complete-sudoers")exit 1;next}
     NR==4{if(NF!=2||$1!="positive-no-argument")exit 1;next}
     NR==5{if(NF!=2||$1!="negative-with-argument")exit 1;next}
     NR==6{if(NF!=2||$1!="negative-direct-unprivileged")exit 1;next}
-    NR==7{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
-    NR==8||NR==9{if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
-    {exit 1} END{if(NR!=9)exit 1}
+    platform=="linux"&&NR==7{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    platform=="linux"&&(NR==8||NR==9){if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    platform=="macos"&&NR==7{if(NF!=2||$1!="negative-direct-installer"||$2!=(scope=="native"?"passed":"fixture-not-run"))exit 1;next}
+    platform=="macos"&&NR==8{if(NF!=2||$1!="negative-root-homebrew"||$2!=(scope=="native"?"passed":"fixture-not-run"))exit 1;next}
+    platform=="macos"&&NR==9{if(NF!=2||$1!="negative-root-shell"||$2!=(scope=="native"?"passed":"fixture-not-run"))exit 1;next}
+    platform=="macos"&&NR==10{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+    platform=="macos"&&(NR==11||NR==12){if(NF!=2||length($2)!=64||$2!~/^[0-9a-f]+$/)exit 1;next}
+    {exit 1} END{if((platform=="linux"&&NR!=9)||(platform=="macos"&&NR!=12))exit 1}
   ' "$canary" || return 1
-  [ "$(/usr/bin/sed -n '8s/|.*//p' "$canary")" = broker-sha256 ] &&
-    [ "$(/usr/bin/sed -n '9s/|.*//p' "$canary")" = sudoers-sha256 ] || return 1
+  if [ "$platform_boundary" = macos ]; then digest_line=11; sudoers_line=12
+  else digest_line=8; sudoers_line=9
+  fi
+  [ "$(/usr/bin/sed -n "${digest_line}s/|.*//p" "$canary")" = broker-sha256 ] &&
+    [ "$(/usr/bin/sed -n "${sudoers_line}s/|.*//p" "$canary")" = sudoers-sha256 ] || return 1
   scope=$(record_value_from "$canary" scope)
   if [ "$fixture_mode" = true ]; then
     [ "$scope" = fixture ] &&
@@ -939,12 +1105,22 @@ validate_public_canary_receipt() {
       [ "$(record_value_from "$canary" positive-no-argument)" = fixture-simulated-broker-reached ] &&
       [ "$(record_value_from "$canary" negative-with-argument)" = fixture-passed ] &&
       [ "$(record_value_from "$canary" negative-direct-unprivileged)" = fixture-not-run ] || return 1
+    if [ "$platform_boundary" = macos ]; then
+      [ "$(record_value_from "$canary" negative-direct-installer)" = fixture-not-run ] &&
+        [ "$(record_value_from "$canary" negative-root-homebrew)" = fixture-not-run ] &&
+        [ "$(record_value_from "$canary" negative-root-shell)" = fixture-not-run ] || return 1
+    fi
   else
     [ "$scope" = native ] &&
       [ "$(record_value_from "$canary" complete-sudoers)" = passed ] &&
       [ "$(record_value_from "$canary" positive-no-argument)" = passed ] &&
       [ "$(record_value_from "$canary" negative-with-argument)" = passed ] &&
       [ "$(record_value_from "$canary" negative-direct-unprivileged)" = passed ] || return 1
+    if [ "$platform_boundary" = macos ]; then
+      [ "$(record_value_from "$canary" negative-direct-installer)" = passed ] &&
+        [ "$(record_value_from "$canary" negative-root-homebrew)" = passed ] &&
+        [ "$(record_value_from "$canary" negative-root-shell)" = passed ] || return 1
+    fi
   fi
   broker_digest=$(record_value_from "$canary" broker-sha256)
   sudoers_digest=$(record_value_from "$canary" sudoers-sha256)
@@ -970,9 +1146,21 @@ validate_coherent_enrollment() {
   protected_file "$broker_path" 33554432 && exact_mode "$broker_path" 755 &&
     protected_file "$sudoers_path" 4096 && exact_mode "$sudoers_path" 440 || return 1
   for expected_file in policy.actions policy.constraints broker.sha256 broker.version ssh-keygen.sha256 host.identity \
-    context.canary apt.conf apt.context; do
+    context.canary; do
     protected_file "$generation/$expected_file" 1048576 && exact_mode "$generation/$expected_file" 644 || return 1
   done
+  case $platform_boundary in
+    linux)
+      for expected_file in apt.conf apt.context; do
+        protected_file "$generation/$expected_file" 1048576 && exact_mode "$generation/$expected_file" 644 || return 1
+      done
+      ;;
+    macos)
+      protected_file "$generation/macos.context" 1048576 &&
+        exact_mode "$generation/macos.context" 644 && validate_macos_packages "$generation" || return 1
+      ;;
+    *) return 1 ;;
+  esac
   for expected_file in fleet-ca.pub allowed_signers revoked.krl; do
     protected_file "$config_root/trust/$expected_file" 1048576 &&
       exact_mode "$config_root/trust/$expected_file" 644 || return 1
@@ -997,14 +1185,19 @@ validate_coherent_enrollment() {
   [ "$epoch_line" = constraints ] && [ "$constraint_version" = 1 ] && [ -z "$constraint_extra" ] &&
     [ "$generation_bound" = "$expected_epoch" ] && [ "$policy_field" = "policy-sha256=$generation_policy" ] || return 1
   IFS='|' read -r _ _ _ _ request_user_from_identity _ _ _ _ _ _ <"$generation/host.identity" || return 1
-  expected_sudoers="$request_user_from_identity ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker \"\""
+  expected_sudoers="$request_user_from_identity ALL=(root) NOPASSWD:NOSETENV: $broker_system_path \"\""
   [ "$(/usr/bin/sed -n '1p' "$sudoers_path")" = "$expected_sudoers" ] &&
     [ "$(/usr/bin/wc -l <"$sudoers_path" | /usr/bin/tr -d ' ')" = 1 ] || return 1
   for state_directory in replay journal audit lock rollback quarantine; do
     protected_directory "$state_root/$state_directory" && exact_mode "$state_root/$state_directory" 700 || return 1
   done
   revocation_reserve_valid || return 1
-  ( bundle=$generation; epoch=$expected_epoch; validate_host_and_context && validate_apt_context ) || return 1
+  case $platform_boundary in
+    linux) ( bundle=$generation; epoch=$expected_epoch; validate_host_and_context && validate_apt_context ) || return 1 ;;
+    macos) ( bundle=$generation; epoch=$expected_epoch; validate_host_and_context &&
+      validate_macos_context && validate_macos_packages "$generation" ) || return 1 ;;
+    *) return 1 ;;
+  esac
   validate_public_enrollment_receipt "$expected_epoch" "$generation" &&
     validate_public_canary_receipt "$expected_epoch"
 }
@@ -1038,19 +1231,28 @@ validate_unenrolled_state() {
 }
 
 emit_preview_body() {
-  local candidate_broker candidate_identity candidate_context candidate_apt_context candidate_source_authority candidate_sudoers
+  local candidate_broker candidate_identity candidate_context candidate_platform_context candidate_platform_artifacts candidate_sudoers
   local candidate_source_uri candidate_source_suite candidate_source_component candidate_publisher_fingerprint
   candidate_broker=$(manifest_file_digest privilege-broker-posix)
   candidate_identity=$(manifest_file_digest host.identity)
   candidate_context=$(manifest_file_digest context.canary)
-  candidate_apt_context=$(manifest_file_digest apt.context)
-  candidate_source_authority=$(manifest_file_digest apt/source-authority)
-  candidate_source_uri=$(record_value_from "$bundle/apt/source-authority" source-uri)
-  candidate_source_suite=$(record_value_from "$bundle/apt/source-authority" source-suite)
-  candidate_source_component=$(record_value_from "$bundle/apt/source-authority" source-component)
-  candidate_publisher_fingerprint=$(record_value_from "$bundle/apt/source-authority" publisher-primary-fingerprint)
-  candidate_sudoers=$(printf '%s ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker ""\n' \
-    "$request_user" | sha256_stream)
+  case $platform_boundary in
+    linux)
+      candidate_platform_context=$(manifest_file_digest apt.context)
+      candidate_platform_artifacts=$(manifest_file_digest apt/source-authority)
+      candidate_source_uri=$(record_value_from "$bundle/apt/source-authority" source-uri)
+      candidate_source_suite=$(record_value_from "$bundle/apt/source-authority" source-suite)
+      candidate_source_component=$(record_value_from "$bundle/apt/source-authority" source-component)
+      candidate_publisher_fingerprint=$(record_value_from "$bundle/apt/source-authority" publisher-primary-fingerprint)
+      ;;
+    macos)
+      candidate_platform_context=$(manifest_file_digest macos.context)
+      candidate_platform_artifacts=$(path_set_digest packages "$bundle/macos/packages")
+      ;;
+    *) return 1 ;;
+  esac
+  candidate_sudoers=$(printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' \
+    "$request_user" "$broker_system_path" | sha256_stream)
   printf 'enrollment-preview|2\noperation|install\n'
   printf 'from-epoch|%s\nto-epoch|%s\nmanifest-sha256|%s\n' "$current_epoch" "$epoch" "$manifest_digest"
   printf 'change|broker|%s|%s\n' "$current_broker_digest" "$candidate_broker"
@@ -1058,13 +1260,18 @@ emit_preview_body() {
   printf 'change|constraints|%s|%s\n' "$current_constraints_digest" "$constraints_digest"
   printf 'change|host-identity|%s|%s\n' "$current_identity_digest" "$candidate_identity"
   printf 'change|context-canary|%s|%s\n' "$current_context_digest" "$candidate_context"
-  printf 'change|apt-context-v2|%s|%s\n' "$current_apt_context_digest" "$candidate_apt_context"
-  printf 'change|apt-source-authority|%s|%s\n' "$current_source_authority_digest" "$candidate_source_authority"
-  printf 'apt-source|uri=%s|suite=%s|component=%s|publisher-primary-fingerprint=%s\n' \
-    "$candidate_source_uri" "$candidate_source_suite" "$candidate_source_component" \
-    "$candidate_publisher_fingerprint"
-  printf 'sudoers|principal=%s|uid=%s|command=/usr/libexec/machine-utilities/posix-broker|argv=empty|sha256=%s\n' \
-    "$request_user" "$enrolled_uid" "$candidate_sudoers"
+  if [ "$platform_boundary" = linux ]; then
+    printf 'change|apt-context-v2|%s|%s\n' "$current_platform_context_digest" "$candidate_platform_context"
+    printf 'change|apt-source-authority|%s|%s\n' "$current_platform_artifacts_digest" "$candidate_platform_artifacts"
+    printf 'apt-source|uri=%s|suite=%s|component=%s|publisher-primary-fingerprint=%s\n' \
+      "$candidate_source_uri" "$candidate_source_suite" "$candidate_source_component" \
+      "$candidate_publisher_fingerprint"
+  else
+    printf 'change|macos-context-v1|%s|%s\n' "$current_platform_context_digest" "$candidate_platform_context"
+    printf 'change|macos-protected-packages|%s|%s\n' "$current_platform_artifacts_digest" "$candidate_platform_artifacts"
+  fi
+  printf 'sudoers|principal=%s|uid=%s|command=%s|argv=empty|sha256=%s\n' \
+    "$request_user" "$enrolled_uid" "$broker_system_path" "$candidate_sudoers"
   printf 'trust|fleet-ca=%s|ca-generation=%s|endpoint-principals=%s\n' \
     "$ca_fingerprint" "$ca_generation" "$endpoint_principals"
   /usr/bin/awk -F '|' 'NR>1{printf "candidate-action|%s|%s|%s|%s|%s\n",$2,$3,$4,$5,$6}' \
@@ -1086,12 +1293,23 @@ preview_bundle() {
 }
 
 validate_os_ancestors() {
-  local ancestor
+  local ancestor broker_parent
   if [ -n "$root_prefix" ]; then protected_directory "$root_prefix" || return 1; fi
+  broker_parent=${broker_path%/machine-utilities/posix-broker}
   for ancestor in "$root_prefix/etc" "$root_prefix/etc/sudoers.d" "$root_prefix/usr" \
-    "$root_prefix/usr/libexec" "$root_prefix/var" "$root_prefix/var/lib"; do
+    "$root_prefix/var" "$root_prefix/var/lib"; do
     protected_directory "$ancestor" || return 1
   done
+  if [ "$platform_boundary" = macos ]; then
+    if [ -e "$root_prefix/usr/local" ] || [ -L "$root_prefix/usr/local" ]; then
+      protected_directory "$root_prefix/usr/local" && exact_mode "$root_prefix/usr/local" 755 || return 1
+    fi
+    if [ -e "$broker_parent" ] || [ -L "$broker_parent" ]; then
+      protected_directory "$broker_parent" && exact_mode "$broker_parent" 755 || return 1
+    fi
+  else
+    protected_directory "$broker_parent" || return 1
+  fi
 }
 
 created_directories=()
@@ -1104,12 +1322,16 @@ ensure_application_directory() {
   /bin/mkdir "$path" || return 1
   created_directories+=("$path")
   /bin/chmod "$mode" "$path" || return 1
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$path" || return 1; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$path" || return 1; fi
   protected_directory "$path" && exact_mode "$path" "${mode#0}"
 }
 
 ensure_application_layout() {
-  ensure_application_directory "$root_prefix/usr/libexec/machine-utilities" 0755 &&
+  if [ "$platform_boundary" = macos ]; then
+    ensure_application_directory "$root_prefix/usr/local" 0755 || return 1
+    ensure_application_directory "$root_prefix/usr/local/libexec" 0755 || return 1
+  fi
+  ensure_application_directory "${broker_path%/posix-broker}" 0755 &&
     ensure_application_directory "$config_root" 0755 &&
     ensure_application_directory "$config_root/generations" 0755 &&
     ensure_application_directory "$config_root/trust" 0755 &&
@@ -1171,18 +1393,41 @@ lifecycle_owner_state() {
 }
 
 acquire_lifecycle_guard() {
-  local owner_pid guard_pid
+  local owner_pid guard_pid guard_rc
   capture_current_process_id owner_pid || return 74
   lifecycle_guard=$root_prefix/var/lib/machine-utilities-lifecycle.guard
   lifecycle_guard_owned=false
+  lifecycle_guard_method=
   if [ "$fixture_mode" = true ]; then
-    # Production is Linux-only and uses flock below. macOS executes U2 only as
-    # a fixture, where shlock supplies an atomic, process-bound serializer.
     [ -x /usr/bin/shlock ] || return 74
     if ! /usr/bin/shlock -f "$lifecycle_guard" -p "$owner_pid"; then return 75; fi
     /bin/chmod 0600 "$lifecycle_guard" || return 74
+    protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || return 74
     guard_pid=$(/usr/bin/sed -n '1p' "$lifecycle_guard") || return 74
     [ "$guard_pid" = "$owner_pid" ] || return 74
+    lifecycle_guard_method=shlock
+    lifecycle_guard_owned=true
+    return 0
+  fi
+  if [ "$platform_boundary" = macos ]; then
+    protected_file /usr/bin/lockf 33554432 && [ -x /usr/bin/lockf ] || return 74
+    [ ! -L "$lifecycle_guard" ] || return 74
+    exec 9>>"$lifecycle_guard" || return 74
+    if /usr/bin/lockf -s -t 0 9; then guard_rc=0
+    else guard_rc=$?
+    fi
+    if [ "$guard_rc" -ne 0 ]; then
+      exec 9>&-
+      [ "$guard_rc" -eq 75 ] && return 75
+      return 74
+    fi
+    /bin/chmod 0600 "$lifecycle_guard" || { exec 9>&-; return 74; }
+    /usr/sbin/chown root:wheel "$lifecycle_guard" || { exec 9>&-; return 74; }
+    protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || {
+      exec 9>&-
+      return 74
+    }
+    lifecycle_guard_method=lockf
     lifecycle_guard_owned=true
     return 0
   fi
@@ -1191,25 +1436,27 @@ acquire_lifecycle_guard() {
   exec 9>>"$lifecycle_guard" || return 74
   /usr/bin/flock -n 9 || { exec 9>&-; return 75; }
   /bin/chmod 0600 "$lifecycle_guard" || { exec 9>&-; return 74; }
-  /usr/bin/chown root:root "$lifecycle_guard" || { exec 9>&-; return 74; }
+  /usr/bin/chown root:"$protected_group" "$lifecycle_guard" || { exec 9>&-; return 74; }
   protected_file "$lifecycle_guard" 1024 && exact_mode "$lifecycle_guard" 600 || {
     exec 9>&-
     return 74
   }
   lifecycle_guard_owned=true
+  lifecycle_guard_method=flock
 }
 
 release_lifecycle_guard() {
   local owner_pid observed
   [ "${lifecycle_guard_owned:-false}" = true ] || return 0
-  capture_current_process_id owner_pid || return 1
-  if [ "$fixture_mode" = true ]; then
+  if [ "$lifecycle_guard_method" = shlock ]; then
+    capture_current_process_id owner_pid || return 1
     observed=$(/usr/bin/sed -n '1p' "$lifecycle_guard" 2>/dev/null || true)
     if [ "$observed" = "$owner_pid" ]; then /bin/rm -f "$lifecycle_guard"; fi
   else
     exec 9>&-
   fi
   lifecycle_guard_owned=false
+  lifecycle_guard_method=
 }
 
 cleanup_orphan_lock_prepare() {
@@ -1431,7 +1678,7 @@ acquire_lifecycle_lock() {
   fi
   /bin/mkdir "$lifecycle_prepare" || { lifecycle_lock_reason=lifecycle_prepare_collision; return 74; }
   /bin/chmod 0700 "$lifecycle_prepare" || return 74
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$lifecycle_prepare" || return 74; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$lifecycle_prepare" || return 74; fi
   u2_pause lifecycle-prepare-before-owner || {
     lifecycle_lock_reason=fixture_pause_failed
     return 74
@@ -1555,7 +1802,7 @@ create_marked_transaction_directory() {
   prepare=$(artifact_prepare_path "$directory") || return 1
   transaction_artifact_absent "$directory" && transaction_artifact_absent "$prepare" || return 1
   /bin/mkdir -m "$directory_mode" "$prepare" || return 1
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$prepare" || return 1; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$prepare" || return 1; fi
   protected_directory "$prepare" && exact_mode "$prepare" "$directory_mode" || return 1
   u2_pause "$pause_point" || return 1
   write_artifact_marker "$prepare" "$marker_mode" || return 1
@@ -1583,7 +1830,7 @@ write_drain() {
   drain_tmp=$state_root/.draining.$$
   printf '%s\n' "$expected" >"$drain_tmp" || return 1
   /bin/chmod 0600 "$drain_tmp" || return 1
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$drain_tmp" || return 1; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$drain_tmp" || return 1; fi
   /bin/mv "$drain_tmp" "$draining" || return 1
   drain_owned=true
 }
@@ -1644,7 +1891,7 @@ restore_path() {
       /bin/rm -f "$restore_path_tmp" || return 1
       /bin/cp "$backup/$label.data" "$restore_path_tmp" || return 1
       /bin/chmod "$mode" "$restore_path_tmp" || return 1
-      if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$restore_path_tmp" || return 1; fi
+      if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$restore_path_tmp" || return 1; fi
       durable_sync || return 1
       /bin/mv -f "$restore_path_tmp" "$path" && durable_sync
       ;;
@@ -2182,22 +2429,25 @@ publish_public_file() {
   suffix=${transaction_id:-$$}
   public_tmp=$public_root/.$destination.$suffix
   /bin/cp "$source" "$public_tmp" && /bin/chmod 0644 "$public_tmp" || return 1
-  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:root "$public_tmp" || return 1; fi
+  if [ "$fixture_mode" = false ]; then /usr/bin/chown root:"$protected_group" "$public_tmp" || return 1; fi
   durable_sync || return 1
   /bin/mv -f "$public_tmp" "$public_root/$destination" && durable_sync
 }
 
 run_enrollment_canary() {
-  local canary_output direct_output canary_result direct_result canary_rc direct_rc suffix
+  local canary_output direct_output canary_result direct_result canary_rc direct_rc suffix brew_path
   suffix=${transaction_id:-$$}
   canary_output=$state_root/.canary-output.$suffix
   direct_output=$state_root/.direct-output.$suffix
   if [ "$fixture_mode" = true ]; then
-    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$root_prefix" "$broker_path" </dev/null >"$canary_output" 2>/dev/null; then
+    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$root_prefix" \
+        MACHINE_UTILITIES_U2_FIXTURE_PLATFORM="$platform_boundary" \
+        "$broker_path" </dev/null >"$canary_output" 2>/dev/null; then
       return 1
     fi
     /usr/bin/grep -Fqx 'result|1' "$canary_output" || return 1
-    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$root_prefix" "$broker_path" unexpected \
+    if MACHINE_UTILITIES_U2_FIXTURE_ROOT="$root_prefix" \
+        MACHINE_UTILITIES_U2_FIXTURE_PLATFORM="$platform_boundary" "$broker_path" unexpected \
         </dev/null >/dev/null 2>&1; then
       return 1
     fi
@@ -2206,27 +2456,45 @@ run_enrollment_canary() {
     canary_positive=fixture-simulated-broker-reached
     canary_negative_argument=fixture-passed
     canary_negative_direct=fixture-not-run
+    if [ "$platform_boundary" = macos ]; then
+      canary_negative_installer=fixture-not-run
+      canary_negative_homebrew=fixture-not-run
+      canary_negative_shell=fixture-not-run
+    fi
   else
     [ -x /usr/bin/sudo ] && [ -x /usr/sbin/visudo ] || return 1
     /usr/sbin/visudo -cf /etc/sudoers >/dev/null || return 1
     if canary_result=$(/usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
-      /usr/libexec/machine-utilities/posix-broker </dev/null 2>/dev/null); then canary_rc=0
+      "$broker_system_path" </dev/null 2>/dev/null); then canary_rc=0
     else canary_rc=$?
     fi
     [ "$canary_rc" -ne 0 ] || return 1
     printf '%s\n' "$canary_result" >"$canary_output"
     /usr/bin/grep -Fqx 'result|1' "$canary_output" || return 1
     if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
-        /usr/libexec/machine-utilities/posix-broker unexpected </dev/null >/dev/null 2>&1; then
+        "$broker_system_path" unexpected </dev/null >/dev/null 2>&1; then
       return 1
     fi
-    if direct_result=$(/usr/bin/sudo -n -u "#$enrolled_uid" /usr/libexec/machine-utilities/posix-broker \
+    if direct_result=$(/usr/bin/sudo -n -u "#$enrolled_uid" "$broker_system_path" \
       </dev/null 2>/dev/null); then direct_rc=0
     else direct_rc=$?
     fi
     [ "$direct_rc" -ne 0 ] || return 1
     printf '%s\n' "$direct_result" >"$direct_output"
     /usr/bin/grep -Fqx 'reason|needs_human_enrollment' "$direct_output" || return 1
+    if [ "$platform_boundary" = macos ]; then
+      if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+          /usr/sbin/installer -help >/dev/null 2>&1; then return 1; fi
+      for brew_path in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k -l \
+            "$brew_path" >/dev/null 2>&1; then return 1; fi
+      done
+      if /usr/bin/sudo -n -u "#$enrolled_uid" /usr/bin/sudo -n -k \
+          /bin/sh -c : >/dev/null 2>&1; then return 1; fi
+      canary_negative_installer=passed
+      canary_negative_homebrew=passed
+      canary_negative_shell=passed
+    fi
     canary_scope=native
     canary_complete_sudoers=passed
     canary_positive=passed
@@ -2422,16 +2690,28 @@ install_bundle() (
     result drifted staging_marker_failed linux
     exit 74
   }
-  ensure_application_directory "$staging/apt" 0755
-  ensure_application_directory "$staging/apt/sources.list.d" 0755
-  ensure_application_directory "$staging/apt/trusted.gpg.d" 0755
-  ensure_application_directory "$staging/apt/preferences.d" 0755
-  for relative in policy.actions policy.constraints host.identity context.canary apt.conf apt.context; do
+  if [ "$platform_boundary" = linux ]; then
+    ensure_application_directory "$staging/apt" 0755
+    ensure_application_directory "$staging/apt/sources.list.d" 0755
+    ensure_application_directory "$staging/apt/trusted.gpg.d" 0755
+    ensure_application_directory "$staging/apt/preferences.d" 0755
+    platform_context_relative=apt.context
+  else
+    ensure_application_directory "$staging/macos" 0755
+    ensure_application_directory "$staging/macos/packages" 0755
+    platform_context_relative=macos.context
+  fi
+  for relative in policy.actions policy.constraints host.identity context.canary "$platform_context_relative"; do
     copy_manifest_file "$relative" "$staging/$relative"
   done
+  if [ "$platform_boundary" = linux ]; then copy_manifest_file apt.conf "$staging/apt.conf"; fi
   while IFS='|' read -r kind relative expected; do
     case $relative in
-      apt/*)
+      apt/*|macos/packages/*.pkg)
+        case $platform_boundary:$relative in
+          linux:apt/*|macos:macos/packages/*.pkg) ;;
+          *) continue ;;
+        esac
         destination=$staging/$relative
         destination_directory=${destination%/*}
         if [ ! -d "$destination_directory" ]; then ensure_application_directory "$destination_directory" 0755; fi
@@ -2445,12 +2725,15 @@ install_bundle() (
   printf '%s\n' "$ssh_keygen_digest" >"$staging/ssh-keygen.sha256"
   /bin/chmod 0644 "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
   if [ "$fixture_mode" = false ]; then
-    /usr/bin/chown root:root "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
+    /usr/bin/chown root:"$protected_group" "$staging/broker.sha256" "$staging/broker.version" "$staging/ssh-keygen.sha256"
   fi
   [ "$(sha256_file "$staging/policy.actions")" = "$policy_digest" ] &&
     [ "$(sha256_file "$staging/policy.constraints")" = "$constraints_digest" ] &&
-    [ "$(sha256_file "$staging/apt.context")" = "$(manifest_file_digest apt.context)" ] &&
+    [ "$(sha256_file "$staging/$platform_context_relative")" = "$(manifest_file_digest "$platform_context_relative")" ] &&
     /bin/bash -n "$bundle/privilege-broker-posix" || { result rejected staged_generation_validation_failed linux; exit 65; }
+  if [ "$platform_boundary" = macos ]; then
+    validate_macos_packages "$staging" || { result rejected staged_macos_package_validation_failed macos; exit 65; }
+  fi
 
   copy_manifest_file privilege-broker-posix "$new_broker"
   /bin/chmod 0755 "$new_broker"
@@ -2463,11 +2746,11 @@ install_bundle() (
   copy_manifest_file revoked.krl "$new_krl"
   observed_ca=$("$ssh_keygen" -lf "$new_ca" -E sha256 2>/dev/null | /usr/bin/awk 'NR==1{print $2}')
   [ "$observed_ca" = "$ca_fingerprint" ] || { result rejected fleet_ca_fingerprint_mismatch linux; exit 65; }
-  printf '%s ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker ""\n' \
-    "$request_user" >"$sudoers_temp"
+  printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' \
+    "$request_user" "$broker_system_path" >"$sudoers_temp"
   /bin/chmod 0440 "$sudoers_temp"
   if [ "$fixture_mode" = false ]; then
-    /usr/bin/chown root:root "$sudoers_temp"
+    /usr/bin/chown root:"$protected_group" "$sudoers_temp"
     [ -x /usr/sbin/visudo ] && /usr/sbin/visudo -cf "$sudoers_temp" >/dev/null
   fi
 
@@ -2514,14 +2797,26 @@ install_bundle() (
   }
   run_enrollment_canary || { result drifted enrollment_canary_failed linux; exit 65; }
   sudoers_digest=$(sha256_file "$sudoers_path")
+  if [ "$platform_boundary" = linux ]; then
+    platform_context_label='apt-context-sha256'
+    platform_context_digest=$(sha256_file "$final_generation/apt.context")
+    platform_artifacts_label='source-authority-sha256'
+    platform_artifacts_digest=$(sha256_file "$final_generation/apt/source-authority")
+  else
+    platform_context_label='platform-context-sha256'
+    platform_context_digest=$(sha256_file "$final_generation/macos.context")
+    platform_artifacts_label='platform-artifacts-sha256'
+    platform_artifacts_digest=$(path_set_digest packages "$final_generation/macos/packages")
+  fi
   {
     printf 'enrollment-receipt|2\nstate|enrolled\nscope|%s\n' "$canary_scope"
     printf 'epoch|%s\nmanifest-sha256|%s\nconfirmation-sha256|%s\n' "$epoch" "$manifest_digest" "$confirmation_digest"
     printf 'broker-sha256|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
       "$(sha256_file "$broker_path")" "$policy_digest" "$constraints_digest"
-    printf 'host-identity-sha256|%s\ncontext-canary-sha256|%s\napt-context-sha256|%s\nsource-authority-sha256|%s\n' \
+    printf 'host-identity-sha256|%s\ncontext-canary-sha256|%s\n%s|%s\n%s|%s\n' \
       "$(sha256_file "$final_generation/host.identity")" "$(sha256_file "$final_generation/context.canary")" \
-      "$(sha256_file "$final_generation/apt.context")" "$(sha256_file "$final_generation/apt/source-authority")"
+      "$platform_context_label" "$platform_context_digest" \
+      "$platform_artifacts_label" "$platform_artifacts_digest"
     printf 'fleet-ca-sha256|%s\nallowed-signers-sha256|%s\nrevoked-krl-sha256|%s\n' \
       "$(sha256_file "$config_root/trust/fleet-ca.pub")" \
       "$(sha256_file "$config_root/trust/allowed_signers")" \
@@ -2534,6 +2829,10 @@ install_bundle() (
     printf 'enrollment-canary|1\nscope|%s\ncomplete-sudoers|%s\n' "$canary_scope" "$canary_complete_sudoers"
     printf 'positive-no-argument|%s\nnegative-with-argument|%s\nnegative-direct-unprivileged|%s\n' \
       "$canary_positive" "$canary_negative_argument" "$canary_negative_direct"
+    if [ "$platform_boundary" = macos ]; then
+      printf 'negative-direct-installer|%s\nnegative-root-homebrew|%s\nnegative-root-shell|%s\n' \
+        "$canary_negative_installer" "$canary_negative_homebrew" "$canary_negative_shell"
+    fi
     printf 'epoch|%s\nbroker-sha256|%s\nsudoers-sha256|%s\n' \
       "$epoch" "$(sha256_file "$broker_path")" "$sudoers_digest"
   } >"$canary_temp"
@@ -2563,7 +2862,7 @@ install_bundle() (
   transaction_started=false
   release_lifecycle_lock || { result drifted lifecycle_lock_retirement_failed linux; exit 74; }
   release_lifecycle_guard
-  printf 'enrollment|1\nstate|enrolled\nreason|generation_activated\nplatform-boundary|linux\n'
+  printf 'enrollment|1\nstate|enrolled\nreason|generation_activated\nplatform-boundary|%s\n' "$platform_boundary"
   printf 'epoch|%s\nmanifest-sha256|%s\nconfirmation-sha256|%s\n' "$epoch" "$manifest_digest" "$confirmation_digest"
   printf 'broker-sha256|%s\npolicy-sha256|%s\nconstraints-sha256|%s\n' \
     "$(sha256_file "$broker_path")" "$policy_digest" "$constraints_digest"
@@ -2764,7 +3063,8 @@ revoke_bundle() (
   transaction_started=false
   release_lifecycle_lock || { result drifted lifecycle_lock_retirement_failed linux; exit 74; }
   release_lifecycle_guard
-  printf 'enrollment|1\nstate|revoked\nreason|grant_broker_generation_and_trust_quarantined\nplatform-boundary|linux\n'
+  printf 'enrollment|1\nstate|revoked\nreason|grant_broker_generation_and_trust_quarantined\nplatform-boundary|%s\n' \
+    "$platform_boundary"
   printf 'epoch|%s\nordinary-inventory|preserved\nprotected-journal|preserved\nquarantine|retained\n' "$expected_epoch"
 )
 
@@ -2772,9 +3072,9 @@ case $command in
   status)
     [ "$#" -eq 0 ] || usage
     if [ -L "$config_root/active" ] && [ -x "$broker_path" ]; then
-      result enrolled protected_generation_present linux
+      result enrolled protected_generation_present "$platform_boundary"
     else
-      result needs_human_enrollment broker_not_enrolled linux
+      result needs_human_enrollment broker_not_enrolled "$platform_boundary"
     fi
     ;;
   preview)

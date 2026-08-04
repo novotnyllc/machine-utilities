@@ -98,12 +98,14 @@ function Get-TextSha256([string]$Text) {
 }
 
 function Test-PrivilegePolicy([string[]]$Lines) {
-    if ($Lines.Count -ne 10 -or $Lines[0] -cne "policy|1|catalog=1") { return $false }
+    if ($Lines.Count -ne 12 -or $Lines[0] -cne "policy|1|catalog=1") { return $false }
     $Expected = [ordered]@{
         "apt.autoremove.v1" = @("posix-root-v1", "none")
         "apt.install-package-version.v1" = @("posix-root-v1", "package-source-version-closure-set-sha256")
         "apt.update-metadata.v1" = @("posix-root-v1", "none")
         "apt.upgrade-package.v1" = @("posix-root-v1", "package-source-channel-set-sha256")
+        "macos.apply-system-setting.v1" = @("macos-root-v1", "macos-system-setting-sha256")
+        "macos.install-signed-pkg.v1" = @("macos-root-v1", "macos-signed-pkg-sha256")
         "profile.apply-managed-bundle.v1" = @("windows-user-s4u-v1", "profile-bundle-set-sha256")
         "profile.inventory-managed-state.v1" = @("windows-user-s4u-v1", "profile-bundle-set-sha256")
         "winget.install-machine-package.v1" = @("windows-system-v1", "winget-package-version-set-sha256")
@@ -112,7 +114,7 @@ function Test-PrivilegePolicy([string[]]$Lines) {
     }
     $Previous = ""
     $Seen = @{}
-    foreach ($Line in $Lines[1..9]) {
+    foreach ($Line in $Lines[1..11]) {
         if ($Line -notmatch '^[\x20-\x7e]+$') { return $false }
         $Fields = $Line.Split('|')
         if ($Fields.Count -ne 6 -or $Fields[0] -cne "action" -or
@@ -181,6 +183,34 @@ function Test-PrivilegeConstraints([string[]]$PolicyLines, [string[]]$Lines, [st
                     -not [int64]::TryParse($Fields[7], [ref]$Major) -or $Major -lt 0 -or $Major -gt 2147483647 -or
                     $Fields[8] -notmatch $Digest) { return $null }
             }
+            "macos-pkg" {
+                [int64]$PackageBytes = 0
+                if ($Fields.Count -ne 12 -or $Fields[1] -cne "macos.install-signed-pkg.v1" -or
+                    $Fields[2] -notmatch $Token -or
+                    $Fields[3] -cnotin @("script-free", "sealed-cask-payload-v1") -or
+                    $Fields[4] -cnotmatch '^[1-9][0-9]{0,9}$' -or
+                    -not [int64]::TryParse($Fields[4], [ref]$PackageBytes) -or
+                    $PackageBytes -lt 1 -or $PackageBytes -gt 2147483647 -or
+                    $Fields[5] -cnotmatch $Digest -or $Fields[6] -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$' -or
+                    $Fields[7] -notmatch $Version -or $Fields[8] -cnotmatch '^[A-Z0-9]{10}$' -or
+                    $Fields[9] -cnotmatch $Digest -or $Fields[10] -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$' -or
+                    $Fields[11] -notmatch $Version) { return $null }
+            }
+            "macos-setting" {
+                if ($Fields.Count -ne 5 -or $Fields[1] -cne "macos.apply-system-setting.v1" -or
+                    $Fields[2] -notmatch $Token) { return $null }
+                $SettingValid = switch -CaseSensitive ($Fields[3]) {
+                    "timezone" { $Fields[4] -cmatch '^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+){0,2}$' -and $Fields[4].Length -le 255 }
+                    "network-time-server" { $Fields[4] -cmatch '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$' -and -not $Fields[4].Contains('..') }
+                    { $_ -cin @("wake-on-network-access", "restart-after-power-failure") } { $Fields[4] -cin @("on", "off") }
+                    { $_ -cin @("computer-sleep", "display-sleep") } {
+                        if ($Fields[4] -ceq "Never") { $true }
+                        else { [int64]$Minutes = 0; $Fields[4] -cmatch '^[1-9][0-9]{0,2}$' -and [int64]::TryParse($Fields[4], [ref]$Minutes) -and $Minutes -le 180 }
+                    }
+                    default { $false }
+                }
+                if (-not $SettingValid) { return $null }
+            }
             "profile" {
                 [int64]$Entries = 0; [int64]$Bytes = 0
                 if ($Fields.Count -ne 9 -or $Fields[1] -notmatch $Token -or
@@ -214,7 +244,8 @@ function Test-PrivilegeConstraints([string[]]$PolicyLines, [string[]]$Lines, [st
     $Tokens = @{}
     foreach ($Action in @(
         "apt.autoremove.v1", "apt.install-package-version.v1", "apt.update-metadata.v1",
-        "apt.upgrade-package.v1", "profile.apply-managed-bundle.v1", "profile.inventory-managed-state.v1",
+        "apt.upgrade-package.v1", "macos.apply-system-setting.v1", "macos.install-signed-pkg.v1",
+        "profile.apply-managed-bundle.v1", "profile.inventory-managed-state.v1",
         "winget.install-machine-package.v1", "winget.inventory-machine.v1", "winget.upgrade-machine-package.v1")) {
         [string[]]$Group = @($Lines | Select-Object -Skip 1 | Where-Object {
             $Parts = $_.Split('|')

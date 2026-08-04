@@ -82,6 +82,8 @@ validate_privilege_policy_file() (
         expected["apt.install-package-version.v1"] = "posix-root-v1|package-source-version-closure-set-sha256"
         expected["apt.update-metadata.v1"] = "posix-root-v1|none"
         expected["apt.upgrade-package.v1"] = "posix-root-v1|package-source-channel-set-sha256"
+        expected["macos.apply-system-setting.v1"] = "macos-root-v1|macos-system-setting-sha256"
+        expected["macos.install-signed-pkg.v1"] = "macos-root-v1|macos-signed-pkg-sha256"
         expected["profile.apply-managed-bundle.v1"] = "windows-user-s4u-v1|profile-bundle-set-sha256"
         expected["profile.inventory-managed-state.v1"] = "windows-user-s4u-v1|profile-bundle-set-sha256"
         expected["winget.install-machine-package.v1"] = "windows-system-v1|winget-package-version-set-sha256"
@@ -98,7 +100,7 @@ validate_privilege_policy_file() (
         if (previous != "" && previous >= $2) exit 1
         previous = $2
       }
-      END { if (NR != 10) exit 1; for (id in expected) if (!seen[id]) exit 1 }
+      END { if (NR != 12) exit 1; for (id in expected) if (!seen[id]) exit 1 }
     ' "$policy" || {
       printf 'machine-utilities: invalid %s\n' "$label" >&2
       return 64
@@ -122,6 +124,15 @@ validate_privilege_constraints_file() (
       function atom(value) { return value ~ /^[A-Za-z0-9][A-Za-z0-9._:+@,-]{0,255}$/ }
       function digest(value) { return length(value) == 64 && value ~ /^[0-9a-f]+$/ }
       function version(value) { return value ~ /^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/ }
+      function package_id(value) { return value ~ /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/ }
+      function team_id(value) { return value ~ /^[A-Z0-9]{10}$/ }
+      function setting_value(id, value) {
+        if (id == "timezone") return value ~ /^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/ && length(value) <= 255
+        if (id == "network-time-server") return value ~ /^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/ && value !~ /\.\./
+        if (id == "wake-on-network-access" || id == "restart-after-power-failure") return value == "on" || value == "off"
+        if (id == "computer-sleep" || id == "display-sleep") return value == "Never" || (value ~ /^[1-9][0-9]{0,2}$/ && (value + 0) <= 180)
+        return 0
+      }
       function uint(value, maximum) {
         return value ~ /^(0|[1-9][0-9]*)$/ && (value + 0) <= maximum
       }
@@ -150,6 +161,19 @@ validate_privilege_constraints_file() (
         if (NF != 9 || $2 != "apt.upgrade-package.v1" || !token($3) ||
             !atom($4) || !atom($5) || !version($6) || !version($7) ||
             !uint($8, 2147483647) || !digest($9)) exit 1
+        next
+      }
+      $1 == "macos-pkg" {
+        if (NF != 12 || $2 != "macos.install-signed-pkg.v1" || !token($3) ||
+            ($4 != "script-free" && $4 != "sealed-cask-payload-v1") ||
+            !uint($5, 2147483647) || $5 == "0" || !digest($6) || !package_id($7) ||
+            !version($8) || !team_id($9) || !digest($10) || !package_id($11) ||
+            !version($12)) exit 1
+        next
+      }
+      $1 == "macos-setting" {
+        if (NF != 5 || $2 != "macos.apply-system-setting.v1" || !token($3) ||
+            !setting_value($4, $5)) exit 1
         next
       }
       $1 == "profile" {
@@ -189,6 +213,7 @@ validate_privilege_constraints_file() (
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   for action in \
     apt.install-package-version.v1 apt.upgrade-package.v1 \
+    macos.apply-system-setting.v1 macos.install-signed-pkg.v1 \
     profile.apply-managed-bundle.v1 profile.inventory-managed-state.v1 \
     winget.install-machine-package.v1 winget.upgrade-machine-package.v1; do
     LC_ALL=C awk -F '|' -v action="$action" '
@@ -226,7 +251,8 @@ inspect_privilege_constraints_file() (
       generation:$generation,digest:{algorithm:"sha256",value:$constraints_digest},
       actions:[
         "apt.autoremove.v1","apt.install-package-version.v1","apt.update-metadata.v1",
-        "apt.upgrade-package.v1","profile.apply-managed-bundle.v1",
+        "apt.upgrade-package.v1","macos.apply-system-setting.v1",
+        "macos.install-signed-pkg.v1","profile.apply-managed-bundle.v1",
         "profile.inventory-managed-state.v1","winget.install-machine-package.v1",
         "winget.inventory-machine.v1","winget.upgrade-machine-package.v1"
       ] | map(. as $action | {
@@ -473,7 +499,8 @@ privilege_status_command() {
   transport=$(jq -r --arg target "$target" '.machines[$target].transport // empty' "$config")
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // empty' "$config")
-  if [ "$platform:$transport:$route" = linux:ssh:posix-ssh ]; then
+  if { [ "$platform" = linux ] || [ "$platform" = macos ]; } &&
+    [ "$transport:$route" = ssh:posix-ssh ]; then
     posix_dispatch_readiness_snapshot "$target" "$output"
     return
   fi
@@ -552,10 +579,10 @@ prepare_privilege_enrollment_command() (
       safe_output "$tmp/preparation" "$output"
       exit 69
       ;;
-    linux:posix-ssh)
-      jq -S -n --arg target "$target" '{
+    linux:posix-ssh|macos:posix-ssh)
+      jq -S -n --arg target "$target" --arg platform "$platform" '{
         schema:"machine-utilities.privilege-enrollment-preparation",schema_version:1,
-        target:$target,platform:"linux",route:"posix-ssh",state:"needs_human_enrollment",
+        target:$target,platform:$platform,route:"posix-ssh",state:"needs_human_enrollment",
         reason:"local_passworded_sudo_required",activation_performed:false,
         credential_handling:"agent_stops_before_password_and_never_requests_or_relays_it",
         fixed_entrypoints:[
@@ -567,22 +594,6 @@ prepare_privilege_enrollment_command() (
         required_public_artifacts:["certificate-request","fleet-ca.pub","node-certificate",
           "revoked.krl","privilege-policy.default","release-integrity","native-canary-receipts"],
         next_action:"inspect_previews_then_complete_the_local_owner_enrollment_ceremony"
-      }' >"$tmp/preparation"
-      ;;
-    macos:posix-ssh)
-      jq -S -n --arg target "$target" '{
-        schema:"machine-utilities.privilege-enrollment-preparation",schema_version:1,
-        target:$target,platform:"macos",route:"posix-ssh",state:"needs_human_enrollment",
-        reason:"transport_enrollment_only_no_cataloged_root_action",activation_performed:false,
-        credential_handling:"agent_stops_before_password_and_never_requests_or_relays_it",
-        fixed_entrypoints:[
-          {path:"scripts/prepare-ssh-identity",mode:"prepare",elevation:"none"},
-          {path:"scripts/certify-ssh-node",mode:"sign",elevation:"isolated_owner_signer"},
-          {path:"scripts/enroll-ssh-posix",mode:"preview_then_install",elevation:"local_passworded_sudo"}
-        ],
-        required_public_artifacts:["certificate-request","fleet-ca.pub","node-certificate",
-          "revoked.krl","release-integrity"],
-        next_action:"inspect_the_transport_preview_then_complete_the_local_owner_enrollment_ceremony"
       }' >"$tmp/preparation"
       ;;
     windows:windows-sftp)
@@ -741,8 +752,8 @@ validate_config_file() {
         ((.privilege_broker | type == "object") and
          ([.privilege_broker | keys[] | select(IN("automation_transport","policy_proposal") | not)] | length == 0) and
          ((.privilege_broker.policy_proposal // null) == null or
-           (.platform | IN("linux","windows")) and
-           (.privilege_broker.policy_proposal | type == "array" and length == 10) and
+           (.platform | IN("linux","macos","windows")) and
+           (.privilege_broker.policy_proposal | type == "array" and length == 12) and
            ([.privilege_broker.policy_proposal[] |
              type == "string" and length > 0 and length <= 512 and test("^[ -~]+$")
            ] | all)) and
@@ -1476,7 +1487,8 @@ REMOTE_COLLECTOR
   # readiness record is accepted only after the separate forced dispatcher
   # round-trip. Drop the ordinary-lane projection even when that round-trip
   # fails, so it can never authorize a broker request.
-  if [ "$platform:$transport:$broker_route" = linux:ssh:posix-ssh ]; then
+  if { [ "$platform" = linux ] || [ "$platform" = macos ]; } &&
+    [ "$transport:$broker_route" = ssh:posix-ssh ]; then
     jq -c 'select(.kind != "privilege_broker" or .id != "readiness")' "$records" \
       >"$tmp/without-posix-readiness.jsonl"
     if posix_dispatch_readiness_records "$target" "$tmp/posix-readiness.jsonl" \
@@ -1780,6 +1792,8 @@ privileged_action_contract_json() {
     "apt.install-package-version.v1":{"domain":"updates","context":"posix-root-v1","constraint_kind":"package-source-version-closure-set-sha256","token":"protected","payload":"empty","protocols":[1]},
     "apt.update-metadata.v1":{"domain":"updates","context":"posix-root-v1","constraint_kind":"none","token":"none","payload":"empty","protocols":[1]},
     "apt.upgrade-package.v1":{"domain":"updates","context":"posix-root-v1","constraint_kind":"package-source-channel-set-sha256","token":"protected","payload":"empty","protocols":[1]},
+    "macos.apply-system-setting.v1":{"domain":"updates","context":"macos-root-v1","constraint_kind":"macos-system-setting-sha256","token":"protected","payload":"empty","protocols":[1]},
+    "macos.install-signed-pkg.v1":{"domain":"updates","context":"macos-root-v1","constraint_kind":"macos-signed-pkg-sha256","token":"protected","payload":"empty","protocols":[1]},
     "profile.apply-managed-bundle.v1":{"domain":"agents","context":"windows-user-s4u-v1","constraint_kind":"profile-bundle-set-sha256","token":"protected","payload":"profile-bundle","protocols":[1]},
     "profile.inventory-managed-state.v1":{"domain":"agents","context":"windows-user-s4u-v1","constraint_kind":"profile-bundle-set-sha256","token":"protected","payload":"empty","protocols":[1]},
     "winget.install-machine-package.v1":{"domain":"updates","context":"windows-system-v1","constraint_kind":"winget-package-version-set-sha256","token":"protected","payload":"empty","protocols":[1]},
@@ -1925,7 +1939,7 @@ validate_mixed_privileged_draft() {
     ([.operations[] | select(.type == "semantic-action") |
       .id as $action | $contracts[$action].domain == $draft.domain] | all) and
     ([.operations[] | select(.type == "semantic-action") | .id as $action |
-      if $draft.domain == "updates" then $contracts[$action].context | IN("posix-root-v1","windows-system-v1")
+      if $draft.domain == "updates" then $contracts[$action].context | IN("posix-root-v1","macos-root-v1","windows-system-v1")
       else $contracts[$action].context == "windows-user-s4u-v1" end] | all) and
     (if .domain == "updates" then
        [.operations[] | select(.type != "semantic-action") | .kind == "package"] | all
@@ -1984,19 +1998,20 @@ write_v4_privilege_metadata() (
         constraints_digest:$r.observed_constraints_digest},
       action:{id:$action,policy_token:$operation.privilege_request.policy_token},
       context:{required:$a.context_id,
-        observed_execution_principal:(if $a.context_id == "posix-root-v1" then "root"
+        observed_execution_principal:(if ($a.context_id | IN("posix-root-v1","macos-root-v1")) then "root"
           elif $a.context_id == "windows-system-v1" then "LocalSystem" else "enrolled-s4u-user" end),
         session_requirement:$r.session_requirement,platform_boundary:$r.platform_boundary,
         manager_source_identity:(if $profile == null then $a.manager_source_identity
           else $profile.entry_map_digest end),canary_digest:$r.context_canary_digest,
-        platform_context_digest:($r.observed_winget_context_digest // null)},
+        platform_context_digest:(if $a.context_id == "macos-root-v1" then $r.observed_platform_context_digest
+          else ($r.observed_winget_context_digest // null) end)},
       request:{id:$operation.privilege_request.request_id,created_at:$created_at,
         expires_at:$operation.privilege_request.expires_at,transport:$r.transport,
         principal:$r.request_principal,originating_node_id:$r.originating_node_identity.node_id,
         node_key_fingerprint:$r.originating_node_identity.node_key_fingerprint,
         certificate_serial:$r.originating_node_identity.certificate_serial,
         certificate_source_addresses:$r.originating_node_identity.certificate_source_addresses,
-        target_uid:(if $a.context_id == "posix-root-v1" then ($r.protected_identity.uid | tostring) else "-" end),
+        target_uid:(if ($a.context_id | IN("posix-root-v1","macos-root-v1")) then ($r.protected_identity.uid | tostring) else "-" end),
         request_sid:(if ($a.context_id | startswith("windows-")) then $r.protected_identity.sid else "-" end)},
       enrollment:{epoch:$r.enrollment_epoch,fleet_domain:$r.originating_node_identity.fleet_domain,
         fleet_ca_fingerprint:$r.originating_node_identity.fleet_ca_fingerprint,
@@ -2478,6 +2493,7 @@ seal_plan_command() {
       . as $records |
       all($actions[]; . as $request |
       (($platform == "linux" and $contracts[$request.action_id].context == "posix-root-v1") or
+       ($platform == "macos" and $contracts[$request.action_id].context == "macos-root-v1") or
        ($platform == "windows" and ($contracts[$request.action_id].context | startswith("windows-")))) and
       any($records[]; .data as $readiness | .kind == "privilege_broker" and .id == "readiness" and .status == "present" and
         .data.lifecycle_status == "ready" and .data.transport_ready == true and
@@ -2508,7 +2524,7 @@ seal_plan_command() {
         (.data.originating_node_identity.certificate_valid_before | fromdateiso8601 > now) and
         (.data.pinned_host_key_fingerprint | test("^SHA256:[A-Za-z0-9+/]{43}=?$")) and
         (.data.request_principal | type == "string" and length > 0) and
-        (if $platform == "linux" then .data.platform_adapter == "posix-sudo-v1"
+        (if ($platform | IN("linux","macos")) then .data.platform_adapter == "posix-sudo-v1"
          elif $platform == "windows" then .data.platform_adapter == "windows-scheduled-task-v1"
          else false end) and
         any(.data.observed_action_contexts[]; .action_id == $request.action_id and
@@ -2658,7 +2674,7 @@ seal_plan_command() {
             constraints_digest:$r.observed_constraints_digest},
           action:{id:$action,policy_token:$draft[0].privilege_request.policy_token},
           context:{required:$a.context_id,
-            observed_execution_principal:(if $a.context_id == "posix-root-v1" then "root"
+            observed_execution_principal:(if ($a.context_id | IN("posix-root-v1","macos-root-v1")) then "root"
               elif $a.context_id == "windows-system-v1" then "LocalSystem" else "enrolled-s4u-user" end),
             session_requirement:$r.session_requirement,platform_boundary:$r.platform_boundary,
             manager_source_identity:$a.manager_source_identity,canary_digest:$r.context_canary_digest},
@@ -2842,7 +2858,7 @@ validate_privileged_plan_file() (
       "platform_boundary","required","session_requirement"]) and
       .required == $contracts[$plan.privilege.action.id].context and
       (.observed_execution_principal | IN("root","LocalSystem","enrolled-s4u-user")) and
-      .session_requirement == "no-console-session" and (.platform_boundary | IN("linux","windows")) and
+      .session_requirement == "no-console-session" and (.platform_boundary | IN("linux","macos","windows")) and
       (.manager_source_identity | type == "string" and length > 0) and
       (.canary_digest | exact(["algorithm","value"]) and .algorithm == "sha256" and
         (.value | test("^[0-9a-f]{64}$")))) and
@@ -2874,6 +2890,11 @@ validate_privileged_plan_file() (
        .privilege.broker.adapter == "posix-sudo-v1" and .privilege.context.required == "posix-root-v1" and
        .privilege.context.observed_execution_principal == "root" and .privilege.context.platform_boundary == "linux" and
        .privilege.request.transport == "posix-ssh"
+     elif .privilege.context.required == "macos-root-v1" then
+       .required_section == "packages" and
+       .privilege.broker.adapter == "posix-sudo-v1" and
+       .privilege.context.observed_execution_principal == "root" and
+       .privilege.context.platform_boundary == "macos" and .privilege.request.transport == "posix-ssh"
      elif .privilege.context.required == "windows-system-v1" then
        .required_section == "packages" and
        .privilege.broker.adapter == "windows-scheduled-task-v1" and
@@ -2923,10 +2944,16 @@ validate_mixed_privileged_plan_file() (
            .request.transport == "windows-sftp" and .request.target_uid == "-" and
            (.request.request_sid | type == "string" and test("^S-[0-9]+(?:-[0-9]+){1,14}$")) and
            (.context.platform_context_digest | digest)
-         else .broker.adapter == "posix-sudo-v1" and .context.platform_boundary == "linux" and
+         elif .context.required == "posix-root-v1" then
+           .broker.adapter == "posix-sudo-v1" and .context.platform_boundary == "linux" and
            .request.transport == "posix-ssh" and .request.request_sid == "-" and
            (.request.target_uid | type == "string" and test("^(0|[1-9][0-9]{0,9})$")) and
-           .context.platform_context_digest == null end)) and
+           .context.platform_context_digest == null
+         else .context.required == "macos-root-v1" and
+           .broker.adapter == "posix-sudo-v1" and .context.platform_boundary == "macos" and
+           .request.transport == "posix-ssh" and .request.request_sid == "-" and
+           (.request.target_uid | type == "string" and test("^(0|[1-9][0-9]{0,9})$")) and
+           (.context.platform_context_digest | digest) end)) and
       (.privilege.request | type == "object" and
         exact(["certificate_serial","certificate_source_addresses","created_at","expires_at","id",
           "node_key_fingerprint","originating_node_id","principal","request_sid","target_uid","transport"]) and
@@ -3084,8 +3111,11 @@ verify_mixed_privilege_readiness() {
         .data.request_principal == $p.request.principal and
         .data.protected_identity.host_id == $plan.target and
         .data.protected_identity.request_principal == $p.request.principal and
-        (if $p.context.required == "posix-root-v1" then
-           (.data.protected_identity.uid | tostring) == $p.request.target_uid and $p.request.request_sid == "-"
+        (if ($p.context.required | IN("posix-root-v1","macos-root-v1")) then
+           (.data.protected_identity.uid | tostring) == $p.request.target_uid and $p.request.request_sid == "-" and
+           (if $p.context.required == "macos-root-v1" then
+              .data.observed_platform_context_digest == $p.context.platform_context_digest
+            else $p.context.platform_context_digest == null end)
          else .data.protected_identity.sid == $p.request.request_sid and $p.request.target_uid == "-" and
            .data.observed_winget_context_digest == $p.context.platform_context_digest end) and
         .data.originating_node_identity.node_id == $p.request.originating_node_id and
@@ -5127,7 +5157,7 @@ invoke_fixed_posix_dispatch() (
   check_private_owned_file "$config" "collection configuration"
   validate_node_identity_file "$identity" "$config"
   [ -f "$request" ] && [ ! -L "$request" ] || return 64
-  route=$(jq -c --arg target "$target" '.machines[$target] | select(.platform == "linux") |
+  route=$(jq -c --arg target "$target" '.machines[$target] | select(.platform | IN("linux","macos")) |
     .privilege_broker.automation_transport | select(.mode == "posix-ssh")' "$config") || {
       printf 'machine-utilities: target has no dedicated POSIX SSH route\n' >&2
       return 64
@@ -5177,9 +5207,9 @@ posix_dispatch_readiness_records() (
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-readiness.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   public_node_identity "$identity" "$config" >"$tmp/origin.json"
-  route=$(jq -c --arg target "$target" '.machines[$target] | select(.platform == "linux" and .transport == "ssh") |
+  route=$(jq -c --arg target "$target" '.machines[$target] | select((.platform | IN("linux","macos")) and .transport == "ssh") |
     .privilege_broker.automation_transport | select(.mode == "posix-ssh")' "$config") || {
-      printf 'machine-utilities: protected POSIX readiness requires linux:ssh:posix-ssh\n' >&2
+      printf 'machine-utilities: protected POSIX readiness requires linux or macos over ssh:posix-ssh\n' >&2
       exit 64
     }
   snapshot_id="readiness-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -5353,17 +5383,20 @@ dispatch_posix_request_command() (
       ;;
     broker-envelope)
       [ "$worker_length" -eq 0 ] && [ "$worker_digest" = "$(printf '' | sha256_stream)" ] || exit 64
-      [ "$(uname -s)" = Linux ] || {
+      native_platform=$(uname -s)
+      case $native_platform in Linux|Darwin) ;; *)
         : >"$tmp/result"
         emit_posix_dispatch_result "$mode" partial 69 "$tmp/result"
         exit 69
-      }
+      esac
       request_id=$(awk -F '|' '$1 == "request-id" { print $2; exit }' "$tmp/request")
       plan_id=$(awk -F '|' '$1 == "plan-id" { print $2; exit }' "$tmp/request")
       action_id=$(awk -F '|' '$1 == "action-id" { print $2; exit }' "$tmp/request")
       protocol=$(awk -F '|' '$1 == "broker-protocol" { print $2; exit }' "$tmp/request")
-      case $action_id in
-        apt.autoremove.v1|apt.install-package-version.v1|apt.update-metadata.v1|apt.upgrade-package.v1|broker.query-result.v1) ;;
+      case $native_platform:$action_id in
+        Linux:apt.autoremove.v1|Linux:apt.install-package-version.v1|Linux:apt.update-metadata.v1|Linux:apt.upgrade-package.v1|\
+        Linux:broker.query-result.v1|Darwin:macos.apply-system-setting.v1|Darwin:macos.install-signed-pkg.v1|\
+        Darwin:broker.query-result.v1) ;;
         *) exit 64 ;;
       esac
       invoke_fixed_posix_broker "$tmp/request" "$tmp/result" || result_code=$?
@@ -5371,8 +5404,9 @@ dispatch_posix_request_command() (
         result_action=$action_id
         if [ "$action_id" = broker.query-result.v1 ] && [ "$(sed -n '1p' "$tmp/result")" = 'journal|2' ]; then
           result_action=$(awk -F '|' 'NR == 9 && $1 == "action-id" { print $2 }' "$tmp/result")
-          case $result_action in
-            apt.autoremove.v1|apt.install-package-version.v1|apt.update-metadata.v1|apt.upgrade-package.v1) ;;
+          case $native_platform:$result_action in
+            Linux:apt.autoremove.v1|Linux:apt.install-package-version.v1|Linux:apt.update-metadata.v1|Linux:apt.upgrade-package.v1|\
+            Darwin:macos.apply-system-setting.v1|Darwin:macos.install-signed-pkg.v1) ;;
             *) exit 70 ;;
           esac
         fi
@@ -5391,7 +5425,7 @@ dispatch_posix_request_command() (
         (.machines | keys) as $targets |
         if ((.worker // null) == null and
             ($targets | length) == 1 and
-            (.machines[$targets[0]].platform == "linux") and
+            (.machines[$targets[0]].platform | IN("linux","macos")) and
             (.machines[$targets[0]].transport == "ssh") and
             (.machines[$targets[0]].privilege_broker.automation_transport.mode == "posix-ssh"))
         then $targets[0]
@@ -5441,7 +5475,8 @@ make_posix_broker_envelope() (
   requested_action=$3
   output=$4
   case $requested_action in
-    apt.autoremove.v1|apt.install-package-version.v1|apt.update-metadata.v1|apt.upgrade-package.v1|broker.query-result.v1) ;;
+    apt.autoremove.v1|apt.install-package-version.v1|apt.update-metadata.v1|apt.upgrade-package.v1|\
+    macos.apply-system-setting.v1|macos.install-signed-pkg.v1|broker.query-result.v1) ;;
     *)
       printf 'machine-utilities: unsupported sealed POSIX broker action\n' >&2
       exit 64
@@ -5454,11 +5489,18 @@ make_posix_broker_envelope() (
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   jq -e --argjson index "$index" '
     .operations[$index] | select(.type == "semantic-action" and
-      .privilege.context.required == "posix-root-v1" and (.id | startswith("apt.")))
+      ((.privilege.context.required == "posix-root-v1" and (.id | startswith("apt."))) or
+       (.privilege.context.required == "macos-root-v1" and (.id | startswith("macos.")))))
   ' "$plan" >"$tmp/operation.json" || {
     printf 'machine-utilities: mixed plan operation is not a supported sealed POSIX action\n' >&2
     exit 64
   }
+  sealed_context=$(jq -r '.privilege.context.required' "$tmp/operation.json")
+  case $sealed_context in
+    posix-root-v1) platform_boundary=linux ;;
+    macos-root-v1) platform_boundary=macos ;;
+    *) exit 64 ;;
+  esac
   # target_uid is an attested property of the protected target readiness
   # projection. It is intentionally not compared with the controller UID:
   # a dedicated broker route can (and normally does) target another host.
@@ -5549,10 +5591,10 @@ make_posix_broker_envelope() (
     printf 'expires-at|%s\n' "$expires_at"
     printf 'transport|posix-ssh\n'
     printf 'request-principal|%s\n' "$(jq -r '.privilege.request.principal' "$tmp/operation.json")"
-    printf 'required-context|posix-root-v1\n'
+    printf 'required-context|%s\n' "$sealed_context"
     printf 'observed-execution-principal|root\n'
     printf 'console-session-state|none\n'
-    printf 'platform-boundary|linux\n'
+    printf 'platform-boundary|%s\n' "$platform_boundary"
     printf 'enrollment-epoch|%s\n' "$(jq -r '.privilege.enrollment.epoch' "$tmp/operation.json")"
     printf 'context-canary-sha256|%s\n' "$(jq -r '.privilege.context.canary_digest.value' "$tmp/operation.json")"
     printf 'pinned-host-key-fingerprint|%s\n' "$(jq -r '.privilege.enrollment.pinned_host_key_fingerprint' "$tmp/operation.json")"
@@ -5587,9 +5629,14 @@ invoke_fixed_posix_broker() {
   envelope=$1
   output=$2
   [ -x /usr/bin/sudo ] || return 69
+  case $(uname -s) in
+    Darwin) fixed_broker=/usr/local/libexec/machine-utilities/posix-broker ;;
+    Linux) fixed_broker=/usr/libexec/machine-utilities/posix-broker ;;
+    *) return 69 ;;
+  esac
   /usr/bin/env -i HOME="$HOME" LC_ALL=C LANG=C TZ=UTC \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin SSH_AUTH_SOCK= \
-    /usr/bin/sudo -n /usr/libexec/machine-utilities/posix-broker <"$envelope" >"$output" 2>"$output.stderr"
+    /usr/bin/sudo -n "$fixed_broker" <"$envelope" >"$output" 2>"$output.stderr"
 }
 
 invoke_posix_broker_for_target() (
@@ -5605,11 +5652,11 @@ invoke_posix_broker_for_target() (
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // empty' "$config")
   case $platform:$transport:$route in
-    linux:local:posix-ssh)
+    linux:local:posix-ssh|macos:local:posix-ssh)
       # The only direct sudo path is the explicitly local target route.
       invoke_fixed_posix_broker "$envelope" "$output"
       ;;
-    linux:ssh:posix-ssh)
+    linux:ssh:posix-ssh|macos:ssh:posix-ssh)
       tmp=$(mktemp -d "${TMPDIR:-/tmp}/machine-utilities-posix-broker-dispatch.XXXXXX")
       trap 'rm -rf "$tmp"' EXIT HUP INT TERM
       write_posix_dispatch_request broker-envelope - "$envelope" "$tmp/framed" || exit 64
@@ -5666,6 +5713,8 @@ write_posix_journal_expectations() (
   source_addresses_digest=$(printf '%s\n' "$source_addresses" | sha256_stream)
   created_at=$(jq -r '.privilege.request.created_at | fromdateiso8601' "$operation")
   expires_at=$(jq -r '.privilege.request.expires_at | fromdateiso8601' "$operation")
+  required_context=$(jq -r '.privilege.context.required' "$operation")
+  platform_boundary=$(jq -r '.privilege.context.platform_boundary' "$operation")
   {
     printf 'request-id|%s\n' "$(jq -r '.privilege.request.id' "$operation")"
     printf 'plan-id|%s\n' "$(jq -r '.plan_id' "$plan")"
@@ -5679,8 +5728,8 @@ write_posix_journal_expectations() (
     printf 'constraints-sha256|%s\n' "$(jq -r '.privilege.policy.constraints_digest.value' "$operation")"
     printf 'precondition-sha256|%s\n' "$(jq -r '.privilege.precondition.digest.value' "$operation")"
     printf 'created-at|%s\nexpires-at|%s\nretain-until|%s\n' "$created_at" "$expires_at" "$((expires_at + 300))"
-    printf '%s\n' 'transport|posix-ssh' 'required-context|posix-root-v1' \
-      'observed-execution-principal|root' 'console-session-state|none' 'platform-boundary|linux'
+    printf '%s\n' 'transport|posix-ssh' "required-context|$required_context" \
+      'observed-execution-principal|root' 'console-session-state|none' "platform-boundary|$platform_boundary"
     printf 'request-principal|%s\n' "$(jq -r '.privilege.request.principal' "$operation")"
     printf 'enrollment-epoch|%s\n' "$(jq -r '.privilege.enrollment.epoch' "$operation")"
     printf 'context-canary-sha256|%s\n' "$(jq -r '.privilege.context.canary_digest.value' "$operation")"
@@ -5982,7 +6031,8 @@ apply_mixed_privileged_plan_command() {
     return 69
   fi
   case $platform:$transport:$route_mode in
-    linux:local:posix-ssh|linux:ssh:posix-ssh|windows:codex-remote-control:windows-sftp) ;;
+    linux:local:posix-ssh|linux:ssh:posix-ssh|macos:local:posix-ssh|macos:ssh:posix-ssh|\
+    windows:codex-remote-control:windows-sftp) ;;
     *)
       printf 'machine-utilities: protected apply has no fixed platform broker route; SSH, WSL, and context fallback are forbidden\n' >&2
       return 69
@@ -6062,7 +6112,7 @@ apply_mixed_privileged_plan_command() {
         break
       fi
       sealed_context=$(jq -r '.privilege.context.required' "$work/operation-$index.json")
-      if { [ "$sealed_context" = posix-root-v1 ] &&
+      if { { [ "$sealed_context" = posix-root-v1 ] || [ "$sealed_context" = macos-root-v1 ]; } &&
           execute_sealed_posix_broker_operation "$plan" "$index" "$work" "$work/outcome-$index"; } ||
         { case $sealed_context in windows-*) true ;; *) false ;; esac &&
           execute_sealed_windows_broker_operation "$plan" "$index" "$work" "$work/outcome-$index" \
@@ -6197,12 +6247,14 @@ normalize_privileged_plan_for_broker_execution() (
     .schema_version = 4 |
     .operations[0].privilege = .privilege |
     .operations[0].privilege.request += {
-      target_uid:(if $context == "posix-root-v1" then ($r.protected_identity.uid | tostring) else "-" end),
+      target_uid:(if ($context | IN("posix-root-v1","macos-root-v1")) then ($r.protected_identity.uid | tostring) else "-" end),
       request_sid:(if ($context | startswith("windows-")) then $r.protected_identity.sid else "-" end),
       certificate_source_addresses:$r.originating_node_identity.certificate_source_addresses
     } |
     .operations[0].privilege.context.platform_context_digest =
-      (if ($context | startswith("windows-")) then $r.observed_winget_context_digest else null end) |
+      (if ($context | startswith("windows-")) then $r.observed_winget_context_digest
+       elif $context == "macos-root-v1" then $r.observed_platform_context_digest
+       else null end) |
     del(.privilege)
   ' "$snapshot" >"$output" || {
     printf 'machine-utilities: could not normalize the verified standalone privilege plan\n' >&2
@@ -6221,12 +6273,12 @@ fresh_posix_broker_readiness_snapshot() (
   route=$(jq -r --arg target "$target" \
     '.machines[$target].privilege_broker.automation_transport.mode // empty' "$config")
   case $platform:$transport:$route in
-    linux:ssh:posix-ssh)
+    linux:ssh:posix-ssh|macos:ssh:posix-ssh)
       # This path enters only through the pinned forced dispatcher; it never
       # falls back to ordinary SSH collection or controller-local identity.
       posix_dispatch_readiness_snapshot "$target" "$output"
       ;;
-    linux:local:posix-ssh)
+    linux:local:posix-ssh|macos:local:posix-ssh)
       collect_command --target "$target" --section host --output "$output"
       ;;
     *)
@@ -6593,6 +6645,8 @@ write_posix_result_lookup_expectations() (
   operation=$(jq -c --argjson index "$index" '.operations[$index]' "$plan")
   created_at=$(printf '%s\n' "$operation" | jq -r '.privilege.request.created_at | fromdateiso8601')
   expires_at=$(printf '%s\n' "$operation" | jq -r '.privilege.request.expires_at | fromdateiso8601')
+  required_context=$(printf '%s\n' "$operation" | jq -r '.privilege.context.required')
+  platform_boundary=$(printf '%s\n' "$operation" | jq -r '.privilege.context.platform_boundary')
   {
     printf 'request-id|%s\n' "$(printf '%s\n' "$operation" | jq -r '.privilege.request.id')"
     printf 'plan-id|%s\n' "$(jq -r '.plan_id' "$plan")"
@@ -6606,8 +6660,8 @@ write_posix_result_lookup_expectations() (
     printf 'constraints-sha256|%s\n' "$(printf '%s\n' "$operation" | jq -r '.privilege.policy.constraints_digest.value')"
     printf 'precondition-sha256|%s\n' "$(printf '%s\n' "$operation" | jq -r '.privilege.precondition.digest.value')"
     printf 'created-at|%s\nexpires-at|%s\n' "$created_at" "$expires_at"
-    printf '%s\n' 'transport|posix-ssh' 'required-context|posix-root-v1' \
-      'observed-execution-principal|root' 'console-session-state|none' 'platform-boundary|linux'
+    printf '%s\n' 'transport|posix-ssh' "required-context|$required_context" \
+      'observed-execution-principal|root' 'console-session-state|none' "platform-boundary|$platform_boundary"
     printf 'request-principal|%s\n' "$(printf '%s\n' "$operation" | jq -r '.privilege.request.principal')"
     printf 'enrollment-epoch|%s\n' "$(printf '%s\n' "$operation" | jq -r '.privilege.enrollment.epoch')"
     printf 'context-canary-sha256|%s\n' "$(printf '%s\n' "$operation" | jq -r '.privilege.context.canary_digest.value')"
@@ -6660,7 +6714,7 @@ lookup_privilege_result_command() (
     }
     standalone_context=$(jq -r '.privilege.context.required' "$plan")
     standalone_target=$(jq -r '.target' "$plan")
-    if [ "$standalone_context" = posix-root-v1 ]; then
+    if [ "$standalone_context" = posix-root-v1 ] || [ "$standalone_context" = macos-root-v1 ]; then
       # A query must bind the UID from a newly observed protected target
       # readiness record. Never substitute the controller's local UID.
       fresh_posix_broker_readiness_snapshot "$standalone_target" "$tmp/current-readiness.jsonl"
@@ -6691,7 +6745,7 @@ lookup_privilege_result_command() (
   context=$(jq -r --argjson index "$index" '.operations[$index].privilege.context.required' \
     "$tmp/executable.json")
   case $context in
-    posix-root-v1)
+    posix-root-v1|macos-root-v1)
       protocol=$(jq -r --argjson index "$index" \
         '.operations[$index].privilege.broker.protocol_version' "$tmp/executable.json")
       privilege_protocol_supports_control "$protocol" result_query || {
@@ -6744,13 +6798,9 @@ preview_privilege_upgrade_command() (
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   case $platform:$route in
     wsl:*) state=unsupported; reason=unsupported_security_boundary; entrypoints='[]' ;;
-    linux:posix-ssh)
+    linux:posix-ssh|macos:posix-ssh)
       state=needs_human_upgrade; reason=local_passworded_sudo_required
       entrypoints='[{"path":"scripts/enroll-privilege-posix","mode":"preview_then_install"},{"path":"scripts/enroll-ssh-posix","mode":"preview_then_repair"}]'
-      ;;
-    macos:posix-ssh)
-      state=needs_human_upgrade; reason=transport_only_no_cataloged_root_action
-      entrypoints='[{"path":"scripts/enroll-ssh-posix","mode":"preview_then_repair"}]'
       ;;
     windows:windows-sftp)
       state=needs_human_upgrade; reason=local_uac_required
@@ -6790,13 +6840,9 @@ preview_privilege_revocation_command() (
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   case $platform:$route in
     wsl:*) state=unsupported; reason=unsupported_security_boundary; entrypoints='[]' ;;
-    linux:posix-ssh)
+    linux:posix-ssh|macos:posix-ssh)
       state=needs_human_revocation; reason=local_passworded_sudo_required
       entrypoints='[{"path":"scripts/enroll-ssh-posix","mode":"preview-revoke_then_revoke"},{"path":"scripts/enroll-privilege-posix","mode":"revoke_after_transport_drain"}]'
-      ;;
-    macos:posix-ssh)
-      state=needs_human_revocation; reason=transport_only_no_cataloged_root_action
-      entrypoints='[{"path":"scripts/enroll-ssh-posix","mode":"preview-revoke_then_revoke"}]'
       ;;
     windows:windows-sftp)
       state=needs_human_revocation; reason=local_uac_required

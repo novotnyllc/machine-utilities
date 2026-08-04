@@ -51,6 +51,11 @@ and Claude is `prepare-privilege-identity`, `prepare-privilege-enrollment`,
 `preview-privilege-revocation`. This inventory skill invokes none of the
 mutating commands.
 
+For macOS, report root-broker enrollment, default-disabled/active state, and
+only `macos.install-signed-pkg.v1` and `macos.apply-system-setting.v1` when
+advertised. Root Homebrew, arbitrary `sudo`, installer scripts, and arbitrary
+plist paths are unsupported; owner-local interactive elevation is separate from SSH.
+
 Preserve `needs_enrollment`, `drifted`, `transport_unavailable`,
 `unsupported_context`, `unsupported_security_boundary`, `partial`, and
 `stale` exactly. Show the public audit identity: fleet CA fingerprint and

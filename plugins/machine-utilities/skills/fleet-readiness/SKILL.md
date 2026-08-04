@@ -28,6 +28,11 @@ Windows work. Protected or logged-off Windows work requires fresh
 `privilege_broker` readiness from the enrolled `windows-sftp` route; never
 substitute the visible task, WSL, or another transport.
 
+For macOS, report a separate root-broker state only when readiness advertises
+the owner-enrolled, default-disabled `macos.install-signed-pkg.v1` or
+`macos.apply-system-setting.v1` action. SSH is not elevation; root Homebrew,
+arbitrary `sudo`, installer scripts, and arbitrary plist paths are unsupported.
+
 Report the exact configured nodes checked, requirements, evidence, changes,
 unknowns, and any restart or saved-project action still required. When the
 request requires fleet-wide parity, verify every configured node.

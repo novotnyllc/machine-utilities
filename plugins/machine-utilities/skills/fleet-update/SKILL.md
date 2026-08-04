@@ -51,9 +51,12 @@ When readiness advertises an active protected action-context pair, select only
 the repository-defined semantic action already present there:
 `apt.update-metadata.v1`, `apt.install-package-version.v1`,
 `apt.upgrade-package.v1`, `apt.autoremove.v1`,
+`macos.install-signed-pkg.v1`, `macos.apply-system-setting.v1`,
 `winget.inventory-machine.v1`, `winget.install-machine-package.v1`, or
 `winget.upgrade-machine-package.v1`. WinGet is required for V1 Windows
-machine-package work. Never add argv, executable, source, installer,
+machine-package work. macOS actions are owner-enrolled and default-disabled;
+use them only when readiness advertises the exact active action. Never use root
+Homebrew, arbitrary `sudo`, installer scripts, or arbitrary plist paths. Never add argv, executable, source, installer,
 dependency, environment, shell, or elevation controls to a protected request;
 WinGet source dependency selection remains delegated to the attested provider.
 
@@ -66,5 +69,6 @@ The shared Codex/Claude lifecycle vocabulary is
 `needs_enrollment`, `drifted`, `transport_unavailable`,
 `unsupported_context`, `unsupported_security_boundary`, `partial`, and
 `stale`; perform no fallback. Never ask for or relay a sudo or Administrator password.
-Human enrollment, upgrade, activation, and revocation
-stop at the local password/UAC boundary.
+Human enrollment, upgrade, activation, and revocation stop at the local
+password/UAC boundary; on macOS that is owner-local interactive elevation, not
+an SSH fallback.

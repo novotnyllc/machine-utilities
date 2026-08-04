@@ -60,6 +60,8 @@ internal static class BrokerCore
         "apt.install-package-version.v1",
         "apt.update-metadata.v1",
         "apt.upgrade-package.v1",
+        "macos.apply-system-setting.v1",
+        "macos.install-signed-pkg.v1",
         "profile.apply-managed-bundle.v1",
         "profile.inventory-managed-state.v1",
         InstallAction,
@@ -74,6 +76,8 @@ internal static class BrokerCore
             ["apt.install-package-version.v1"] = ("posix-root-v1", "package-source-version-closure-set-sha256"),
             ["apt.update-metadata.v1"] = ("posix-root-v1", "none"),
             ["apt.upgrade-package.v1"] = ("posix-root-v1", "package-source-channel-set-sha256"),
+            ["macos.apply-system-setting.v1"] = ("macos-root-v1", "macos-system-setting-sha256"),
+            ["macos.install-signed-pkg.v1"] = ("macos-root-v1", "macos-signed-pkg-sha256"),
             ["profile.apply-managed-bundle.v1"] = ("windows-user-s4u-v1", "profile-bundle-set-sha256"),
             ["profile.inventory-managed-state.v1"] = ("windows-user-s4u-v1", "profile-bundle-set-sha256"),
             [InstallAction] = (ContextName, "winget-package-version-set-sha256"),
@@ -822,7 +826,7 @@ internal static class BrokerCore
     internal static PolicyDocument ParsePolicy(ReadOnlySpan<byte> bytes)
     {
         string[] lines = ParseCanonicalLines(bytes, MaxPolicyBytes, "policy");
-        if (lines.Length != 10 || lines[0] != "policy|1|catalog=1")
+        if (lines.Length != ActionIds.Length + 1 || lines[0] != "policy|1|catalog=1")
         {
             throw new FormatException("invalid_policy");
         }

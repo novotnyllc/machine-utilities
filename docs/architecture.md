@@ -46,6 +46,16 @@ non-elevated S4U task. WinGet is the required V1 Windows provider; its approved
 source retains the documented source-delegated installer and dependency
 authority.
 
+macOS root support is owner-enrolled and disabled by default. Its entire v1
+catalog is `macos.install-signed-pkg.v1` and `macos.apply-system-setting.v1`;
+root Homebrew, arbitrary `sudo`, and arbitrary plist paths are outside the
+boundary. The signed-package action remains script-free unless a human
+enrollment seals an exact Apple-signed package as `sealed-cask-payload-v1`;
+the broker still invokes only fixed `installer -pkg … -target /`. That is a
+root-phase primitive, not a Homebrew transaction: Caskroom state remains
+user-owned and is never reported as updated by the broker. Interactive macOS
+elevation remains an owner-local workflow and is never a remote fallback.
+
 Logged-off reachability is separate from elevation. POSIX uses a forced bounded
 dispatcher; Windows uses a dedicated standard SID in an internal-SFTP-only
 chroot. The request SID has no shell or task authority and is distinct from the

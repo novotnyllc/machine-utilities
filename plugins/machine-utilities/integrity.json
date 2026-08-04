@@ -10,7 +10,7 @@
     },
     {
       "path": "references/privilege-policy.default",
-      "sha256": "282a41d877e2e3b5625b7d73ac1f6ee9aac2ece0e6684346057d40524fa8cf2d"
+      "sha256": "09456c0023c09a6cda403e0f635ef203e97b8fd4c9a94d51e646fd9ae74823b1"
     },
     {
       "path": "references/windows-winget-provider.lock",
@@ -18,7 +18,7 @@
     },
     {
       "path": "scripts/apply-windows.ps1",
-      "sha256": "d02dc091c3d57915aea13babfdd2d89216c8bf3a76e08dd296e0f2630620d938"
+      "sha256": "86cdcbb6f7cec9db2dcce134d6e8a488958803b437ca9d3e52716e58422fed33"
     },
     {
       "path": "scripts/certify-ssh-node",
@@ -26,15 +26,15 @@
     },
     {
       "path": "scripts/collect-posix",
-      "sha256": "b415da67241896a335acfa6590ee290db5e2fce2987a27ac74960e7e0956cd90"
+      "sha256": "934f2af1290527059905e3494a8ead724d9b2c997799d730df36971ad464ec4c"
     },
     {
       "path": "scripts/collect-windows.ps1",
-      "sha256": "4b0208817add756ebfcff8727cda148e8bfbcc575d621de7af8e625412099628"
+      "sha256": "5bf4ee06a185df061482100876b7eb245252ba06d8dcbb0b8e2055eaa0d9ffee"
     },
     {
       "path": "scripts/enroll-privilege-posix",
-      "sha256": "fac34831b024e52952f0a772758af720fc7a298505f3cf64fda75077425e70fb"
+      "sha256": "c38a7e284ce47e3dbed35c12861852ae64e445091c4bd0219fdcd532c671dadb"
     },
     {
       "path": "scripts/enroll-privilege-windows.ps1",
@@ -42,7 +42,7 @@
     },
     {
       "path": "scripts/enroll-ssh-posix",
-      "sha256": "c9975f23f83a0163a1bd6f25881c3a1215445cc2f87c43820540db8e35abf319"
+      "sha256": "27d5a98553eb2053b5974ef4708ba6a556f9a1d9c69e5eb2fbd9dfc1e329686e"
     },
     {
       "path": "scripts/enroll-windows-sftp.ps1",
@@ -50,7 +50,7 @@
     },
     {
       "path": "scripts/machine-utilities",
-      "sha256": "dd302dbee4cc9652f5002150ce5da796d532b210802d15149296c85c97b627c5"
+      "sha256": "af8c6da611391bcff8c2963825f3a3b5b6843e593f4d16375b8e6c6706fd70c7"
     },
     {
       "path": "scripts/prepare-ssh-identity",
@@ -58,7 +58,7 @@
     },
     {
       "path": "scripts/privilege-broker-posix",
-      "sha256": "17c0ef89c5dadd1414471faf726abc4af123f943eb7363f90295b8741cdf1281"
+      "sha256": "37e604d7634e683d393daab8bfbeb2f7b96c64f45c029173c4445b696ae2c7d6"
     },
     {
       "path": "scripts/privilege-broker-windows.ps1",
@@ -78,7 +78,7 @@
     },
     {
       "path": "windows/WinGetBroker/BrokerCore.cs",
-      "sha256": "82aba632b39718724a3042463e122ecfc94b85c66a81658f952c1ea2a199eebe"
+      "sha256": "a5559e8ae6516f11570b192d896b65138fefdf93921cfd026896a5222f42f697"
     },
     {
       "path": "windows/WinGetBroker/Program.cs",

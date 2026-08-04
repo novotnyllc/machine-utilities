@@ -407,8 +407,11 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
     $Operations = @($Plan.operations)
     if ($Operations.Count -eq 0 -or $Operations.Count -gt 128) { throw "Invalid plan operations" }
     foreach ($Operation in $Operations) {
+        $HasTargets = $null -ne $Operation.PSObject.Properties["targets"]
         $ExpectedOperationProperties = if ([string]$Operation.type -eq "package-upgrade") {
             @("argv", "candidate_version", "id", "kind", "type")
+        } elseif ([string]$Operation.type -eq "chezmoi-apply" -and $HasTargets) {
+            @("argv", "id", "kind", "targets", "type")
         } else { @("argv", "id", "kind", "type") }
         if (-not (Test-ExactProperties $Operation $ExpectedOperationProperties) -or
             [string]$Operation.type -eq "semantic-action") {
@@ -431,7 +434,6 @@ function Assert-Plan([object]$Plan, [string]$WorkerConfigDigest) {
             default { $false }
         }
         if (-not $Valid) { throw "Unsupported Windows operation" }
-        $HasTargets = $null -ne $Operation.PSObject.Properties["targets"]
         if ($HasTargets -and [string]$Operation.type -ne "chezmoi-apply") {
             throw "Only chezmoi apply may declare targets"
         }
@@ -1121,7 +1123,7 @@ if ($SelfTest) {
             controller_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $ControllerConfigDigest }
             worker_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $RuntimeWorkerDigest }
             precondition_digest = [ordered]@{ algorithm = "sha256"; value = "c" * 64 }
-            operations = @([ordered]@{
+            operations = @([pscustomobject][ordered]@{
                 type = "agent-update"; kind = "agent_runtime"; id = "codex"; argv = @("codex", "update")
             })
         }
@@ -1132,6 +1134,54 @@ if ($SelfTest) {
         })
         $PlanId = $RuntimePlan.plan_id
         Assert-Plan $RuntimePlan $RuntimeWorkerDigest
+
+        $TargetedChezmoiPlan = [pscustomobject][ordered]@{
+            schema = "machine-utilities.plan"
+            schema_version = 2
+            target = $HostId
+            domain = "chezmoi"
+            required_section = "chezmoi"
+            controller_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $ControllerConfigDigest }
+            worker_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $RuntimeWorkerDigest }
+            precondition_digest = [ordered]@{ algorithm = "sha256"; value = "c" * 64 }
+            operations = @([pscustomobject][ordered]@{
+                type = "chezmoi-apply"; kind = "chezmoi_state"; id = "live"
+                argv = @("chezmoi", "--no-tty", "apply", "--", "C:\Users\Claire\.profile.d\10-env.sh")
+                targets = @("C:\Users\Claire\.profile.d\10-env.sh")
+            })
+        }
+        $TargetedChezmoiDigest = Get-TextSha256 ((ConvertTo-CanonicalJson $TargetedChezmoiPlan) + "`n")
+        Add-Member -InputObject $TargetedChezmoiPlan -NotePropertyName plan_id -NotePropertyValue "plan-$($TargetedChezmoiDigest.Substring(0, 16))"
+        Add-Member -InputObject $TargetedChezmoiPlan -NotePropertyName plan_digest -NotePropertyValue ([ordered]@{
+            algorithm = "sha256"; value = $TargetedChezmoiDigest
+        })
+        $PlanId = $TargetedChezmoiPlan.plan_id
+        Assert-Plan $TargetedChezmoiPlan $RuntimeWorkerDigest
+
+        $UnexpectedTargetsPlan = [pscustomobject][ordered]@{
+            schema = "machine-utilities.plan"
+            schema_version = 2
+            plan_id = "plan-0000000000000000"
+            target = $HostId
+            domain = "agents"
+            required_section = "agents"
+            controller_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $ControllerConfigDigest }
+            worker_configuration_digest = [ordered]@{ algorithm = "sha256"; value = $RuntimeWorkerDigest }
+            plan_digest = [ordered]@{ algorithm = "sha256"; value = "d" * 64 }
+            precondition_digest = [ordered]@{ algorithm = "sha256"; value = "c" * 64 }
+            operations = @([ordered]@{
+                type = "agent-update"; kind = "agent_runtime"; id = "codex"; argv = @("codex", "update")
+                targets = @("C:\Users\Claire\.profile.d\10-env.sh")
+            })
+        }
+        $Rejected = $false
+        try {
+            Assert-Plan $UnexpectedTargetsPlan $RuntimeWorkerDigest
+        } catch {
+            $Rejected = $true
+        }
+        if (-not $Rejected) { throw "Unexpected operation targets self-test failed" }
+        $PlanId = $TargetedChezmoiPlan.plan_id
 
         $PartialPlan = [pscustomobject]@{
             domain = "agents"

@@ -196,10 +196,28 @@ u2_directory_ready() {
   u2_path=$1
   u2_owner=$2
   u2_mode=${3:-}
-  [ -d "$u2_path" ] && [ ! -L "$u2_path" ] && [ "$(file_owner "$u2_path")" = "$u2_owner" ] &&
-    u2_safe_permissions "$u2_path" || return 1
+  u2_checked_path=$u2_path
+  if [ -L "$u2_path" ]; then
+    [ -z "${u2_root:-}" ] && [ "${platform:-}" = macos ] && [ "$u2_owner" = root ] || return 1
+    [ "$(file_owner "$u2_path")" = root ] && u2_safe_permissions "$u2_path" &&
+      u2_directory_ready /private root || return 1
+    case $u2_path in
+      /etc)
+        [ "$(readlink "$u2_path")" = private/etc ] || return 1
+        u2_checked_path=/private/etc
+        ;;
+      /var)
+        [ "$(readlink "$u2_path")" = private/var ] || return 1
+        u2_checked_path=/private/var
+        ;;
+      *) return 1 ;;
+    esac
+  fi
+  [ -d "$u2_checked_path" ] && [ ! -L "$u2_checked_path" ] &&
+    [ "$(file_owner "$u2_checked_path")" = "$u2_owner" ] &&
+    u2_safe_permissions "$u2_checked_path" || return 1
   if [ -n "$u2_mode" ]; then
-    u2_observed_mode=$(file_mode "$u2_path" | sed 's/.*\(...\)$/\1/')
+    u2_observed_mode=$(file_mode "$u2_checked_path" | sed 's/.*\(...\)$/\1/')
     [ "$u2_observed_mode" = "$u2_mode" ] || return 1
   fi
 }
@@ -242,6 +260,7 @@ u2_identity_mode() {
 u2_path_set_digest() {
   u2_owner=$1
   shift
+  u2_maximum=33554432
   u2_listing=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-u2-path-set.XXXXXX") || return 1
   : >"$u2_listing"
   while [ "$#" -gt 0 ]; do
@@ -256,7 +275,8 @@ u2_path_set_digest() {
       rm -f "$u2_listing"
       return 1
     elif [ -f "$u2_candidate" ]; then
-      u2_file_ready "$u2_candidate" "$u2_owner" 33554432 || { rm -f "$u2_listing"; return 1; }
+      case $u2_candidate in */macos/packages/*.pkg) u2_maximum=2147483647 ;; *) u2_maximum=33554432 ;; esac
+      u2_file_ready "$u2_candidate" "$u2_owner" "$u2_maximum" || { rm -f "$u2_listing"; return 1; }
       printf '%s|file|owner=%s|mode=%s|sha256=%s\n' "$u2_label" \
         "$(file_owner "$u2_candidate")" "$(u2_identity_mode "$u2_candidate")" \
         "$(sha256_file "$u2_candidate")" >>"$u2_listing"
@@ -276,7 +296,8 @@ u2_path_set_digest() {
           "$(u2_identity_mode "$u2_member")" >>"$u2_listing"
       done < <(find "$u2_candidate" -mindepth 1 -type d -print | LC_ALL=C sort)
       while IFS= read -r u2_member; do
-        u2_file_ready "$u2_member" "$u2_owner" 33554432 || exit 1
+        case $u2_member in */macos/packages/*.pkg) u2_maximum=2147483647 ;; *) u2_maximum=33554432 ;; esac
+        u2_file_ready "$u2_member" "$u2_owner" "$u2_maximum" || exit 1
         printf '%s/%s|file|owner=%s|mode=%s|sha256=%s\n' "$u2_label" \
           "${u2_member#"$u2_candidate"/}" "$(file_owner "$u2_member")" \
           "$(u2_identity_mode "$u2_member")" "$(sha256_file "$u2_member")" >>"$u2_listing"
@@ -621,6 +642,252 @@ u2_validate_apt_context() {
   return 0
 }
 
+u2_validate_macos_context() {
+  u2_generation=$1
+  u2_root=$2
+  u2_owner=$3
+  u2_macos_context=$u2_generation/macos.context
+  awk -F '|' '
+    BEGIN { binary[2]="installer"; binary[3]="pkgutil"; binary[4]="pmset"; binary[5]="systemsetup" }
+    $0!~/^[ -~]+$/ { exit 1 }
+    NR==1 { if(NF!=2||$1!="macos-context"||$2!="1")exit 1; next }
+    NR>=2&&NR<=5 { if(NF!=3||$1!="binary"||$2!=binary[NR]||length($3)!=64||$3!~/^[0-9a-f]+$/)exit 1; next }
+    { exit 1 } END { if(NR!=5)exit 1 }
+  ' "$u2_macos_context" || return 1
+  for u2_binary in installer pkgutil pmset systemsetup; do
+    case $u2_binary in pmset) u2_binary_path=$u2_root/usr/bin/pmset ;; *) u2_binary_path=$u2_root/usr/sbin/$u2_binary ;; esac
+    u2_expected_digest=$(awk -F '|' -v name="$u2_binary" '$1=="binary"&&$2==name{print $3;exit}' "$u2_macos_context")
+    u2_file_ready "$u2_binary_path" "$u2_owner" 33554432 && [ -x "$u2_binary_path" ] &&
+      [ "$(sha256_file "$u2_binary_path")" = "$u2_expected_digest" ] || return 1
+  done
+  u2_package_root=$u2_generation/macos/packages
+  u2_directory_ready "$u2_generation/macos" "$u2_owner" 755 &&
+    u2_directory_ready "$u2_package_root" "$u2_owner" 755 || return 1
+  u2_package_count=0
+  while IFS='|' read -r u2_kind _ u2_token u2_payload_mode u2_size u2_digest _; do
+    [ "$u2_kind" = macos-pkg ] || continue
+    case $u2_payload_mode in script-free|sealed-cask-payload-v1) ;; *) return 1 ;; esac
+    u2_package=$u2_package_root/$u2_token.pkg
+    u2_file_ready "$u2_package" "$u2_owner" 2147483647 644 &&
+      [ "$(file_size "$u2_package")" = "$u2_size" ] &&
+      [ "$(sha256_file "$u2_package")" = "$u2_digest" ] || return 1
+    u2_package_count=$((u2_package_count + 1))
+  done <"$u2_generation/policy.constraints"
+  u2_file_count=$(find "$u2_package_root" -mindepth 1 -maxdepth 1 -type f -print | wc -l | tr -d ' ')
+  [ "$u2_package_count" -eq "$u2_file_count" ] &&
+    [ "$(find "$u2_package_root" -mindepth 1 -maxdepth 1 ! -type f -print | wc -l | tr -d ' ')" -eq 0 ]
+}
+
+u2_macos_setting_value_valid() {
+  u2_setting_id=$1
+  u2_setting_value=$2
+  case $u2_setting_id in
+    timezone)
+      [ "${#u2_setting_value}" -le 255 ] &&
+        [[ $u2_setting_value =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+){0,2}$ ]]
+      ;;
+    wake-on-network-access|restart-after-power-failure)
+      [[ $u2_setting_value =~ ^(on|off)$ ]]
+      ;;
+    network-time-server)
+      [[ $u2_setting_value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] &&
+        [ "${#u2_setting_value}" -le 253 ] && [[ $u2_setting_value != *..* ]]
+      ;;
+    computer-sleep|display-sleep)
+      [ "$u2_setting_value" = Never ] ||
+        { [[ $u2_setting_value =~ ^[1-9][0-9]{0,2}$ ]] && [ "$u2_setting_value" -le 180 ]; }
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+u2_macos_receipt_version() {
+  u2_pkgutil=$1
+  u2_receipt=$2
+  [[ $u2_receipt =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]] || return 1
+  u2_output=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pkg.XXXXXX") || return 1
+  u2_error=$u2_output.error
+  if ! env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$u2_pkgutil" --pkg-info-plist "$u2_receipt" >"$u2_output" 2>"$u2_error"; then
+    [ "$(<"$u2_error")" = "No receipt for '$u2_receipt' found at '/'." ] || {
+      rm -f "$u2_output" "$u2_error"
+      return 1
+    }
+    rm -f "$u2_output" "$u2_error"
+    printf '%s\n' -
+    return 0
+  fi
+  [ ! -s "$u2_error" ] && [ "$(file_size "$u2_output")" -le 65536 ] || {
+    rm -f "$u2_output" "$u2_error"
+    return 1
+  }
+  u2_observed_id=$(awk '
+    /<key>pkgid<\/key>/{if(found++)exit 1;getline;if($0!~/<string>[^<]+<\/string>/)exit 1;
+      sub(/^.*<string>/,"");sub(/<\/string>.*$/,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$u2_output") || {
+    rm -f "$u2_output" "$u2_error"
+    return 1
+  }
+  u2_observed_version=$(awk '
+    /<key>pkg-version<\/key>/{if(found++)exit 1;getline;if($0!~/<string>[^<]+<\/string>/)exit 1;
+      sub(/^.*<string>/,"");sub(/<\/string>.*$/,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$u2_output") || {
+    rm -f "$u2_output" "$u2_error"
+    return 1
+  }
+  rm -f "$u2_output" "$u2_error"
+  [ "$u2_observed_id" = "$u2_receipt" ] &&
+    [[ $u2_observed_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || return 1
+  printf '%s\n' "$u2_observed_version"
+}
+
+u2_macos_pmset_snapshot() {
+  u2_root=$1
+  u2_owner=$2
+  u2_output=$3
+  u2_pmset=$u2_root/usr/bin/pmset
+  u2_raw=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pmset.XXXXXX") || return 1
+  if ! u2_validate_protected_ancestors "$u2_pmset" "$u2_owner" ||
+    ! u2_file_ready "$u2_pmset" "$u2_owner" 33554432 || [ ! -x "$u2_pmset" ] ||
+    ! env -i HOME=/nonexistent LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$u2_pmset" -g custom >"$u2_raw" 2>/dev/null ||
+    [ "$(file_size "$u2_raw")" -gt 65536 ]; then
+    rm -f "$u2_raw"
+    return 1
+  fi
+  if ! awk '
+    /^[A-Za-z][A-Za-z ]*:$/ {
+      profile=$0; sub(/:$/, "", profile)
+      if(seen_profile[profile]++)exit 1
+      profiles++; profile_name[profiles]=profile
+      next
+    }
+    /^[[:space:]]+[A-Za-z0-9][A-Za-z0-9 ]*[[:space:]]+-?[0-9]+[[:space:]]*$/ {
+      if(profile=="")exit 1
+      if(NF!=2)next
+      key=$1; value=$2
+      if(key!="womp"&&key!="autorestart"&&key!="sleep"&&key!="displaysleep")next
+      if(seen[key,profile]++)exit 1
+      if((key=="womp"||key=="autorestart")&&(value!="0"&&value!="1"))exit 1
+      if((key=="sleep"||key=="displaysleep")&&(value!~/^(0|[1-9][0-9]{0,2})$/||(value+0)>180))exit 1
+      if((key in selected)&&selected[key]!=value)exit 1
+      selected[key]=value
+      next
+    }
+    {exit 1}
+    END {
+      if(profiles<1||!("womp" in selected)||!("autorestart" in selected)||
+        !("sleep" in selected)||!("displaysleep" in selected))exit 1
+      for(i=1;i<=profiles;i++)
+        if(!seen["womp",profile_name[i]]||!seen["autorestart",profile_name[i]]||
+          !seen["sleep",profile_name[i]]||!seen["displaysleep",profile_name[i]])exit 1
+      print "wake-on-network-access|" (selected["womp"]=="1"?"on":"off")
+      print "restart-after-power-failure|" (selected["autorestart"]=="1"?"on":"off")
+      print "computer-sleep|" (selected["sleep"]=="0"?"Never":selected["sleep"])
+      print "display-sleep|" (selected["displaysleep"]=="0"?"Never":selected["displaysleep"])
+    }
+  ' "$u2_raw" >"$u2_output"; then
+    rm -f "$u2_raw" "$u2_output"
+    return 1
+  fi
+  rm -f "$u2_raw"
+}
+
+u2_macos_setting_snapshot() {
+  u2_root=$1
+  u2_owner=$2
+  u2_setting_id=$3
+  u2_pmset_values=$4
+  case $u2_setting_id in
+    timezone)
+      u2_localtime=$u2_root/etc/localtime
+      u2_validate_protected_ancestors "$u2_localtime" "$u2_owner" && [ -L "$u2_localtime" ] || return 1
+      u2_zone_link=$(readlink "$u2_localtime") || return 1
+      case $u2_zone_link in /var/db/timezone/zoneinfo/*) ;; *) return 1 ;; esac
+      u2_current=${u2_zone_link#/var/db/timezone/zoneinfo/}
+      case /$u2_current/ in */../*|*/./*|*//*) return 1 ;; esac
+      u2_zone_file=$u2_root$u2_zone_link
+      u2_validate_protected_ancestors "$u2_zone_file" "$u2_owner" &&
+        u2_file_ready "$u2_zone_file" "$u2_owner" 8388608 || return 1
+      ;;
+    network-time-server)
+      u2_ntp=$u2_root/etc/ntp.conf
+      u2_validate_protected_ancestors "$u2_ntp" "$u2_owner" &&
+        u2_file_ready "$u2_ntp" "$u2_owner" 4096 644 || return 1
+      u2_current=$(awk 'NR==1&&NF==2&&$1=="server"&&$0=="server " $2{value=$2;next}
+        {exit 1}END{if(NR!=1)exit 1;print value}' "$u2_ntp") || return 1
+      ;;
+    wake-on-network-access|restart-after-power-failure|computer-sleep|display-sleep)
+      u2_current=$(awk -F '|' -v id="$u2_setting_id" '$1==id{if(found++)exit 1;value=$2}
+        END{if(found!=1)exit 1;print value}' "$u2_pmset_values") || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  u2_macos_setting_value_valid "$u2_setting_id" "$u2_current" || return 1
+  printf '%s\n' "$u2_current"
+}
+
+u2_macos_preconditions() {
+  u2_generation=$1
+  u2_root=$2
+  u2_values=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-preconditions.XXXXXX") || return 1
+  u2_pmset_values=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-macos-pmset-values.XXXXXX") || {
+    rm -f "$u2_values"
+    return 1
+  }
+  : >"$u2_values"
+  : >"$u2_pmset_values"
+  if awk -F '|' '$1=="macos-setting"&&$4~/^(wake-on-network-access|restart-after-power-failure|computer-sleep|display-sleep)$/{found=1}END{exit !found}' \
+      "$u2_generation/policy.constraints" &&
+    ! u2_macos_pmset_snapshot "$u2_root" "$u2_protected_owner" "$u2_pmset_values"; then
+    rm -f "$u2_values" "$u2_pmset_values"
+    return 1
+  fi
+  u2_count=0
+  u2_failed=false
+  while IFS='|' read -r u2_kind u2_action u2_token u2_field4 u2_field5 u2_field6 u2_field7 \
+      u2_field8 u2_field9 u2_field10 u2_field11 u2_field12 u2_extra; do
+    case $u2_kind in
+      macos-pkg)
+        [ "$u2_action" = macos.install-signed-pkg.v1 ] && [ -z "$u2_extra" ] || { u2_failed=true; break; }
+        case $u2_field4 in script-free|sealed-cask-payload-v1) ;; *) u2_failed=true; break ;; esac
+        u2_current=$(u2_macos_receipt_version "$u2_root/usr/sbin/pkgutil" "$u2_field11") || {
+          u2_failed=true; break;
+        }
+        u2_digest=$(printf 'macos-pkg|2|%s|%s|%s|%s|%s|%s|%s|%s\n' "$u2_token" "$u2_field11" \
+          "$u2_current" "$u2_field12" "$u2_field6" "$u2_field10" "$u2_field9" "$u2_field4" | sha256_stream) || {
+          u2_failed=true; break;
+        }
+        ;;
+      macos-setting)
+        [ "$u2_action" = macos.apply-system-setting.v1 ] &&
+          [ -z "$u2_field6$u2_field7$u2_field8$u2_field9$u2_field10$u2_field11$u2_field12$u2_extra" ] &&
+          u2_macos_setting_value_valid "$u2_field4" "$u2_field5" || { u2_failed=true; break; }
+        u2_current=$(u2_macos_setting_snapshot "$u2_root" "$u2_protected_owner" "$u2_field4" \
+          "$u2_pmset_values") || { u2_failed=true; break; }
+        u2_digest=$(printf 'macos-setting|1|%s|%s|%s\n' "$u2_field4" "$u2_current" "$u2_field5" |
+          sha256_stream) || { u2_failed=true; break; }
+        ;;
+      *) continue ;;
+    esac
+    u2_count=$((u2_count + 1))
+    [ "$u2_count" -le 128 ] || { u2_failed=true; break; }
+    printf '%s\t%s\t%s\n' "$u2_action" "$u2_token" "$u2_digest" >>"$u2_values" || {
+      u2_failed=true; break;
+    }
+  done <"$u2_generation/policy.constraints"
+  if [ "$u2_failed" = true ]; then
+    rm -f "$u2_values" "$u2_pmset_values"
+    return 1
+  fi
+  u2_observed_preconditions=$(jq -Rsc 'split("\n") | map(select(length>0) | split("\t") |
+    {action_id:.[0],policy_token:.[1],digest:{algorithm:"sha256",value:.[2]}})' "$u2_values") || {
+    rm -f "$u2_values" "$u2_pmset_values"
+    return 1
+  }
+  rm -f "$u2_values" "$u2_pmset_values"
+}
+
 u2_public_record_json() {
   u2_public_file=$1
   awk -F '|' '
@@ -647,6 +914,7 @@ u2_public_record_json() {
 
 emit_privilege_readiness() {
   platform=$(jq -r --arg host "$host_id" '.machines[$host].platform' "$config")
+  machine_transport=$(jq -r --arg host "$host_id" '.machines[$host].transport' "$config")
   route=$(jq -c --arg host "$host_id" '.machines[$host].privilege_broker.automation_transport // null' "$config")
   transport=$(printf '%s' "$route" | jq -r '.mode // empty')
   request_principal=$(printf '%s' "$route" | jq -r '.request_user // empty')
@@ -716,10 +984,14 @@ emit_privilege_readiness() {
   adapter=none
   execution_principals='[]'
   session_requirement=unsupported
-  if [ "$platform" = linux ]; then
+  if [ "$platform" = linux ] || [ "$platform" = macos ]; then
     adapter=posix-sudo-v1
     execution_principals='["root"]'
     session_requirement=no-console-session
+    if [ "$machine_transport:$transport" = local:posix-ssh ] && [ -x /usr/bin/sudo ]; then
+      transport_ready=true
+      transport_receipt_status=local-sudo-readiness
+    fi
   fi
 
   u2_root=${MACHINE_UTILITIES_U2_FIXTURE_ROOT:-}
@@ -734,7 +1006,12 @@ emit_privilege_readiness() {
     u2_fixture=true
     u2_protected_owner=$(id -un)
   fi
-  broker_path=$u2_root/usr/libexec/machine-utilities/posix-broker
+  if [ "$platform" = macos ]; then
+    broker_system_path=/usr/local/libexec/machine-utilities/posix-broker
+  else
+    broker_system_path=/usr/libexec/machine-utilities/posix-broker
+  fi
+  broker_path=$u2_root$broker_system_path
   config_root=$u2_root/etc/machine-utilities
   sudoers_path=$u2_root/etc/sudoers.d/machine-utilities-posix-broker
   public_root=$u2_root/var/lib/machine-utilities-public
@@ -744,6 +1021,8 @@ emit_privilege_readiness() {
   observed_context_digest=
   observed_constraints_digest=
   observed_apt_context_digest=
+  observed_platform_context_digest=
+  observed_platform_artifacts_digest=
   constraint_generation=null
   enrollment_epoch=null
   broker_version=
@@ -796,13 +1075,20 @@ emit_privilege_readiness() {
     "$config_root/trust/allowed_signers" "$config_root/trust/revoked.krl" "$public_root/canary"; do
     if [ -e "$u2_candidate" ] || [ -L "$u2_candidate" ]; then artifact_any=true; fi
   done
-  if [ "$platform" = linux ] && [ "$u2_fixture_valid" = true ]; then
+  if { [ "$platform" = linux ] || [ "$platform" = macos ]; } && [ "$u2_fixture_valid" = true ]; then
     ancestors_ready=true
     if [ -n "$u2_root" ]; then u2_directory_ready "$u2_root" "$u2_protected_owner" || ancestors_ready=false; fi
-    for u2_ancestor in "$u2_root/etc" "$u2_root/etc/sudoers.d" "$u2_root/usr" "$u2_root/usr/libexec" \
+    for u2_ancestor in "$u2_root/etc" "$u2_root/etc/sudoers.d" "$u2_root/usr" \
       "$u2_root/var" "$u2_root/var/lib"; do
       u2_directory_ready "$u2_ancestor" "$u2_protected_owner" || ancestors_ready=false
     done
+    if [ "$platform" = macos ]; then
+      for u2_ancestor in "$u2_root/usr/local" "$u2_root/usr/local/libexec"; do
+        u2_directory_ready "$u2_ancestor" "$u2_protected_owner" || ancestors_ready=false
+      done
+    else
+      u2_directory_ready "$u2_root/usr/libexec" "$u2_protected_owner" || ancestors_ready=false
+    fi
     lifecycle_transaction_count=0
     for lifecycle_kind in lock recovery; do
       case $lifecycle_kind in
@@ -889,16 +1175,27 @@ emit_privilege_readiness() {
         context_path=$generation/context.canary
         identity_path=$generation/host.identity
         apt_context_path=$generation/apt.context
+        macos_context_path=$generation/macos.context
         broker_digest_path=$generation/broker.sha256
         broker_version_path=$generation/broker.version
         trust_root=$config_root/trust
         constraints_inventory=$(mktemp "${TMPDIR:-/tmp}/machine-utilities-constraints.XXXXXX")
+        platform_files_ready=false
+        if [ "$platform" = linux ]; then
+          if u2_file_ready "$apt_context_path" "$u2_protected_owner" 65536 644 &&
+            u2_file_ready "$generation/apt.conf" "$u2_protected_owner" 65536 644; then
+            platform_files_ready=true
+          fi
+        elif u2_file_ready "$macos_context_path" "$u2_protected_owner" 65536 644 &&
+          u2_validate_macos_context "$generation" "$u2_root" "$u2_protected_owner"; then
+          platform_files_ready=true
+        fi
         if [ "$ancestors_ready" = true ] &&
           u2_directory_ready "$config_root" "$u2_protected_owner" 755 &&
           u2_directory_ready "$config_root/generations" "$u2_protected_owner" 755 &&
           u2_directory_ready "$generation" "$u2_protected_owner" 755 &&
           u2_directory_ready "$trust_root" "$u2_protected_owner" 755 &&
-          u2_directory_ready "$u2_root/usr/libexec/machine-utilities" "$u2_protected_owner" 755 &&
+          u2_directory_ready "${broker_path%/*}" "$u2_protected_owner" 755 &&
           u2_directory_ready "$public_root" "$u2_protected_owner" 755 &&
           u2_file_ready "$broker_path" "$u2_protected_owner" 1048576 755 &&
           u2_file_ready "$broker_digest_path" "$u2_protected_owner" 128 644 &&
@@ -907,8 +1204,7 @@ emit_privilege_readiness() {
           u2_file_ready "$constraints_path" "$u2_protected_owner" 1048576 644 &&
           u2_file_ready "$context_path" "$u2_protected_owner" 65536 644 &&
           u2_file_ready "$identity_path" "$u2_protected_owner" 65536 644 &&
-          u2_file_ready "$apt_context_path" "$u2_protected_owner" 65536 644 &&
-          u2_file_ready "$generation/apt.conf" "$u2_protected_owner" 65536 644 &&
+          [ "$platform_files_ready" = true ] &&
           u2_file_ready "$trust_root/fleet-ca.pub" "$u2_protected_owner" 8192 644 &&
           u2_file_ready "$trust_root/allowed_signers" "$u2_protected_owner" 16384 644 &&
           u2_file_ready "$trust_root/revoked.krl" "$u2_protected_owner" 1048576 644 &&
@@ -921,7 +1217,14 @@ emit_privilege_readiness() {
           observed_policy_digest=$(sha256_file "$policy_path")
           observed_constraints_digest=$(jq -r '.digest.value' "$constraints_inventory")
           observed_context_digest=$(sha256_file "$context_path")
-          observed_apt_context_digest=$(sha256_file "$apt_context_path")
+          if [ "$platform" = linux ]; then
+            observed_apt_context_digest=$(sha256_file "$apt_context_path")
+            observed_platform_context_digest=$observed_apt_context_digest
+            observed_platform_artifacts_digest=$(sha256_file "$generation/apt/source-authority")
+          else
+            observed_platform_context_digest=$(sha256_file "$macos_context_path")
+            observed_platform_artifacts_digest=$(u2_path_set_digest "$u2_protected_owner" packages "$generation/macos/packages")
+          fi
           constraint_generation=$(jq -r '.generation' "$constraints_inventory")
           broker_version=$(head -1 "$broker_version_path" | clip)
           declared_broker_digest=$(head -1 "$broker_digest_path" | clip)
@@ -931,22 +1234,32 @@ emit_privilege_readiness() {
             [ "$observed_protocol" = 1 ] && [ "$constraint_generation" = "$active_epoch" ] &&
             /bin/bash -n "$broker_path" &&
             awk -F '|' '
-              BEGIN { key[2]="state";key[3]="scope";key[4]="epoch";key[5]="manifest-sha256"
-                key[6]="confirmation-sha256";key[7]="broker-sha256";key[8]="policy-sha256"
-                key[9]="constraints-sha256";key[10]="host-identity-sha256";key[11]="context-canary-sha256"
-                key[12]="apt-context-sha256";key[13]="source-authority-sha256";key[14]="fleet-ca-sha256"
-                key[15]="allowed-signers-sha256";key[16]="revoked-krl-sha256";key[17]="sudoers-sha256"
-                key[18]="fleet-ca-fingerprint";key[19]="protected-uid";key[20]="request-principal"
-                key[21]="endpoint-principals" }
+              function digest(v){return length(v)==64&&v~/^[0-9a-f]+$/}
               $0!~/^[ -~]+$/{exit 1} NR==1{if($0!="enrollment-receipt|2")exit 1;next}
-              NR>=2&&NR<=21{if(NF!=2||$1!=key[NR])exit 1;next}{exit 1}END{if(NR!=21)exit 1}
+              NR==2{if($0!="state|enrolled")exit 1;next}
+              NR==3{if(NF!=2||$1!="scope"||($2!="fixture"&&$2!="native"))exit 1;next}
+              NR==4{if(NF!=2||$1!="epoch"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+              NR>=5&&NR<=17{if(NF!=2||!digest($2))exit 1;next}
+              NR==18{if(NF!=2||$1!="fleet-ca-fingerprint"||$2!~/^SHA256:[A-Za-z0-9+\/=]+$/)exit 1;next}
+              NR==19{if(NF!=2||$1!="protected-uid"||$2!~/^[1-9][0-9]{0,9}$/)exit 1;next}
+              NR==20{if(NF!=2||$1!="request-principal")exit 1;next}
+              NR==21{if(NF!=2||$1!="endpoint-principals")exit 1;next}
+              {exit 1}END{if(NR!=21)exit 1}
             ' "$public_root/enrollment" &&
             awk -F '|' '
               BEGIN{key[2]="scope";key[3]="complete-sudoers";key[4]="positive-no-argument"
-                key[5]="negative-with-argument";key[6]="negative-direct-unprivileged";key[7]="epoch"
-                key[8]="broker-sha256";key[9]="sudoers-sha256"}
+                key[5]="negative-with-argument";key[6]="negative-direct-unprivileged"}
               $0!~/^[ -~]+$/{exit 1} NR==1{if($0!="enrollment-canary|1")exit 1;next}
-              NR>=2&&NR<=9{if(NF!=2||$1!=key[NR])exit 1;next}{exit 1}END{if(NR!=9)exit 1}
+              NR>=2&&NR<=6{if(NF!=2||$1!=key[NR])exit 1;next}
+              NR==7{if(NF!=2)exit 1;if($1=="epoch")mode="linux";else if($1=="negative-direct-installer")mode="macos";else exit 1;next}
+              mode=="macos"&&NR==8{if(NF!=2||$1!="negative-root-homebrew")exit 1;next}
+              mode=="macos"&&NR==9{if(NF!=2||$1!="negative-root-shell")exit 1;next}
+              mode=="linux"&&NR==8{if(NF!=2||$1!="broker-sha256")exit 1;next}
+              mode=="linux"&&NR==9{if(NF!=2||$1!="sudoers-sha256")exit 1;next}
+              mode=="macos"&&NR==10{if(NF!=2||$1!="epoch")exit 1;next}
+              mode=="macos"&&NR==11{if(NF!=2||$1!="broker-sha256")exit 1;next}
+              mode=="macos"&&NR==12{if(NF!=2||$1!="sudoers-sha256")exit 1;next}
+              {exit 1}END{if((mode=="linux"&&NR!=9)||(mode=="macos"&&NR!=12))exit 1}
             ' "$public_root/canary"; then
             receipt_state=$(u2_record_value "$public_root/enrollment" state)
             enrollment_receipt_scope=$(u2_record_value "$public_root/enrollment" scope)
@@ -958,8 +1271,18 @@ emit_privilege_readiness() {
             receipt_constraints_digest=$(u2_record_value "$public_root/enrollment" constraints-sha256)
             receipt_identity_digest=$(u2_record_value "$public_root/enrollment" host-identity-sha256)
             receipt_context_digest=$(u2_record_value "$public_root/enrollment" context-canary-sha256)
-            receipt_apt_context_digest=$(u2_record_value "$public_root/enrollment" apt-context-sha256)
-            receipt_source_authority_digest=$(u2_record_value "$public_root/enrollment" source-authority-sha256)
+            if [ "$platform" = linux ]; then
+              receipt_platform_context_digest=$(u2_record_value "$public_root/enrollment" apt-context-sha256)
+              receipt_platform_artifacts_digest=$(u2_record_value "$public_root/enrollment" source-authority-sha256)
+              expected_receipt_labels='manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,apt-context-sha256,source-authority-sha256,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256'
+              action_context_id=posix-root-v1
+            else
+              receipt_platform_context_digest=$(u2_record_value "$public_root/enrollment" platform-context-sha256)
+              receipt_platform_artifacts_digest=$(u2_record_value "$public_root/enrollment" platform-artifacts-sha256)
+              expected_receipt_labels='manifest-sha256,confirmation-sha256,broker-sha256,policy-sha256,constraints-sha256,host-identity-sha256,context-canary-sha256,platform-context-sha256,platform-artifacts-sha256,fleet-ca-sha256,allowed-signers-sha256,revoked-krl-sha256,sudoers-sha256'
+              action_context_id=macos-root-v1
+            fi
+            receipt_labels=$(awk -F '|' 'NR>=5&&NR<=17{printf "%s%s",sep,$1;sep=","}' "$public_root/enrollment")
             receipt_ca_digest=$(u2_record_value "$public_root/enrollment" fleet-ca-sha256)
             receipt_signers_digest=$(u2_record_value "$public_root/enrollment" allowed-signers-sha256)
             receipt_krl_digest=$(u2_record_value "$public_root/enrollment" revoked-krl-sha256)
@@ -973,6 +1296,9 @@ emit_privilege_readiness() {
             canary_positive=$(u2_record_value "$public_root/canary" positive-no-argument)
             canary_negative_argument=$(u2_record_value "$public_root/canary" negative-with-argument)
             canary_negative_direct=$(u2_record_value "$public_root/canary" negative-direct-unprivileged)
+            canary_negative_installer=$(u2_record_value "$public_root/canary" negative-direct-installer)
+            canary_negative_homebrew=$(u2_record_value "$public_root/canary" negative-root-homebrew)
+            canary_negative_shell=$(u2_record_value "$public_root/canary" negative-root-shell)
             canary_epoch=$(u2_record_value "$public_root/canary" epoch)
             canary_broker_digest=$(u2_record_value "$public_root/canary" broker-sha256)
             canary_sudoers_digest=$(u2_record_value "$public_root/canary" sudoers-sha256)
@@ -983,8 +1309,8 @@ emit_privilege_readiness() {
             receipt_digests_valid=true
             for receipt_digest in "$enrollment_manifest_digest" "$enrollment_confirmation_digest" \
               "$receipt_broker_digest" "$receipt_policy_digest" "$receipt_constraints_digest" \
-              "$receipt_identity_digest" "$receipt_context_digest" "$receipt_apt_context_digest" \
-              "$receipt_source_authority_digest" \
+              "$receipt_identity_digest" "$receipt_context_digest" "$receipt_platform_context_digest" \
+              "$receipt_platform_artifacts_digest" \
               "$receipt_ca_digest" "$receipt_signers_digest" "$receipt_krl_digest" "$receipt_sudoers_digest"; do
               printf '%s' "$receipt_digest" | grep -Eq '^[0-9a-f]{64}$' || receipt_digests_valid=false
             done
@@ -992,19 +1318,30 @@ emit_privilege_readiness() {
             if [ "$canary_scope" = native ] && [ "$canary_sudoers" = passed ] &&
               [ "$canary_positive" = passed ] && [ "$canary_negative_argument" = passed ] &&
               [ "$canary_negative_direct" = passed ]; then
-              canary_labels_valid=true
-              adapter_verifier_status=passed-complete-policy
+              if [ "$platform" = linux ] || {
+                [ "$canary_negative_installer" = passed ] && [ "$canary_negative_homebrew" = passed ] &&
+                [ "$canary_negative_shell" = passed ];
+              }; then
+                canary_labels_valid=true
+                adapter_verifier_status=passed-complete-policy
+              fi
             elif [ "$u2_fixture" = true ] && [ "$canary_scope" = fixture ] &&
               [ "$canary_sudoers" = fixture-not-run ] &&
               [ "$canary_positive" = fixture-simulated-broker-reached ] &&
               [ "$canary_negative_argument" = fixture-passed ] &&
               [ "$canary_negative_direct" = fixture-not-run ]; then
-              canary_labels_valid=true
-              adapter_verifier_status=fixture-labeled
+              if [ "$platform" = linux ] || {
+                [ "$canary_negative_installer" = fixture-not-run ] &&
+                [ "$canary_negative_homebrew" = fixture-not-run ] &&
+                [ "$canary_negative_shell" = fixture-not-run ];
+              }; then
+                canary_labels_valid=true
+                adapter_verifier_status=fixture-labeled
+              fi
             fi
             sudoers_content_valid=true
             if [ -r "$sudoers_path" ]; then
-              [ "$(cat "$sudoers_path")" = "$protected_principal ALL=(root) NOPASSWD:NOSETENV: /usr/libexec/machine-utilities/posix-broker \"\"" ] &&
+              [ "$(cat "$sudoers_path")" = "$protected_principal ALL=(root) NOPASSWD:NOSETENV: $broker_system_path \"\"" ] &&
                 [ "$(sha256_file "$sudoers_path")" = "$receipt_sudoers_digest" ] || sudoers_content_valid=false
             elif [ "$u2_fixture" = true ]; then
               sudoers_content_valid=false
@@ -1016,8 +1353,9 @@ emit_privilege_readiness() {
               [ "$receipt_constraints_digest" = "$observed_constraints_digest" ] &&
               [ "$receipt_identity_digest" = "$(sha256_file "$identity_path")" ] &&
               [ "$receipt_context_digest" = "$observed_context_digest" ] &&
-              [ "$receipt_apt_context_digest" = "$observed_apt_context_digest" ] &&
-              [ "$receipt_source_authority_digest" = "$(sha256_file "$generation/apt/source-authority")" ] &&
+              [ "$receipt_labels" = "$expected_receipt_labels" ] &&
+              [ "$receipt_platform_context_digest" = "$observed_platform_context_digest" ] &&
+              [ "$receipt_platform_artifacts_digest" = "$observed_platform_artifacts_digest" ] &&
               [ "$receipt_ca_digest" = "$(sha256_file "$trust_root/fleet-ca.pub")" ] &&
               [ "$receipt_signers_digest" = "$(sha256_file "$trust_root/allowed_signers")" ] &&
               [ "$receipt_krl_digest" = "$(sha256_file "$trust_root/revoked.krl")" ] &&
@@ -1033,11 +1371,13 @@ emit_privilege_readiness() {
               [ "$canary_sudoers_digest" = "$receipt_sudoers_digest" ] &&
               [ "$receipt_digests_valid" = true ] && [ "$canary_labels_valid" = true ] &&
               [ "$sudoers_content_valid" = true ] &&
-              u2_validate_apt_context "$generation" "$u2_root" "$u2_protected_owner"; then
+              { { [ "$platform" = linux ] && u2_validate_apt_context "$generation" "$u2_root" "$u2_protected_owner"; } ||
+                { [ "$platform" = macos ] && [ "$platform_files_ready" = true ] &&
+                  u2_macos_preconditions "$generation" "$u2_root"; }; }; then
               enrollment_receipt_ready=true
               adapter_mechanism_ready=true
               observed_preconditions=$u2_observed_preconditions
-              observed_contexts=$(awk -F '|' 'NR>1&&$3=="posix-root-v1"&&$4=="enabled"{
+              observed_contexts=$(awk -F '|' -v context="$action_context_id" 'NR>1&&$3==context&&$4=="enabled"{
                 print $2"\t"$3"\t"$5"\t"$6}' "$policy_path" |
                 jq -Rsc --slurpfile constraints "$constraints_inventory" '
                   split("\n")|map(select(length>0)|split("\t")|
@@ -1092,9 +1432,7 @@ emit_privilege_readiness() {
   lifecycle_status=needs_enrollment
   if [ "$platform" = wsl ]; then
     lifecycle_status=unsupported_security_boundary
-  elif [ "$platform" = macos ]; then
-    lifecycle_status=no_cataloged_action
-  elif [ "$platform" != linux ]; then
+  elif [ "$platform" != linux ] && [ "$platform" != macos ]; then
     lifecycle_status=unsupported_context
   elif [ "$lifecycle_activity" = true ] && [ "$lifecycle_activity_valid" = true ]; then
     lifecycle_status=draining
@@ -1130,6 +1468,7 @@ emit_privilege_readiness() {
     --arg broker_digest "$observed_broker_digest" --arg proposal_digest "$proposal_digest" \
     --arg proposal_status "$proposal_status" --arg policy_digest "$observed_policy_digest" \
     --arg context_digest "$observed_context_digest" --arg apt_context_digest "$observed_apt_context_digest" \
+    --arg platform_context_digest "$observed_platform_context_digest" \
     --arg constraints_digest "$observed_constraints_digest" --arg adapter_verifier_status "$adapter_verifier_status" \
     --arg node_id "$node_id" --arg fleet_domain "$fleet_domain" --arg node_key_fingerprint "$node_key_fingerprint" \
     --arg fleet_ca_fingerprint "$fleet_ca_fingerprint" --arg certificate_serial "$certificate_serial" \
@@ -1181,6 +1520,8 @@ emit_privilege_readiness() {
       constraint_generation:$constraint_generation,observed_action_contexts:$observed_contexts,
       observed_preconditions:$observed_preconditions,
       context_canary_digest:(if $context_digest=="" then null else {algorithm:"sha256",value:$context_digest} end),
+      observed_platform_context_digest:(if $platform_context_digest=="" then null else
+        {algorithm:"sha256",value:$platform_context_digest} end),
       apt_context:{version:(if $apt_context_digest=="" then null else 2 end),
         digest:(if $apt_context_digest=="" then null else {algorithm:"sha256",value:$apt_context_digest} end)},
       protected_identity:{host_id:(if $protected_host_id=="" then null else $protected_host_id end),

@@ -716,8 +716,12 @@ verify_release_bundle() {
     /bin/bash -n "$release_plugin_root/scripts/enroll-ssh-posix" &&
     /bin/bash -n "$release_plugin_root/scripts/machine-utilities" &&
     /usr/bin/grep -Fq 'dispatch-posix-request' "$release_plugin_root/scripts/machine-utilities" &&
-    /usr/bin/grep -Fq '/usr/bin/sudo -n /usr/libexec/machine-utilities/posix-broker' \
+    /usr/bin/grep -Fq 'invoke_fixed_posix_broker()' "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq '/usr/libexec/machine-utilities/posix-broker' \
       "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq '/usr/local/libexec/machine-utilities/posix-broker' \
+      "$release_plugin_root/scripts/machine-utilities" &&
+    /usr/bin/grep -Fq '/usr/bin/sudo -n "$fixed_broker"' "$release_plugin_root/scripts/machine-utilities" &&
     validate_integrity_manifest
 }
 

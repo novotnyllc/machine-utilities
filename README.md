@@ -118,8 +118,16 @@ when run from a source checkout. This detects a stale or altered worker without
 custom signing infrastructure; the authenticated Git marketplace remains the
 source of provenance.
 
-Protected APT, WinGet, and bounded Windows profile actions use repository-fixed
-semantic action/context pairs rather than request-supplied commands. WinGet is
+Protected APT, WinGet, bounded Windows profile, and macOS root actions use
+repository-fixed semantic action/context pairs rather than request-supplied
+commands. macOS root support is owner-enrolled and disabled by default; v1
+permits only `macos.install-signed-pkg.v1` and
+`macos.apply-system-setting.v1`. It never exposes root Homebrew, arbitrary
+`sudo`, or arbitrary plist paths. The signed-package action is script-free by
+default; its `sealed-cask-payload-v1` policy mode may run only the exact,
+owner-enrolled Apple-signed package through fixed `installer -pkg … -target /`.
+It never runs Homebrew as root and does not claim Homebrew's Caskroom state was
+updated. WinGet is
 required for V1 Windows machine-package operations. Enrollment preparation and
 upgrade/revocation previews are inert: the agent stops at the owner's local
 password or UAC boundary and never requests or relays an elevation credential.

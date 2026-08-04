@@ -1066,6 +1066,8 @@ static (string Policy, string Constraints) PolicyAndConstraints(bool enabled)
         "action|apt.install-package-version.v1|posix-root-v1|disabled|package-source-version-closure-set-sha256|-",
         "action|apt.update-metadata.v1|posix-root-v1|enabled|none|-",
         "action|apt.upgrade-package.v1|posix-root-v1|disabled|package-source-channel-set-sha256|-",
+        "action|macos.apply-system-setting.v1|macos-root-v1|disabled|macos-system-setting-sha256|-",
+        "action|macos.install-signed-pkg.v1|macos-root-v1|disabled|macos-signed-pkg-sha256|-",
         "action|profile.apply-managed-bundle.v1|windows-user-s4u-v1|disabled|profile-bundle-set-sha256|-",
         "action|profile.inventory-managed-state.v1|windows-user-s4u-v1|disabled|profile-bundle-set-sha256|-",
         $"action|{BrokerCore.InstallAction}|windows-system-v1|{(enabled ? "enabled" : "disabled")}|winget-package-version-set-sha256|{recordDigest}",

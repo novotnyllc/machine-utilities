@@ -120,15 +120,26 @@ if [ -n "$fixture_root" ]; then
   protected_owner=$(/usr/bin/id -un)
   readonly protected_owner
   readonly fixture_mode=true
+  broker_platform=${MACHINE_UTILITIES_U2_FIXTURE_PLATFORM:-linux}
+  case $broker_platform in linux|macos) ;; *) reject fixture_platform_invalid 64 ;; esac
 else
-  [ "$(/usr/bin/uname -s)" = Linux ] || reject no_cataloged_action 69
+  case $(/usr/bin/uname -s) in
+    Linux) broker_platform=linux ;;
+    Darwin) broker_platform=macos ;;
+    *) reject no_cataloged_action 69 ;;
+  esac
   [ "$(/usr/bin/id -u)" -eq 0 ] || reject needs_human_enrollment 77
   readonly root_prefix=
   readonly protected_owner=root
   readonly fixture_mode=false
 fi
+readonly broker_platform
 
-readonly broker_path=$root_prefix/usr/libexec/machine-utilities/posix-broker
+if [ "$broker_platform" = macos ]; then
+  readonly broker_path=$root_prefix/usr/local/libexec/machine-utilities/posix-broker
+else
+  readonly broker_path=$root_prefix/usr/libexec/machine-utilities/posix-broker
+fi
 readonly config_root=$root_prefix/etc/machine-utilities
 readonly generations_root=$config_root/generations
 readonly active_link=$config_root/active
@@ -184,8 +195,17 @@ permissions_safe() {
 
 protected_directory() {
   path=$1
-  [ -d "$path" ] && [ ! -L "$path" ] &&
-    [ "$(file_owner "$path")" = "$protected_owner" ] && permissions_safe "$path"
+  if [ -d "$path" ] && [ ! -L "$path" ] &&
+    [ "$(file_owner "$path")" = "$protected_owner" ] && permissions_safe "$path"; then
+    return 0
+  fi
+  [ "$fixture_mode" = false ] && [ "$broker_platform" = macos ] && [ -L "$path" ] || return 1
+  [ "$(file_owner "$path")" = root ] && permissions_safe "$path" && protected_directory /private || return 1
+  case $path in
+    /etc) [ "$(/usr/bin/readlink /etc)" = private/etc ] && protected_directory /private/etc ;;
+    /var) [ "$(/usr/bin/readlink /var)" = private/var ] && protected_directory /private/var ;;
+    *) return 1 ;;
+  esac
 }
 
 protected_file() {
@@ -216,6 +236,168 @@ digest() { [[ $1 =~ ^[0-9a-f]{64}$ ]]; }
 fingerprint() { [[ $1 =~ ^SHA256:[A-Za-z0-9+/]{43}=?$ ]]; }
 iso_time() { [[ $1 =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; }
 
+macos_setting_value_valid() {
+  local setting_id=$1 setting_value=$2
+  case $setting_id in
+    timezone)
+      [ "${#setting_value}" -le 255 ] &&
+        [[ $setting_value =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+){0,2}$ ]]
+      ;;
+    wake-on-network-access|restart-after-power-failure)
+      [[ $setting_value =~ ^(on|off)$ ]]
+      ;;
+    network-time-server)
+      [[ $setting_value =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] &&
+        [ "${#setting_value}" -le 253 ] && [[ $setting_value != *..* ]]
+      ;;
+    computer-sleep|display-sleep)
+      [ "$setting_value" = Never ] ||
+        { [[ $setting_value =~ ^[1-9][0-9]{0,2}$ ]] && [ "$setting_value" -le 180 ]; }
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+macos_pkg_payload_mode_valid() {
+  case $1 in script-free|sealed-cask-payload-v1) return 0 ;; *) return 1 ;; esac
+}
+
+macos_receipt_version() {
+  local pkgutil_binary=$1 receipt=$2 output=$3 error_output observed_id observed_version
+  [[ $receipt =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]] || return 1
+  error_output=$output.error
+  if ! /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$pkgutil_binary" --pkg-info-plist "$receipt" >"$output" 2>"$error_output"; then
+    [ "$(<"$error_output")" = "No receipt for '$receipt' found at '/'." ] || return 1
+    /bin/rm -f "$error_output" || return 1
+    printf '%s\n' -
+    return 0
+  fi
+  [ ! -s "$error_output" ] || return 1
+  /bin/rm -f "$error_output" || return 1
+  [ "$(file_size "$output")" -le 65536 ] || return 1
+  observed_id=$(/usr/bin/awk '
+    /<key>pkgid<\/key>/{if(found++)exit 1;getline;if($0!~/<string>[^<]+<\/string>/)exit 1;
+      sub(/^.*<string>/,"");sub(/<\/string>.*$/,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$output") || return 1
+  observed_version=$(/usr/bin/awk '
+    /<key>pkg-version<\/key>/{if(found++)exit 1;getline;if($0!~/<string>[^<]+<\/string>/)exit 1;
+      sub(/^.*<string>/,"");sub(/<\/string>.*$/,"");value=$0}
+    END{if(found!=1)exit 1;print value}' "$output") || return 1
+  [ "$observed_id" = "$receipt" ] &&
+    [[ $observed_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || return 1
+  printf '%s\n' "$observed_version"
+}
+
+macos_setting_snapshot() {
+  local systemsetup_binary=$1 setting_id=$2 output=$3 observed
+  case $setting_id in
+    timezone) setting_getter=-gettimezone ;;
+    network-time-server) setting_getter=-getnetworktimeserver ;;
+    wake-on-network-access) setting_getter=-getwakeonnetworkaccess ;;
+    restart-after-power-failure) setting_getter=-getrestartpowerfailure ;;
+    computer-sleep) setting_getter=-getcomputersleep ;;
+    display-sleep) setting_getter=-getdisplaysleep ;;
+    *) return 1 ;;
+  esac
+  /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "$systemsetup_binary" "$setting_getter" >"$output" 2>/dev/null || return 1
+  [ "$(/usr/bin/wc -l <"$output" | /usr/bin/tr -d ' ')" = 1 ] || return 1
+  observed=$(<"$output")
+  case $setting_id in
+    timezone) observed=${observed#Time Zone: } ;;
+    network-time-server) observed=${observed#Network Time Server: } ;;
+    wake-on-network-access)
+      observed=${observed#Wake On Network Access: }
+      observed=$(printf '%s' "$observed" | /usr/bin/tr '[:upper:]' '[:lower:]')
+      ;;
+    restart-after-power-failure)
+      observed=${observed#Restart After Power Failure: }
+      observed=$(printf '%s' "$observed" | /usr/bin/tr '[:upper:]' '[:lower:]')
+      ;;
+    computer-sleep)
+      observed=${observed#Computer Sleep: }
+      if [ "$observed" = Off ] || [ "$observed" = Never ]; then observed=Never
+      else observed=${observed#After }; observed=${observed% Minutes}; fi
+      ;;
+    display-sleep)
+      observed=${observed#Display Sleep: }
+      if [ "$observed" = Off ] || [ "$observed" = Never ]; then observed=Never
+      else observed=${observed#After }; observed=${observed% Minutes}; fi
+      ;;
+  esac
+  macos_setting_value_valid "$setting_id" "$observed" || return 1
+  printf '%s\n' "$observed"
+}
+
+protected_ancestors() {
+  local candidate=$1 ancestor
+  case $candidate in /*) ;; *) return 1 ;; esac
+  if [ -n "$root_prefix" ]; then case $candidate in "$root_prefix"/*) ;; *) return 1 ;; esac; fi
+  ancestor=${candidate%/*}
+  while :; do
+    protected_directory "$ancestor" || return 1
+    if [ -n "$root_prefix" ] && [ "$ancestor" = "$root_prefix" ]; then break; fi
+    [ "$ancestor" = / ] && break
+    ancestor=${ancestor%/*}
+    [ -n "$ancestor" ] || ancestor=/
+  done
+}
+
+inspect_macos_package() {
+  local pkgutil_binary=$1 installer_binary=$2 artifact=$3 scratch=$4 expected_size=$5
+  local expected_digest=$6 expected_pkg_id=$7 expected_pkg_version=$8 expected_team_id=$9
+  local expected_signature_digest=${10} expected_payload_mode=${11:-script-free}
+  local signature_output pkginfo_output expanded package_info
+  local observed_team observed_signature observed_pkg_id observed_pkg_version
+  macos_pkg_payload_mode_valid "$expected_payload_mode" || return 1
+  protected_ancestors "$artifact" && protected_file "$artifact" "$expected_size" && exact_mode "$artifact" 644 &&
+    [ "$(file_size "$artifact")" = "$expected_size" ] &&
+    [ "$(sha256_file "$artifact")" = "$expected_digest" ] || return 1
+  signature_output=$scratch.signature
+  pkginfo_output=$scratch.pkginfo
+  expanded=$scratch.expanded
+  [ ! -e "$expanded" ] && [ ! -L "$expanded" ] || return 1
+  /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "$pkgutil_binary" --check-signature "$artifact" >"$signature_output" 2>/dev/null || return 1
+  [ "$(file_size "$signature_output")" -le 65536 ] || return 1
+  /usr/bin/grep -Fqx '   Status: signed by a developer certificate issued by Apple for distribution' \
+    "$signature_output" || return 1
+  observed_team=$(/usr/bin/awk '
+    $1=="1." && $2=="Developer" && $3=="ID" && $4=="Installer:" {
+      if(found++)exit 1; value=$0; sub(/^.*\(/,"",value); sub(/\).*$/, "", value)
+    } END{if(found!=1)exit 1;print value}' "$signature_output") || return 1
+  observed_signature=$(/usr/bin/awk '
+    $1=="1."{leaf=1;next}
+    leaf && /SHA256 Fingerprint:/{fingerprint=1;next}
+    fingerprint {for(i=1;i<=NF;i++)if($i~/^[0-9A-F][0-9A-F]$/)value=value tolower($i);
+      if(length(value)>=64){print value;exit}}
+  ' "$signature_output") || return 1
+  [ "$observed_team" = "$expected_team_id" ] &&
+    [ "$observed_signature" = "$expected_signature_digest" ] || return 1
+  /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "$pkgutil_binary" --expand "$artifact" "$expanded" >/dev/null 2>&1 || return 1
+  ! /usr/bin/find "$expanded" -type l -print | /usr/bin/grep -q . &&
+    ! /usr/bin/find "$expanded" ! -type d ! -type f -print | /usr/bin/grep -q . &&
+    ! /usr/bin/find "$expanded" -name Distribution -print | /usr/bin/grep -q . || return 1
+  if [ "$expected_payload_mode" = script-free ]; then
+    ! /usr/bin/find "$expanded" -name Scripts -print | /usr/bin/grep -q . || return 1
+  fi
+  package_info=$(/usr/bin/find "$expanded" -name PackageInfo -type f -print)
+  [ -n "$package_info" ] && [ "$(printf '%s\n' "$package_info" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" = 1 ] || return 1
+  [ "$expected_payload_mode" != script-free ] ||
+    ! /usr/bin/grep -Eq '<scripts([[:space:]>])' "$package_info" || return 1
+  observed_pkg_id=$(/usr/bin/sed -n 's/^<pkg-info .* identifier="\([A-Za-z0-9][A-Za-z0-9._-]*\)".*$/\1/p' \
+    "$package_info") || return 1
+  observed_pkg_version=$(/usr/bin/sed -n 's/^<pkg-info .* version="\([0-9A-Za-z][0-9A-Za-z.+:~_-]*\)".*$/\1/p' \
+    "$package_info") || return 1
+  [ "$observed_pkg_id" = "$expected_pkg_id" ] && [ "$observed_pkg_version" = "$expected_pkg_version" ] || return 1
+  /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "$installer_binary" -pkginfo -plist -pkg "$artifact" -target / >"$pkginfo_output" 2>/dev/null || return 1
+  [ "$(file_size "$pkginfo_output")" -le 1048576 ] &&
+    /usr/bin/grep -Fq '<plist version="1.0">' "$pkginfo_output"
+}
+
 fixture_pause() {
   local phase=$1 marker
   [ "$fixture_mode" = true ] && [ "${MACHINE_UTILITIES_U2_PAUSE_AT:-}" = "$phase" ] || return 0
@@ -243,14 +425,18 @@ internal_process_start_identity() {
 run_internal_launcher() {
   local gate_token claim launch_record launch_digest launch_request launch_action launch_token
   local launch_target launch_epoch launch_broker_digest launch_policy_digest launch_constraints_digest
-  local launch_apt_context_digest launch_precondition_digest launch_action_digest launch_exact_version
+  local launch_platform_context_digest launch_precondition_digest launch_action_digest launch_exact_version
   local launch_gate_digest active_target_internal generation_internal admission_file journal_file
   local admission_kind admission_version admission_request parent_pid parent_start child_pid child_pgid
   local child_start launch_boot admission_state admission_effect admission_epoch admission_launch_digest admission_extra
-  local apt_context_internal apt_config_internal apt_get_internal apt_get_expected policy_internal constraints_internal
+  local platform_context_internal apt_context_internal apt_config_internal apt_get_internal apt_get_expected
+  local policy_internal constraints_internal installer_internal pkgutil_internal pmset_internal systemsetup_internal
+  local installer_expected pkgutil_expected pmset_expected systemsetup_expected
   local policy_record_internal selected_context_internal selected_state_internal
   local selected_constraint_internal package_internal artifact_internal artifact_expected exact_internal
-  local journal_launch_digest observed_start native_arguments_internal
+  local pkg_size_internal pkg_id_internal pkg_version_internal team_id_internal signature_digest_internal
+  local receipt_id_internal receipt_version_internal setting_id_internal setting_value_internal current_internal
+  local fresh_internal scratch_internal native_setting_value journal_launch_digest observed_start native_arguments_internal
 
   IFS= read -r gate_token <&9 || exit 74
   digest "$(printf '%s\n' "$gate_token" | sha256_stream)" || exit 74
@@ -265,7 +451,7 @@ run_internal_launcher() {
   /usr/bin/awk -F '|' '
     BEGIN { key[1]="launch-record";key[2]="request-id";key[3]="action-id";key[4]="policy-token"
       key[5]="generation-target";key[6]="enrollment-epoch";key[7]="broker-sha256"
-      key[8]="policy-sha256";key[9]="constraints-sha256";key[10]="apt-context-sha256"
+      key[8]="policy-sha256";key[9]="constraints-sha256";key[10]="platform-context-sha256"
       key[11]="precondition-sha256";key[12]="action-evidence-sha256";key[13]="exact-version"
       key[14]="gate-sha256";key[15]="end-launch" }
     $0!~/^[ -~]*$/||length($0)>2048||NF!=2||$1!=key[NR]{exit 1}
@@ -281,7 +467,7 @@ run_internal_launcher() {
   launch_broker_digest=$(record_value_from "$launch_record" broker-sha256) || exit 74
   launch_policy_digest=$(record_value_from "$launch_record" policy-sha256) || exit 74
   launch_constraints_digest=$(record_value_from "$launch_record" constraints-sha256) || exit 74
-  launch_apt_context_digest=$(record_value_from "$launch_record" apt-context-sha256) || exit 74
+  launch_platform_context_digest=$(record_value_from "$launch_record" platform-context-sha256) || exit 74
   launch_precondition_digest=$(record_value_from "$launch_record" precondition-sha256) || exit 74
   launch_action_digest=$(record_value_from "$launch_record" action-evidence-sha256) || exit 74
   launch_exact_version=$(record_value_from "$launch_record" exact-version) || exit 74
@@ -291,7 +477,7 @@ run_internal_launcher() {
     { [ "$launch_token" = - ] || token "$launch_token"; } &&
     [[ $launch_target =~ ^generations/([1-9][0-9]{0,9})$ ]] && [ "${BASH_REMATCH[1]}" = "$launch_epoch" ] &&
     uint "$launch_epoch" && digest "$launch_broker_digest" && digest "$launch_policy_digest" &&
-    digest "$launch_constraints_digest" && digest "$launch_apt_context_digest" &&
+    digest "$launch_constraints_digest" && digest "$launch_platform_context_digest" &&
     digest "$launch_precondition_digest" && digest "$launch_action_digest" &&
     { [ "$launch_exact_version" = - ] || [[ $launch_exact_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]]; } &&
     digest "$launch_gate_digest" &&
@@ -302,24 +488,54 @@ run_internal_launcher() {
   generation_internal=$config_root/$launch_target
   policy_internal=$generation_internal/policy.actions
   constraints_internal=$generation_internal/policy.constraints
-  apt_context_internal=$generation_internal/apt.context
-  apt_config_internal=$generation_internal/apt.conf
-  apt_get_internal=$root_prefix/usr/bin/apt-get
+  if [ "$broker_platform" = macos ]; then
+    platform_context_internal=$generation_internal/macos.context
+  else
+    platform_context_internal=$generation_internal/apt.context
+  fi
   protected_directory "$generation_internal" && protected_file "$policy_internal" 65536 &&
-    protected_file "$constraints_internal" 65536 && protected_file "$apt_context_internal" 65536 &&
-    protected_file "$apt_config_internal" 65536 && protected_file "$apt_get_internal" 33554432 &&
-    [ -x "$apt_get_internal" ] && [ "$(sha256_file "$policy_internal")" = "$launch_policy_digest" ] &&
+    protected_file "$constraints_internal" 65536 && protected_file "$platform_context_internal" 65536 &&
+    [ "$(sha256_file "$policy_internal")" = "$launch_policy_digest" ] &&
     [ "$(sha256_file "$constraints_internal")" = "$launch_constraints_digest" ] &&
-    [ "$(sha256_file "$apt_context_internal")" = "$launch_apt_context_digest" ] || exit 75
+    [ "$(sha256_file "$platform_context_internal")" = "$launch_platform_context_digest" ] || exit 75
   if [ "$fixture_mode" = true ]; then
     [ "$(sha256_file "$0")" = "$launch_broker_digest" ] ||
       [ "$(sha256_file "$broker_path")" = "$launch_broker_digest" ] || exit 75
   else
     [ "$0" = "$broker_path" ] && [ "$(sha256_file "$broker_path")" = "$launch_broker_digest" ] || exit 75
   fi
-  apt_get_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="apt-get"{if(found++)exit 1;print $3}
-    END{if(found!=1)exit 1}' "$apt_context_internal") || exit 75
-  digest "$apt_get_expected" && [ "$(sha256_file "$apt_get_internal")" = "$apt_get_expected" ] || exit 75
+  if [ "$broker_platform" = macos ]; then
+    installer_internal=$root_prefix/usr/sbin/installer
+    pkgutil_internal=$root_prefix/usr/sbin/pkgutil
+    pmset_internal=$root_prefix/usr/bin/pmset
+    systemsetup_internal=$root_prefix/usr/sbin/systemsetup
+    /usr/bin/awk -F '|' '
+      NR==1{if($0!="macos-context|1")exit 1;next}
+      NR>=2&&NR<=5{if(NF!=3||$1!="binary"||$2!~/^(installer|pkgutil|pmset|systemsetup)$/||
+        length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$2))exit 1;previous=$2;next}
+      {exit 1} END{if(NR!=5||!seen["installer"]||!seen["pkgutil"]||!seen["pmset"]||!seen["systemsetup"])exit 1}
+    ' "$platform_context_internal" || exit 75
+    installer_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="installer"{print $3}' "$platform_context_internal")
+    pkgutil_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pkgutil"{print $3}' "$platform_context_internal")
+    pmset_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pmset"{print $3}' "$platform_context_internal")
+    systemsetup_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="systemsetup"{print $3}' "$platform_context_internal")
+    for dependency_internal in "$installer_internal" "$pkgutil_internal" "$pmset_internal" "$systemsetup_internal"; do
+      protected_file "$dependency_internal" 33554432 && [ -x "$dependency_internal" ] || exit 75
+    done
+      [ "$(sha256_file "$installer_internal")" = "$installer_expected" ] &&
+      [ "$(sha256_file "$pkgutil_internal")" = "$pkgutil_expected" ] &&
+      [ "$(sha256_file "$pmset_internal")" = "$pmset_expected" ] &&
+      [ "$(sha256_file "$systemsetup_internal")" = "$systemsetup_expected" ] || exit 75
+  else
+    apt_context_internal=$platform_context_internal
+    apt_config_internal=$generation_internal/apt.conf
+    apt_get_internal=$root_prefix/usr/bin/apt-get
+    protected_file "$apt_config_internal" 65536 && protected_file "$apt_get_internal" 33554432 &&
+      [ -x "$apt_get_internal" ] || exit 75
+    apt_get_expected=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="apt-get"{if(found++)exit 1;print $3}
+      END{if(found!=1)exit 1}' "$apt_context_internal") || exit 75
+    digest "$apt_get_expected" && [ "$(sha256_file "$apt_get_internal")" = "$apt_get_expected" ] || exit 75
+  fi
 
   IFS='|' read -r admission_kind admission_version admission_request parent_pid parent_start child_pid child_pgid \
     child_start launch_boot admission_state admission_effect admission_epoch admission_launch_digest admission_extra \
@@ -344,50 +560,143 @@ run_internal_launcher() {
   policy_record_internal=$(/usr/bin/awk -F '|' -v action="$launch_action" \
     '$1=="action"&&$2==action{if(found++)exit 1;print} END{if(found!=1)exit 1}' "$policy_internal") || exit 75
   IFS='|' read -r _ _ selected_context_internal selected_state_internal _ _ <<<"$policy_record_internal"
-  [ "$selected_context_internal" = posix-root-v1 ] && [ "$selected_state_internal" = enabled ] || exit 75
-  native_arguments_internal=(--quiet=2)
-  case $launch_action in
-    apt.update-metadata.v1)
-      [ "$launch_token" = - ] && [ "$launch_exact_version" = - ] || exit 75
-      native_arguments_internal+=(update)
-      ;;
-    apt.autoremove.v1)
-      [ "$launch_token" = - ] && [ "$launch_exact_version" = - ] || exit 75
-      native_arguments_internal+=(--yes autoremove)
-      ;;
-    apt.install-package-version.v1)
-      selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
-        '$1=="apt-install"&&$2=="apt.install-package-version.v1"&&$3==token{if(found++)exit 1;print}
-         END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
-      IFS='|' read -r _ _ _ package_internal _ exact_internal artifact_expected _ \
-        <<<"$selected_constraint_internal"
-      [ "$launch_exact_version" = "$exact_internal" ] && digest "$artifact_expected" || exit 75
-      artifact_internal=$generation_internal/apt/artifacts/$launch_token.deb
-      protected_file "$artifact_internal" 33554432 &&
-        [ "$(sha256_file "$artifact_internal")" = "$artifact_expected" ] || exit 75
-      native_arguments_internal+=(--yes --no-remove --no-install-recommends install "$artifact_internal")
-      ;;
-    apt.upgrade-package.v1)
-      selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
-        '$1=="apt-upgrade"&&$2=="apt.upgrade-package.v1"&&$3==token{if(found++)exit 1;print}
-         END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
-      IFS='|' read -r _ _ _ package_internal _ _ _ _ _ \
-        <<<"$selected_constraint_internal"
-      [[ $launch_exact_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || exit 75
-      native_arguments_internal+=(--yes --no-remove --only-upgrade install "$package_internal=$launch_exact_version")
-      ;;
-    *) exit 75 ;;
-  esac
+  if [ "$broker_platform" = macos ]; then
+    [ "$selected_context_internal" = macos-root-v1 ] && [ "$selected_state_internal" = enabled ] || exit 75
+    case $launch_action in
+      macos.install-signed-pkg.v1)
+        selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
+          '$1=="macos-pkg"&&$2=="macos.install-signed-pkg.v1"&&$3==token{if(found++)exit 1;print}
+           END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
+        IFS='|' read -r _ _ _ payload_mode_internal pkg_size_internal artifact_expected pkg_id_internal pkg_version_internal \
+          team_id_internal signature_digest_internal receipt_id_internal receipt_version_internal \
+          <<<"$selected_constraint_internal"
+        [ "$launch_exact_version" = "$receipt_version_internal" ] &&
+          macos_pkg_payload_mode_valid "$payload_mode_internal" && uint "$pkg_size_internal" &&
+          digest "$artifact_expected" && digest "$signature_digest_internal" || exit 75
+        artifact_internal=$generation_internal/macos/packages/$launch_token.pkg
+        scratch_internal=$claim/.macos-package.$$
+        inspect_macos_package "$pkgutil_internal" "$installer_internal" "$artifact_internal" "$scratch_internal" \
+          "$pkg_size_internal" "$artifact_expected" "$pkg_id_internal" "$pkg_version_internal" \
+          "$team_id_internal" "$signature_digest_internal" "$payload_mode_internal" || exit 75
+        /bin/rm -rf "$scratch_internal.expanded" "$scratch_internal.signature" "$scratch_internal.pkginfo" || exit 75
+        current_internal=$(macos_receipt_version "$pkgutil_internal" "$receipt_id_internal" "$claim/.receipt.$$") || exit 75
+        /bin/rm -f "$claim/.receipt.$$" || exit 75
+        fresh_internal=$(printf 'macos-pkg|2|%s|%s|%s|%s|%s|%s|%s|%s\n' "$launch_token" \
+          "$receipt_id_internal" "$current_internal" "$receipt_version_internal" "$artifact_expected" \
+          "$signature_digest_internal" "$team_id_internal" "$payload_mode_internal" | sha256_stream) || exit 75
+        [ "$fresh_internal" = "$launch_precondition_digest" ] || exit 75
+        native_arguments_internal=(-pkg "$artifact_internal" -target /)
+        ;;
+      macos.apply-system-setting.v1)
+        selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
+          '$1=="macos-setting"&&$2=="macos.apply-system-setting.v1"&&$3==token{if(found++)exit 1;print}
+           END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
+        IFS='|' read -r _ _ _ setting_id_internal setting_value_internal <<<"$selected_constraint_internal"
+        [ "$launch_exact_version" = - ] && macos_setting_value_valid "$setting_id_internal" "$setting_value_internal" || exit 75
+        current_internal=$(macos_setting_snapshot "$systemsetup_internal" "$setting_id_internal" \
+          "$claim/.setting.$$") || exit 75
+        /bin/rm -f "$claim/.setting.$$" || exit 75
+        fresh_internal=$(printf 'macos-setting|1|%s|%s|%s\n' "$setting_id_internal" "$current_internal" \
+          "$setting_value_internal" | sha256_stream) || exit 75
+        [ "$fresh_internal" = "$launch_precondition_digest" ] || exit 75
+        case $setting_id_internal in
+          timezone) native_arguments_internal=(-settimezone "$setting_value_internal") ;;
+          network-time-server) native_arguments_internal=(-setnetworktimeserver "$setting_value_internal") ;;
+          wake-on-network-access) native_arguments_internal=(-setwakeonnetworkaccess "$setting_value_internal") ;;
+          restart-after-power-failure) native_arguments_internal=(-setrestartpowerfailure "$setting_value_internal") ;;
+          computer-sleep)
+            native_setting_value=$setting_value_internal
+            [ "$native_setting_value" != Never ] || native_setting_value=off
+            native_arguments_internal=(-setcomputersleep "$native_setting_value")
+            ;;
+          display-sleep)
+            native_setting_value=$setting_value_internal
+            [ "$native_setting_value" != Never ] || native_setting_value=off
+            native_arguments_internal=(-setdisplaysleep "$native_setting_value")
+            ;;
+        esac
+        ;;
+      *) exit 75 ;;
+    esac
+  else
+    [ "$selected_context_internal" = posix-root-v1 ] && [ "$selected_state_internal" = enabled ] || exit 75
+    native_arguments_internal=(--quiet=2)
+    case $launch_action in
+      apt.update-metadata.v1)
+        [ "$launch_token" = - ] && [ "$launch_exact_version" = - ] || exit 75
+        native_arguments_internal+=(update)
+        ;;
+      apt.autoremove.v1)
+        [ "$launch_token" = - ] && [ "$launch_exact_version" = - ] || exit 75
+        native_arguments_internal+=(--yes autoremove)
+        ;;
+      apt.install-package-version.v1)
+        selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
+          '$1=="apt-install"&&$2=="apt.install-package-version.v1"&&$3==token{if(found++)exit 1;print}
+           END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
+        IFS='|' read -r _ _ _ package_internal _ exact_internal artifact_expected _ \
+          <<<"$selected_constraint_internal"
+        [ "$launch_exact_version" = "$exact_internal" ] && digest "$artifact_expected" || exit 75
+        artifact_internal=$generation_internal/apt/artifacts/$launch_token.deb
+        protected_file "$artifact_internal" 33554432 &&
+          [ "$(sha256_file "$artifact_internal")" = "$artifact_expected" ] || exit 75
+        native_arguments_internal+=(--yes --no-remove --no-install-recommends install "$artifact_internal")
+        ;;
+      apt.upgrade-package.v1)
+        selected_constraint_internal=$(/usr/bin/awk -F '|' -v token="$launch_token" \
+          '$1=="apt-upgrade"&&$2=="apt.upgrade-package.v1"&&$3==token{if(found++)exit 1;print}
+           END{if(found!=1)exit 1}' "$constraints_internal") || exit 75
+        IFS='|' read -r _ _ _ package_internal _ _ _ _ _ \
+          <<<"$selected_constraint_internal"
+        [[ $launch_exact_version =~ ^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$ ]] || exit 75
+        native_arguments_internal+=(--yes --no-remove --only-upgrade install "$package_internal=$launch_exact_version")
+        ;;
+      *) exit 75 ;;
+    esac
+  fi
   fixture_pause internal-before-effect || exit 74
   [ "$(/usr/bin/readlink "$active_link" 2>/dev/null)" = "$launch_target" ] &&
     [ ! -e "$state_root/draining" ] && [ "$(sha256_file "$launch_record")" = "$launch_digest" ] &&
     [ "$(sha256_file "$policy_internal")" = "$launch_policy_digest" ] &&
     [ "$(sha256_file "$constraints_internal")" = "$launch_constraints_digest" ] &&
-    [ "$(sha256_file "$apt_context_internal")" = "$launch_apt_context_digest" ] &&
+    [ "$(sha256_file "$platform_context_internal")" = "$launch_platform_context_digest" ] || exit 75
+  if [ "$broker_platform" = macos ]; then
+    [ "$(sha256_file "$installer_internal")" = "$installer_expected" ] &&
+      [ "$(sha256_file "$pkgutil_internal")" = "$pkgutil_expected" ] &&
+      [ "$(sha256_file "$systemsetup_internal")" = "$systemsetup_expected" ] || exit 75
+    case $launch_action in
+      macos.install-signed-pkg.v1)
+        scratch_internal=$claim/.macos-package-final.$$
+        inspect_macos_package "$pkgutil_internal" "$installer_internal" "$artifact_internal" "$scratch_internal" \
+          "$pkg_size_internal" "$artifact_expected" "$pkg_id_internal" "$pkg_version_internal" \
+          "$team_id_internal" "$signature_digest_internal" "$payload_mode_internal" || exit 75
+        /bin/rm -rf "$scratch_internal.expanded" "$scratch_internal.signature" "$scratch_internal.pkginfo" || exit 75
+        current_internal=$(macos_receipt_version "$pkgutil_internal" "$receipt_id_internal" "$claim/.receipt-final.$$") || exit 75
+        /bin/rm -f "$claim/.receipt-final.$$" || exit 75
+        fresh_internal=$(printf 'macos-pkg|2|%s|%s|%s|%s|%s|%s|%s|%s\n' "$launch_token" \
+          "$receipt_id_internal" "$current_internal" "$receipt_version_internal" "$artifact_expected" \
+          "$signature_digest_internal" "$team_id_internal" "$payload_mode_internal" | sha256_stream) || exit 75
+        [ "$fresh_internal" = "$launch_precondition_digest" ] || exit 75
+        exec /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+          "$installer_internal" "${native_arguments_internal[@]}"
+        ;;
+      macos.apply-system-setting.v1)
+        current_internal=$(macos_setting_snapshot "$systemsetup_internal" "$setting_id_internal" \
+          "$claim/.setting-final.$$") || exit 75
+        /bin/rm -f "$claim/.setting-final.$$" || exit 75
+        fresh_internal=$(printf 'macos-setting|1|%s|%s|%s\n' "$setting_id_internal" "$current_internal" \
+          "$setting_value_internal" | sha256_stream) || exit 75
+        [ "$fresh_internal" = "$launch_precondition_digest" ] || exit 75
+        exec /usr/bin/env -i HOME=/var/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+          "$systemsetup_internal" "${native_arguments_internal[@]}"
+        ;;
+    esac
+  else
     [ "$(sha256_file "$apt_get_internal")" = "$apt_get_expected" ] || exit 75
-  exec /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    DEBIAN_FRONTEND=noninteractive APT_CONFIG="$apt_config_internal" \
-    "$apt_get_internal" "${native_arguments_internal[@]}"
+    exec /usr/bin/env -i HOME=/root LC_ALL=C LANG=C TZ=UTC PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      DEBIAN_FRONTEND=noninteractive APT_CONFIG="$apt_config_internal" \
+      "$apt_get_internal" "${native_arguments_internal[@]}"
+  fi
 }
 
 if [ "$internal_launch" = true ]; then
@@ -556,9 +865,8 @@ token "$target_host_id" && uint "$target_uid" &&
   digest "$requested_broker_digest" && digest "$requested_policy_digest" &&
   digest "$requested_constraints_digest" && digest "$requested_precondition_digest" &&
   uint "$created_at" && uint "$expires_at" &&
-  [[ $transport = posix-ssh && $required_context = posix-root-v1 &&
-     $observed_execution_principal = root && $console_session_state = none &&
-     $platform_boundary = linux ]] &&
+  [[ $transport = posix-ssh && $observed_execution_principal = root &&
+     $console_session_state = none ]] &&
   token "$request_principal" && uint "$requested_epoch" && digest "$requested_context_digest" &&
   fingerprint "$pinned_host_key_fingerprint" && token "$node_id" &&
   [[ $fleet_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
@@ -572,12 +880,26 @@ case $action_id in
   broker.query-result.v1)
     [ "$policy_token" = - ] && [ "$requested_manager_identity" = not-applicable ] ||
       reject forbidden_action_parameter
+    if [ "$broker_platform" = macos ]; then
+      [ "$required_context" = macos-root-v1 ] && [ "$platform_boundary" = macos ] || reject invalid_request_value
+    else
+      [ "$required_context" = posix-root-v1 ] && [ "$platform_boundary" = linux ] || reject invalid_request_value
+    fi
     ;;
   apt.update-metadata.v1|apt.autoremove.v1)
+    [ "$broker_platform" = linux ] && [ "$required_context" = posix-root-v1 ] &&
+      [ "$platform_boundary" = linux ] || reject unknown_action
     [ "$policy_token" = - ] && [ "$requested_manager_identity" = not-applicable ] ||
       reject forbidden_action_parameter
     ;;
   apt.install-package-version.v1|apt.upgrade-package.v1)
+    [ "$broker_platform" = linux ] && [ "$required_context" = posix-root-v1 ] &&
+      [ "$platform_boundary" = linux ] || reject unknown_action
+    token "$policy_token" && digest "$requested_manager_identity" || reject invalid_policy_token
+    ;;
+  macos.install-signed-pkg.v1|macos.apply-system-setting.v1)
+    [ "$broker_platform" = macos ] && [ "$required_context" = macos-root-v1 ] &&
+      [ "$platform_boundary" = macos ] || reject unknown_action
     token "$policy_token" && digest "$requested_manager_identity" || reject invalid_policy_token
     ;;
   *) reject unknown_action ;;
@@ -963,10 +1285,16 @@ readonly context_canary=$generation/context.canary
 readonly host_identity=$generation/host.identity
 readonly apt_config=$generation/apt.conf
 readonly apt_context=$generation/apt.context
+readonly macos_context=$generation/macos.context
+if [ "$broker_platform" = macos ]; then platform_context=$macos_context
+else platform_context=$apt_context
+fi
+readonly platform_context
 for protected in "$policy" "$constraints" "$broker_digest_file" "$broker_version_file" \
-  "$ssh_keygen_digest_file" "$context_canary" "$host_identity" "$apt_config" "$apt_context"; do
+  "$ssh_keygen_digest_file" "$context_canary" "$host_identity" "$platform_context"; do
   protected_file "$protected" 65536 || reject protected_file_drift
 done
+if [ "$broker_platform" = linux ]; then protected_file "$apt_config" 65536 || reject protected_file_drift; fi
 protected_file "$trust_root/fleet-ca.pub" 8192 &&
   protected_file "$trust_root/allowed_signers" 16384 &&
   protected_file "$trust_root/revoked.krl" 1048576 || reject trust_state_drift
@@ -1013,6 +1341,8 @@ fi
     expected["apt.install-package-version.v1"]="posix-root-v1|package-source-version-closure-set-sha256"
     expected["apt.update-metadata.v1"]="posix-root-v1|none"
     expected["apt.upgrade-package.v1"]="posix-root-v1|package-source-channel-set-sha256"
+    expected["macos.apply-system-setting.v1"]="macos-root-v1|macos-system-setting-sha256"
+    expected["macos.install-signed-pkg.v1"]="macos-root-v1|macos-signed-pkg-sha256"
     expected["profile.apply-managed-bundle.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
     expected["profile.inventory-managed-state.v1"]="windows-user-s4u-v1|profile-bundle-set-sha256"
     expected["winget.install-machine-package.v1"]="windows-system-v1|winget-package-version-set-sha256"
@@ -1029,7 +1359,7 @@ fi
     if (previous!="" && previous >= $2) exit 1
     previous=$2
   }
-  END { if (NR!=10) exit 1; for (id in expected) if (!seen[id]) exit 1 }
+  END { if (NR!=12) exit 1; for (id in expected) if (!seen[id]) exit 1 }
 ' "$policy" || reject invalid_protected_policy
 
 /usr/bin/awk -F '|' -v policy_digest="$actual_policy_digest" '
@@ -1038,6 +1368,14 @@ fi
   function digest(v){return length(v)==64 && v~/^[0-9a-f]+$/}
   function version(v){return v~/^[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}$/}
   function uint(v){return v~/^(0|[1-9][0-9]*)$/ && (v+0)<=2147483647}
+  function package_id(v){return v~/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/}
+  function setting_value(id,v) {
+    if(id=="timezone")return v~/^[A-Za-z0-9._+-]+(\/[A-Za-z0-9._+-]+){0,2}$/&&length(v)<=255
+    if(id=="network-time-server")return v~/^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/&&v!~/\.\./
+    if(id=="wake-on-network-access"||id=="restart-after-power-failure")return v=="on"||v=="off"
+    if(id=="computer-sleep"||id=="display-sleep")return v=="Never"||(v~/^[1-9][0-9]{0,2}$/&&(v+0)<=180)
+    return 0
+  }
   $0 !~ /^[ -~]+$/ || length($0)>2048 { exit 1 }
   NR==1 {
     if (NF!=4 || $1!="constraints" || $2!="1" ||
@@ -1058,6 +1396,17 @@ fi
   $1=="apt-upgrade" {
     if (NF!=9 || $2!="apt.upgrade-package.v1" || !token($3) || !atom($4) ||
         !atom($5) || !version($6) || !version($7) || !uint($8) || !digest($9)) exit 1
+    next
+  }
+  $1=="macos-pkg" {
+    if (NF!=12 || $2!="macos.install-signed-pkg.v1" || !token($3) ||
+        ($4!="script-free" && $4!="sealed-cask-payload-v1") || !uint($5) || $5=="0" ||
+        $5+0>2147483647 || !digest($6) || !package_id($7) || !version($8) ||
+        $9!~/^[A-Z0-9]{10}$/ || !digest($10) || !package_id($11) || !version($12)) exit 1
+    next
+  }
+  $1=="macos-setting" {
+    if (NF!=5 || $2!="macos.apply-system-setting.v1" || !token($3) || !setting_value($4,$5)) exit 1
     next
   }
   $1=="profile" {
@@ -1091,19 +1440,22 @@ IFS='|' read -r identity_type identity_version protected_host_id protected_uid \
   protected_host_fingerprint endpoint_principals <"$host_identity" || reject invalid_host_identity
 [ "$identity_type" = identity ] && [ "$identity_version" = 1 ] &&
   token "$protected_host_id" && uint "$protected_uid" && token "$protected_principal" &&
-  [ "$protected_domain" = "$fleet_domain" ] && fingerprint "$protected_ca_fingerprint" &&
+  [[ $protected_domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$ ]] &&
+  fingerprint "$protected_ca_fingerprint" &&
   uint "$protected_ca_generation" && fingerprint "$protected_host_fingerprint" &&
-  [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] &&
-  [ "$target_host_id" = "$protected_host_id" ] && [ "$target_uid" = "$protected_uid" ] &&
-  [ "$request_principal" = "$protected_principal" ] &&
-  [ "$requested_ca_fingerprint" = "$protected_ca_fingerprint" ] &&
-  [ "$requested_ca_generation" = "$protected_ca_generation" ] &&
-  [ "$pinned_host_key_fingerprint" = "$protected_host_fingerprint" ] || reject host_identity_mismatch
+  [ "$endpoint_principals" = machine-utilities-posix,machine-utilities-windows ] || reject invalid_host_identity
 
 if [ "$fixture_mode" = false ]; then caller_uid=${SUDO_UID:-}
 else caller_uid=$(/usr/bin/id -u)
 fi
 [ "$caller_uid" = "$protected_uid" ] || reject caller_uid_mismatch
+
+[ "$protected_domain" = "$fleet_domain" ] &&
+  [ "$target_host_id" = "$protected_host_id" ] && [ "$target_uid" = "$protected_uid" ] &&
+  [ "$request_principal" = "$protected_principal" ] &&
+  [ "$requested_ca_fingerprint" = "$protected_ca_fingerprint" ] &&
+  [ "$requested_ca_generation" = "$protected_ca_generation" ] &&
+  [ "$pinned_host_key_fingerprint" = "$protected_host_fingerprint" ] || reject host_identity_mismatch
 
 now=$($date_tool -u +%s)
 uint "$now" && [ "$created_at" -le "$now" ] && [ "$expires_at" -gt "$now" ] &&
@@ -1203,7 +1555,7 @@ policy_record=$(/usr/bin/awk -F '|' -v action="$action_id" '$1=="action"&&$2==ac
 IFS='|' read -r _ selected_action selected_context selected_state constraint_kind constraint_digest <<EOF
 $policy_record
 EOF
-[ "$selected_action" = "$action_id" ] && [ "$selected_context" = posix-root-v1 ] &&
+[ "$selected_action" = "$action_id" ] && [ "$selected_context" = "$required_context" ] &&
   [ "$selected_state" = enabled ] || reject action_not_enabled
 
 package_id=-
@@ -1214,6 +1566,16 @@ maximum_version=-
 major_ceiling=-
 artifact_digest=-
 closure_digest=-
+pkg_size=-
+pkg_id=-
+pkg_version=-
+team_id=-
+signature_identity_digest=-
+receipt_id=-
+receipt_version=-
+payload_mode=-
+setting_id=-
+setting_value=-
 case $action_id in
   apt.update-metadata.v1)
     ;;
@@ -1236,6 +1598,24 @@ EOF
     [ -n "$package_id" ] || reject policy_token_not_found
     exact_version=$maximum_version
     ;;
+  macos.install-signed-pkg.v1)
+    selected_constraint=$(/usr/bin/awk -F '|' -v token="$policy_token" \
+      '$1=="macos-pkg"&&$2=="macos.install-signed-pkg.v1"&&$3==token{print;exit}' "$constraints")
+    IFS='|' read -r _ _ _ payload_mode pkg_size artifact_digest pkg_id pkg_version team_id \
+      signature_identity_digest receipt_id receipt_version <<EOF
+$selected_constraint
+EOF
+    [ -n "$pkg_id" ] && macos_pkg_payload_mode_valid "$payload_mode" || reject policy_token_not_found
+    exact_version=$receipt_version
+    ;;
+  macos.apply-system-setting.v1)
+    selected_constraint=$(/usr/bin/awk -F '|' -v token="$policy_token" \
+      '$1=="macos-setting"&&$2=="macos.apply-system-setting.v1"&&$3==token{print;exit}' "$constraints")
+    IFS='|' read -r _ _ _ setting_id setting_value <<EOF
+$selected_constraint
+EOF
+    [ -n "$setting_id" ] && macos_setting_value_valid "$setting_id" "$setting_value" || reject policy_token_not_found
+    ;;
 esac
 if [ "$constraint_kind" = none ]; then
   [ "$constraint_digest" = - ] && [ "$requested_manager_identity" = not-applicable ] ||
@@ -1246,6 +1626,7 @@ fi
 
 # Validate every constraint group, not only the selected token.
 for grouped_action in apt.install-package-version.v1 apt.upgrade-package.v1 \
+  macos.apply-system-setting.v1 macos.install-signed-pkg.v1 \
   profile.apply-managed-bundle.v1 profile.inventory-managed-state.v1 \
   winget.install-machine-package.v1 winget.upgrade-machine-package.v1; do
   /usr/bin/awk -F '|' -v action="$grouped_action" 'NR>1 &&
@@ -1261,6 +1642,7 @@ for grouped_action in apt.install-package-version.v1 apt.upgrade-package.v1 \
   fi
 done
 
+if [ "$broker_platform" = linux ]; then
 # The generation owns the complete APT configuration. The protected context
 # attests both the complete canonical `apt-config dump` and every executable or
 # directory through which APT can dispatch privileged work.
@@ -1828,7 +2210,7 @@ Architecture: $apt_architecture" ] || return 1
 compute_preflight || reject apt_precondition_unavailable
 [ "$fresh_precondition_digest" = "$requested_precondition_digest" ] || reject precondition_drift
 sealed_precondition_digest=$fresh_precondition_digest
-sealed_apt_context_digest=$(sha256_file "$apt_context") || reject apt_context_digest_unavailable
+sealed_platform_context_digest=$(sha256_file "$apt_context") || reject apt_context_digest_unavailable
 
 revalidate_execution_snapshot() {
   local revalidated_target revalidated_dump
@@ -1842,7 +2224,7 @@ revalidate_execution_snapshot() {
   [ "$(sha256_file "$policy")" = "$actual_policy_digest" ] &&
     [ "$(sha256_file "$constraints")" = "$actual_constraints_digest" ] &&
     [ "$(sha256_file "$context_canary")" = "$actual_context_digest" ] &&
-    [ "$(sha256_file "$apt_context")" = "$sealed_apt_context_digest" ] &&
+    [ "$(sha256_file "$apt_context")" = "$sealed_platform_context_digest" ] &&
     [ "$(sha256_file "$apt_config")" = "$apt_config_digest" ] || return 1
   validate_apt_source_authority "$generation" "$generation" || return 1
   [ "$(path_set_digest source-main "$generation/apt/sources.list" source-parts "$generation/apt/sources.list.d")" = "$sources_digest" ] &&
@@ -1869,15 +2251,106 @@ revalidate_execution_snapshot() {
   compute_preflight && [ "$fresh_precondition_digest" = "$sealed_precondition_digest" ] &&
     [ "$fresh_precondition_digest" = "$requested_precondition_digest" ]
 }
+else
+  readonly installer_path=$root_prefix/usr/sbin/installer
+  readonly pkgutil_path=$root_prefix/usr/sbin/pkgutil
+  readonly pmset_path=$root_prefix/usr/bin/pmset
+  readonly systemsetup_path=$root_prefix/usr/sbin/systemsetup
+  /usr/bin/awk -F '|' '
+    NR==1{if($0!="macos-context|1")exit 1;next}
+    NR>=2&&NR<=5{if(NF!=3||$1!="binary"||$2!~/^(installer|pkgutil|pmset|systemsetup)$/||
+      length($3)!=64||$3!~/^[0-9a-f]+$/||seen[$2]++||(previous!=""&&previous>=$2))exit 1;previous=$2;next}
+    {exit 1} END{if(NR!=5||!seen["installer"]||!seen["pkgutil"]||!seen["pmset"]||!seen["systemsetup"])exit 1}
+  ' "$macos_context" || reject invalid_macos_context
+  installer_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="installer"{print $3}' "$macos_context")
+  pkgutil_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pkgutil"{print $3}' "$macos_context")
+  pmset_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="pmset"{print $3}' "$macos_context")
+  systemsetup_digest=$(/usr/bin/awk -F '|' '$1=="binary"&&$2=="systemsetup"{print $3}' "$macos_context")
+  for dependency in "$installer_path" "$pkgutil_path" "$pmset_path" "$systemsetup_path"; do
+    protected_file "$dependency" 33554432 && [ -x "$dependency" ] || reject macos_dependency_drift
+  done
+  [ "$(sha256_file "$installer_path")" = "$installer_digest" ] &&
+    [ "$(sha256_file "$pkgutil_path")" = "$pkgutil_digest" ] &&
+    [ "$(sha256_file "$pmset_path")" = "$pmset_digest" ] &&
+    [ "$(sha256_file "$systemsetup_path")" = "$systemsetup_digest" ] || reject macos_dependency_drift
+
+  metadata_digest=-
+  pre_state_digest=-
+  post_state_digest=-
+  autoremove_pre_digest=-
+  autoremove_post_digest=-
+  artifact_path=-
+  fresh_precondition_digest=-
+  closure_members_digest=-
+  macos_current_value=-
+
+  compute_preflight() {
+    local scratch
+    case $action_id in
+      macos.install-signed-pkg.v1)
+        artifact_path=$generation/macos/packages/$policy_token.pkg
+        scratch=$policy_group_tmp/macos.package
+        inspect_macos_package "$pkgutil_path" "$installer_path" "$artifact_path" "$scratch" \
+          "$pkg_size" "$artifact_digest" "$pkg_id" "$pkg_version" "$team_id" \
+          "$signature_identity_digest" "$payload_mode" || return 1
+        /bin/rm -rf "$scratch.expanded" "$scratch.signature" "$scratch.pkginfo" || return 1
+        macos_current_value=$(macos_receipt_version "$pkgutil_path" "$receipt_id" \
+          "$policy_group_tmp/macos.receipt") || return 1
+        metadata_digest=$(printf 'macos-package|2|%s|%s|%s|%s|%s\n' "$pkg_id" "$pkg_version" \
+          "$team_id" "$signature_identity_digest" "$payload_mode" | sha256_stream) || return 1
+        pre_state_digest=$(printf 'macos-receipt|1|%s|%s\n' "$receipt_id" "$macos_current_value" |
+          sha256_stream) || return 1
+        fresh_precondition_digest=$(printf 'macos-pkg|2|%s|%s|%s|%s|%s|%s|%s|%s\n' "$policy_token" \
+          "$receipt_id" "$macos_current_value" "$receipt_version" "$artifact_digest" \
+          "$signature_identity_digest" "$team_id" "$payload_mode" | sha256_stream) || return 1
+        ;;
+      macos.apply-system-setting.v1)
+        macos_current_value=$(macos_setting_snapshot "$systemsetup_path" "$setting_id" \
+          "$policy_group_tmp/macos.setting") || return 1
+        pre_state_digest=$(printf 'macos-setting-state|1|%s|%s\n' "$setting_id" "$macos_current_value" |
+          sha256_stream) || return 1
+        fresh_precondition_digest=$(printf 'macos-setting|1|%s|%s|%s\n' "$setting_id" \
+          "$macos_current_value" "$setting_value" | sha256_stream) || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  compute_preflight || reject macos_precondition_unavailable
+  [ "$fresh_precondition_digest" = "$requested_precondition_digest" ] || reject precondition_drift
+  sealed_precondition_digest=$fresh_precondition_digest
+  sealed_platform_context_digest=$(sha256_file "$macos_context") || reject macos_context_digest_unavailable
+
+  revalidate_execution_snapshot() {
+    local revalidated_target
+    [ ! -e "$state_root/draining" ] && [ -L "$active_link" ] || return 1
+    revalidated_target=$(/usr/bin/readlink "$active_link") || return 1
+    [ "$revalidated_target" = "$active_target" ] && protected_directory "$generation" &&
+      protected_file "$policy" 65536 && protected_file "$constraints" 65536 &&
+      protected_file "$macos_context" 65536 || return 1
+    [ "$(sha256_file "$policy")" = "$actual_policy_digest" ] &&
+      [ "$(sha256_file "$constraints")" = "$actual_constraints_digest" ] &&
+      [ "$(sha256_file "$context_canary")" = "$actual_context_digest" ] &&
+      [ "$(sha256_file "$macos_context")" = "$sealed_platform_context_digest" ] &&
+      [ "$(sha256_file "$installer_path")" = "$installer_digest" ] &&
+      [ "$(sha256_file "$pkgutil_path")" = "$pkgutil_digest" ] &&
+      [ "$(sha256_file "$pmset_path")" = "$pmset_digest" ] &&
+      [ "$(sha256_file "$systemsetup_path")" = "$systemsetup_digest" ] || return 1
+    compute_preflight && [ "$fresh_precondition_digest" = "$sealed_precondition_digest" ] &&
+      [ "$fresh_precondition_digest" = "$requested_precondition_digest" ]
+  }
+fi
 
 request_digest=$(sha256_file "$request_tmp") || reject request_digest_unavailable 74
 certificate_digest=$(sha256_file "$certificate_tmp") || reject certificate_digest_unavailable 74
 signature_digest=$(sha256_file "$signature_tmp") || reject signature_digest_unavailable 74
 source_addresses_digest=$(printf '%s\n' "$requested_source_addresses" | sha256_stream) ||
   reject request_digest_unavailable 74
-action_evidence_digest=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+action_evidence_digest=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
   "$action_id" "$policy_token" "$constraint_kind" "$package_id" "$source_id" "$exact_version" \
-  "$minimum_version" "$maximum_version" "$major_ceiling" "$requested_manager_identity" | sha256_stream) ||
+  "$minimum_version" "$maximum_version" "$major_ceiling" "$requested_manager_identity" \
+  "$pkg_size" "$pkg_id" "$pkg_version" "$team_id" "$signature_identity_digest" "$receipt_id" \
+  "$receipt_version" "$payload_mode" "$setting_id" "$setting_value" | sha256_stream) ||
   reject action_evidence_unavailable 74
 closure_members_digest=${closure_members_digest:--}
 
@@ -2218,8 +2691,8 @@ launch_record_tmp=$claim_directory/.launch.record.$$
     "$request_id" "$action_id" "$policy_token"
   printf 'generation-target|%s\nenrollment-epoch|%s\nbroker-sha256|%s\n' \
     "$active_target" "$active_epoch" "$actual_broker_digest"
-  printf 'policy-sha256|%s\nconstraints-sha256|%s\napt-context-sha256|%s\n' \
-    "$actual_policy_digest" "$actual_constraints_digest" "$sealed_apt_context_digest"
+  printf 'policy-sha256|%s\nconstraints-sha256|%s\nplatform-context-sha256|%s\n' \
+    "$actual_policy_digest" "$actual_constraints_digest" "$sealed_platform_context_digest"
   printf 'precondition-sha256|%s\naction-evidence-sha256|%s\nexact-version|%s\ngate-sha256|%s\nend-launch|\n' \
     "$sealed_precondition_digest" "$action_evidence_digest" "$exact_version" "$gate_digest"
 } >"$launch_record_tmp" && /bin/chmod 0600 "$launch_record_tmp" &&
@@ -2235,8 +2708,16 @@ launch_guard_open=true
 # The child opens its own read-only descriptor while its inherited guard keeps
 # the FIFO open. It then closes the guard, so parent death always produces EOF;
 # the child never retains a writer that can strand it before the effect gate.
-"$setsid_path" "$broker_path" --internal-launch-v1 "$request_id" \
-  9<"$launch_gate" 8>&- &
+if [ "$broker_platform" = macos ]; then
+  # Bash monitor mode gives the fixed launcher its own process group on Darwin,
+  # where util-linux setsid is not a native system dependency.
+  set -m
+  "$broker_path" --internal-launch-v1 "$request_id" 9<"$launch_gate" 8>&- &
+  set +m
+else
+  "$setsid_path" "$broker_path" --internal-launch-v1 "$request_id" \
+    9<"$launch_gate" 8>&- &
+fi
 native_pid=$!
 native_pgid=$native_pid
 native_started=true
@@ -2354,6 +2835,26 @@ case $action_id in
     if [ "$post_reason" = post_state_verified ]; then
       post_state_digest=$(printf 'package-closure|2|%s|%s|%s\n' "$package_id" "$installed_after" \
         "$closure_members_digest" | sha256_stream)
+    fi
+    ;;
+  macos.install-signed-pkg.v1)
+    installed_after=$(macos_receipt_version "$pkgutil_path" "$receipt_id" \
+      "$policy_group_tmp/macos.receipt.post") || post_reason=package_post_state_unavailable
+    [ "$post_reason" != post_state_verified ] || [ "$installed_after" = "$receipt_version" ] ||
+      post_reason=package_post_state_mismatch
+    if [ "$post_reason" = post_state_verified ]; then
+      post_state_digest=$(printf 'macos-receipt|2|%s|%s|%s\n' "$receipt_id" "$installed_after" "$payload_mode" |
+        sha256_stream)
+    fi
+    ;;
+  macos.apply-system-setting.v1)
+    setting_after=$(macos_setting_snapshot "$systemsetup_path" "$setting_id" \
+      "$policy_group_tmp/macos.setting.post") || post_reason=setting_post_state_unavailable
+    [ "$post_reason" != post_state_verified ] || [ "$setting_after" = "$setting_value" ] ||
+      post_reason=setting_post_state_mismatch
+    if [ "$post_reason" = post_state_verified ]; then
+      post_state_digest=$(printf 'macos-setting-state|1|%s|%s\n' "$setting_id" "$setting_after" |
+        sha256_stream)
     fi
     ;;
 esac
