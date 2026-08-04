@@ -142,7 +142,7 @@ safe_permissions() {
 
 no_extended_acl() {
   local candidate=$1 listing
-  if [ "$platform" = macos ] || [ "$(/usr/bin/uname -s)" = Darwin ]; then
+  if [ "$(/usr/bin/uname -s)" = Darwin ]; then
     listing=$(/bin/ls -lde "$candidate" 2>/dev/null) || return 1
     [ "$(printf '%s\n' "$listing" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" -eq 1 ]
   elif [ -x /usr/bin/getfacl ]; then
