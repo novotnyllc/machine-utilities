@@ -2,11 +2,11 @@
   "files": [
     {
       "path": ".claude-plugin/plugin.json",
-      "sha256": "0697bbbf8f6b0071c7d731e2e23a234d0246f2e800e49c86ad7a06b198bf86fc"
+      "sha256": "f2372bf02c27ff569ece728adc7ef86186c19908a3d1cc4a30036358eae48805"
     },
     {
       "path": ".codex-plugin/plugin.json",
-      "sha256": "72843632c5e977a2cddf55edce38c15c5e27d7955a75982597d17f064dadf1b4"
+      "sha256": "43d2277dc78953c6b2025d2c8673d7c61d19e46c6d4bfb53677da9f8972a9f4e"
     },
     {
       "path": "scripts/apply-windows.ps1",
@@ -29,5 +29,5 @@
   "plugin": "machine-utilities",
   "schema": "machine-utilities.integrity",
   "schema_version": 1,
-  "version": "0.2.13"
+  "version": "0.2.14"
 }
