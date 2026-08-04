@@ -1926,6 +1926,7 @@ self_test() {
   local background_pids='' fixture_pid
   root=$(private_temp_directory) || return 1
   trap 'for fixture_pid in ${background_pids:-}; do /bin/kill -KILL "$fixture_pid" >/dev/null 2>&1 || :; wait "$fixture_pid" 2>/dev/null || :; done; if [ -n "${agent_pid:-}" ]; then /bin/kill "$agent_pid" >/dev/null 2>&1 || :; wait "$agent_pid" 2>/dev/null || :; fi; /usr/bin/find "$root" -depth -delete >/dev/null 2>&1 || :' RETURN
+  trap 'self_test_rc=$?; printf "FAIL: certify-ssh-node self-test line %s rc %s\n" "$LINENO" "$self_test_rc" >&2' ERR
 
   # The claim primitive must never reinterpret an existing destination as a
   # container.  Exercise real and symlinked directories, then race two exact
@@ -2552,6 +2553,7 @@ self_test() {
   fixture_receipt_path=
   fixture_helper_path=
   /usr/bin/find "$root" -depth -delete || return 1
+  trap - ERR
   trap - RETURN
   printf '%s\n' 'PASS: certify-ssh-node fixture-safe self-check'
 }
