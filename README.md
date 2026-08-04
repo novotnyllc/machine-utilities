@@ -81,6 +81,8 @@ plugins/machine-utilities/scripts/machine-utilities executor-status executor.jso
 plugins/machine-utilities/scripts/machine-utilities verify-executor executor.json
 plugins/machine-utilities/scripts/machine-utilities privilege-status HOST privilege-status.jsonl
 plugins/machine-utilities/scripts/machine-utilities prepare-privilege-enrollment HOST enrollment.json
+plugins/machine-utilities/scripts/machine-utilities prepare-privilege-identity HOST identity.json
+plugins/machine-utilities/scripts/machine-utilities profile-bundle HOST bundle.json
 plugins/machine-utilities/scripts/machine-utilities worker-config HOST DOMAIN worker-config.json
 plugins/machine-utilities/scripts/machine-utilities collect --target local --section all --output snapshot.jsonl
 plugins/machine-utilities/scripts/machine-utilities validate snapshot.jsonl
@@ -145,6 +147,17 @@ upgrade/revocation previews are inert: the agent stops at the owner's local
 password or UAC boundary and never requests or relays an elevation credential.
 WSL has no protected root boundary and reports `unsupported_security_boundary`
 without fallback. Result lookup is read-only and never resubmits a request.
+
+The current V1 broker map is deliberately small: Linux runs fixed APT actions
+through the root broker; macOS keeps Homebrew and Caskroom under the ordinary
+user and uses the enrolled typed broker only to prepare an exact existing app
+bundle or sealed package payload (including generic casks such as Visual
+Studio Code); native Windows runs machine WinGet through LocalSystem using the
+pinned, signed official `Microsoft.WinGet.Client` PowerShell module (1.29.280).
+The repository self-checks these contracts and policy parsers locally. Real
+root-owned macOS bundle preparation and logged-off LocalSystem WinGet remain
+native canaries requiring a recoverable host and interactive human enrollment;
+they are not implied by fixture or CI results.
 
 Release integrity proves plugin source bytes. It does not prove or mutate the
 separately installed root-/Administrator-owned broker generation, policy,

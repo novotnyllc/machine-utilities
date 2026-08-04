@@ -93,7 +93,10 @@ protected generation and native-canary receipts separately.
 
 On Linux, preview the privilege broker and POSIX SSH transport, then complete
 their local passworded-sudo ceremonies. macOS may enroll the bounded ordinary
-dispatcher but has no cataloged unattended root action. WSL always reports
+dispatcher and, after local human activation, its two cataloged root actions:
+`macos.install-signed-pkg.v1` and `macos.apply-system-setting.v1`. The former
+can prepare an enrolled exact app bundle/package payload; it never grants root
+Homebrew or arbitrary sudo. WSL always reports
 `unsupported_security_boundary`; never install a broker in a distribution or
 fall back through Windows, a shell, or an interactive task.
 

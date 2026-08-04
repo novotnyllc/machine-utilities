@@ -93,6 +93,15 @@ current protected local projections are required together. Because U6 v1 does
 not publish native-canary evidence digests, the public files are not portable
 cryptographic proof and cannot be trusted after copying them off the Windows
 target.
+
+Local self-tests and fixtures verify the shared schemas, closed dispatch,
+policy matching, request bounds, and negative security cases. They do not prove
+native ownership, task/SYSTEM behavior, interactive elevation, or package
+manager behavior. Those claims require recoverable-host canaries: Linux
+`visudo`/root execution, macOS human enrollment plus app-bundle/package
+preparation, and native Windows LocalSystem WinGet with the pinned signed
+`Microsoft.WinGet.Client` module. Enrollment and policy activation always stop
+at the owner's local password or UAC boundary; no remote or WSL fallback exists.
 Upgrade and normal revocation enter draining, reject new submissions, preserve
 result lookup, and wait for terminal evidence before changing the adapter
 grant. Emergency revocation may trade reachability for explicit partial/stale
@@ -209,7 +218,8 @@ reconciles each configured manager using its native semantics:
 - Homebrew: `brew update`, outdated plan, selected or full upgrade
 - APT: metadata refresh, upgradable plan, selected or normal upgrade
 - Linuxbrew: Homebrew behavior on configured Linux/WSL hosts
-- winget: source refresh, upgrade plan, selected or all upgrade
+- winget: source refresh and bounded protected package install/upgrade actions;
+  protected execution never means all-packages or caller-selected commands
 
 The default is a plan. Applying updates requires an explicit request and may
 target a machine/group, manager, package, or package set. Cleanup, autoremove,
