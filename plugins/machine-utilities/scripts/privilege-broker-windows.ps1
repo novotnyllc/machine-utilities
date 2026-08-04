@@ -4590,13 +4590,22 @@ function Invoke-SelfTest {
                 "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
                 '[Console]::Write([string]$env:HTTP_PROXY)') ([byte[]]@()) 128 10000
             if ($EnvironmentResult.Bytes.Count -ne 0) { throw "fixed environment self-test failed" }
-            $TimeoutRejected = $false
-            try {
-                [void](Invoke-FixedProcess $PwshPath @(
-                    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 5") `
-                    ([byte[]]@()) 128 100)
-            } catch { $TimeoutRejected = $_.Exception.Message -eq "native_process_timeout" }
-            if (-not $TimeoutRejected) { throw "contained timeout self-test failed" }
+            if ($IsWindows) {
+                $TimeoutResult = Invoke-FixedProcess $PwshPath @(
+                    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 1") `
+                    ([byte[]]@()) 128 100
+                if (-not $TimeoutResult.RecoveryThresholdExceeded -or $TimeoutResult.ExitCode -ne 0) {
+                    throw "contained recovery self-test failed"
+                }
+            } else {
+                $TimeoutRejected = $false
+                try {
+                    [void](Invoke-FixedProcess $PwshPath @(
+                        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 1") `
+                        ([byte[]]@()) 128 100)
+                } catch { $TimeoutRejected = $_.Exception.Message -eq "native_process_timeout" }
+                if (-not $TimeoutRejected) { throw "contained timeout self-test failed" }
+            }
         } finally { [Environment]::SetEnvironmentVariable("HTTP_PROXY", $SavedProxy, "Process") }
 
         $BadCommit = @($CommitLines); $BadCommit[2] = "request-length|1"
