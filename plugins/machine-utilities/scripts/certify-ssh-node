@@ -723,7 +723,7 @@ process_executable() {
       else
         return 1
       fi
-      if ! candidate=$($readlink_binary "/proc/$pid/exe" 2>&1); then
+      if ! candidate=$($readlink_binary --verbose "/proc/$pid/exe" 2>&1); then
         case $candidate in *': Permission denied'|*': Operation not permitted') ;; *) return 1 ;; esac
         [ -n "${agent_peer_executable-}" ] || return 1
         mode=$(file_mode "$agent_peer_executable") || return 1
