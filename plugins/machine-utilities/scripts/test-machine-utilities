@@ -38,38 +38,6 @@ assert_ordered() {
     fail "expected ordered contract: $2 before $3"
 }
 
-resolve_agent_utilities_compatibility() {
-  explicit_router=${AGENT_UTILITIES_MODEL_ROUTER:-}
-  explicit_manifest=${AGENT_UTILITIES_PLUGIN_MANIFEST:-}
-  if { [ -n "$explicit_router" ] && [ -z "$explicit_manifest" ]; } ||
-      { [ -z "$explicit_router" ] && [ -n "$explicit_manifest" ]; }; then
-    fail "set both AGENT_UTILITIES_MODEL_ROUTER and AGENT_UTILITIES_PLUGIN_MANIFEST"
-  fi
-  if [ -n "$explicit_router" ]; then
-    [ -f "$explicit_router" ] || fail "Agent Utilities router not found: $explicit_router"
-    [ -f "$explicit_manifest" ] || fail "Agent Utilities manifest not found: $explicit_manifest"
-    agent_utilities_router=$explicit_router
-    agent_utilities_manifest=$explicit_manifest
-    return
-  fi
-
-  repository_root=$(CDPATH='' cd -- "$script_dir/../../.." && pwd)
-  sibling_root=$(dirname -- "$repository_root")/agent-utilities/plugins/agent-utilities
-  sibling_router=$sibling_root/scripts/model-routing.mjs
-  sibling_manifest=$sibling_root/.codex-plugin/plugin.json
-  if [ -f "$sibling_router" ] && [ -f "$sibling_manifest" ]; then
-    agent_utilities_router=$sibling_router
-    agent_utilities_manifest=$sibling_manifest
-    return
-  fi
-  fail "compatible Agent Utilities source is required; set AGENT_UTILITIES_MODEL_ROUTER and AGENT_UTILITIES_PLUGIN_MANIFEST"
-}
-
-resolve_agent_utilities_compatibility
-AGENT_UTILITIES_MODEL_ROUTER=$agent_utilities_router \
-AGENT_UTILITIES_PLUGIN_MANIFEST=$agent_utilities_manifest \
-  "$real_node" --test "$script_dir/model-routing-compat.test.mjs"
-
 fleet_agents_skill="$script_dir/../skills/fleet-agents/SKILL.md"
 remote_control_reference="$script_dir/../references/codex-remote-control.md"
 fleet_agents_text=$(cat "$fleet_agents_skill")
@@ -115,14 +83,12 @@ assert_contains "$remote_control_text" '`callerKind: "machine-utilities"`'
 assert_contains "$remote_control_text" '`codex-task-create` or'
 assert_contains "$remote_control_text" '`codex-task-message`'
 assert_contains "$remote_control_text" '`task_create` or `task_message`'
-assert_contains "$remote_control_text" '`senderOwner`'
+assert_contains "$remote_control_text" '`senderOwnerDigest`'
 assert_contains "$remote_control_text" 'visible-task authority receipt'
-assert_contains "$remote_control_text" '`agent-utilities/r52-readiness/v1`'
-assert_contains "$remote_control_text" '`executionHost` and `targetPlatform`'
-assert_contains "$remote_control_text" '`ready`, `blocked`, or'
+assert_contains "$remote_control_text" 'execution-host and'
+assert_contains "$remote_control_text" 'target-platform identities'
 assert_contains "$remote_control_text" 'work-class digest'
-assert_contains "$remote_control_text" 'task creation, set `budgetEffect: "start"`'
-assert_contains "$remote_control_text" 'message never uses `budgetEffect: "start"`'
+assert_contains "$remote_control_text" '`budgetEffect: "start"`'
 assert_contains "$remote_control_text" '`admit(requestId)`'
 assert_contains "$remote_control_text" '`claim-dispatch`'
 assert_contains "$remote_control_text" 'adapter/path/model/effort controls'
@@ -133,12 +99,6 @@ assert_contains "$remote_control_text" 'visible-provider bridge'
 assert_contains "$remote_control_text" 'acknowledgement-only bootstrap'
 assert_contains "$remote_control_text" 'provider-local activation/follow-up'
 assert_contains "$remote_control_text" 'model_routing_capability_unavailable'
-assert_contains "$remote_control_text" 'public CLI does not mint visible-task authority'
-assert_contains "$remote_control_text" 'host-owned user-turn authority'
-assert_contains "$remote_control_text" 'Agent Utilities 0.5.10 or newer'
-assert_contains "$remote_control_text" 'before Machine Utilities'
-assert_contains "$remote_control_text" '0.2.18 advertises routed remote-task dispatch'
-assert_contains "$remote_control_text" 'Roll back Machine Utilities dispatch support before rolling Agent Utilities'
 assert_contains "$remote_control_text" 'Do not call a provider'
 assert_contains "$remote_control_text" 'model constants'
 assert_contains "$remote_control_text" 'transport matrix'

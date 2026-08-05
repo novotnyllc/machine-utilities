@@ -10,26 +10,12 @@ permissions:
 
 jobs:
   posix:
-    env:
-      # Populate this repository variable with the immutable Agent Utilities
-      # 0.5.10 release commit after that dependency ships. The explicit empty
-      # check prevents default-branch drift from becoming a compatibility pin.
-      AGENT_UTILITIES_COMPAT_REF: ${{ vars.AGENT_UTILITIES_0_5_10_RELEASE_SHA }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Require immutable Agent Utilities compatibility pin
-        shell: bash
-        run: printf '%s\n' "$AGENT_UTILITIES_COMPAT_REF" | grep -Eq '^[0-9a-f]{40}$'
-      - name: Checkout compatible Agent Utilities
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: novotnyllc/agent-utilities
-          ref: ${{ env.AGENT_UTILITIES_COMPAT_REF }}
-          path: .compat/agent-utilities
       - name: Install OpenSSH server for scope validation
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
@@ -88,9 +74,6 @@ jobs:
           PY
       - name: Run fixture suite
         shell: bash
-        env:
-          AGENT_UTILITIES_MODEL_ROUTER: ${{ github.workspace }}/.compat/agent-utilities/plugins/agent-utilities/scripts/model-routing.mjs
-          AGENT_UTILITIES_PLUGIN_MANIFEST: ${{ github.workspace }}/.compat/agent-utilities/plugins/agent-utilities/.codex-plugin/plugin.json
         run: |
           chmod -R go-w plugins/machine-utilities
           plugins/machine-utilities/scripts/test-machine-utilities

@@ -44,61 +44,31 @@ compatible contract is absent, stop the affected Codex dispatch with
 `model_routing_capability_unavailable`; retain local/SSH evidence but never
 create an unbound task or omit model/effort controls.
 
-This integration requires released Agent Utilities 0.5.10 or newer. Release,
-publish, install, and verify Agent Utilities 0.5.10 before Machine Utilities
-0.2.18 advertises routed remote-task dispatch. The compatibility gate binds the
-router to its sibling Codex plugin manifest and rejects an older release even
-if a similarly named script is present. During rollback, dependency mismatch,
-or partial fleet rollout, block routed remote tasks with
-`model_routing_capability_unavailable`; do not fall back to an unrouted task.
-Roll back Machine Utilities dispatch support before rolling Agent Utilities
-below the compatible release.
-
 Machine Utilities remains the sole sender for its native remote actions and
 retains host/project matching, Windows-native execution, executor readiness,
 payload/chunk validation, and cleanup. The routing request is bounded,
 content-free policy metadata and includes:
 
-- `callerKind: "machine-utilities"`, a stable opaque `senderOwner`, unique
+- `callerKind: "machine-utilities"`, a stable `senderOwnerDigest`, unique
   request/action ID, `adapterId` (`codex-task-create` or
   `codex-task-message`), and `dispatchKind` (`task_create` or `task_message`);
-- one exact `r52` record with schema
-  `agent-utilities/r52-readiness/v1`: `hostReadiness`, `taskReadiness`, and
-  `transportReadiness` each contain only `state` (`ready`, `blocked`, or
-  `unknown`) plus an `evidenceDigest`; `executionHost` and `targetPlatform`
-  each contain only an opaque `identityDigest` plus platform (`darwin`,
-  `linux`, `windows`, `wsl`, or `unknown`). The router freezes this record and
-  owns carrier transport selection; never send host names, paths, commands,
-  profiles, prompts, or a caller transport assertion. All three readiness
-  facts must be `ready`; missing, `blocked`, or `unknown` readiness returns
-  `model_routing_capability_unavailable` before selection;
-- the bounded destination work-class digest and `workShape`, privacy/context
-  constraints, and standalone task/run budget scope or accepted orchestrator
-  lease;
+- the selected host/task/transport readiness, separate execution-host and
+  target-platform identities, exact carrier transport, bounded destination
+  work-class digest and `workShape`, privacy/context constraints, and the
+  standalone task/run budget scope or accepted orchestrator lease;
 - a one-use visible-task authority receipt for `task_create`. A user policy,
   catalog entry, prior task, or caller Boolean is not task authority; and
 - for `task_message`, the destination task identity, its resolver-owned prior
   route receipt with prior model/effort, and whether the bounded work class
   continues or changes.
 
-For a work-starting task creation, set `budgetEffect: "start"` and follow the
-returned sequence exactly: resolve, `admit(requestId)`,
+For a work-starting task creation or message, set `budgetEffect: "start"` and
+follow the returned sequence exactly: resolve, `admit(requestId)`,
 `claim-dispatch`, perform the native action, then reconcile the returned
 receipt. Pass the returned validated adapter/path/model/effort controls to the
 Codex task action verbatim. A missing/unselectable control, requested-versus-
 actual mismatch, or incompatible path uses only the resolver's disclosed
 fallback or blocks; never silently inherit or substitute a route.
-
-The ordinary public CLI does not mint visible-task authority and does not turn
-caller JSON into a terminal native receipt. The Machine Utilities host adapter
-must use the embedded router contract with its host-owned user-turn authority
-attestor and native app-tool receipt importer. If that fixed embedding is not
-available and verified on the execution host, return
-`model_routing_capability_unavailable` before task creation.
-
-An existing-task message never uses `budgetEffect: "start"`. It uses `none`
-for an attested non-expanding action or `adjust_active` for additional active
-work, with the resolver-owned prior-route binding described below.
 
 A status request, non-expanding clarification, cancellation, or narrowing that
 the adapter attests does not start work instead uses `budgetEffect: "none"` and
@@ -251,7 +221,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    integrity-verified release that predates this helper: after the marketplace
    upgrade, run exactly
    `codex plugin add machine-utilities@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.2.18` executor and integrity manifest before any
+   fresh task, and verify the `0.2.19` executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by
