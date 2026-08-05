@@ -11,9 +11,6 @@ This plugin has been split and retired.
   **[yardmaster](https://github.com/novotnyllc/yardmaster)**; craft skills in
   **[agent-utilities](https://github.com/novotnyllc/agent-utilities)**.
 
-Enrolled hosts keep the `machine-utilities` system namespace
-(`/usr/local/libexec/machine-utilities`, the sudoers broker,
-`/etc/machine-utilities/ssh`, `/var/lib/machine-utilities*`); roundhouse ships
-the same executor under its legacy name and documents the re-enrollment
-migration. History for everything that moved lives in this repository up to
-the retirement commit.
+Nothing retains this name: roundhouse's executor, namespaces, and config
+paths are all roundhouse-native. History for everything that moved lives in
+this repository up to the retirement commit.
