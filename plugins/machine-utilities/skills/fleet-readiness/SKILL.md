@@ -22,8 +22,13 @@ Orchestrator invokes this skill, retain the parent-assigned title.
   authentication repair.
 
 Let each routed skill retain its inventory, approval, mutation, and
-post-verification contract. Do not duplicate its commands or treat SSH command
-execution as a remote agent. A visible Codex task covers only ordinary native
+post-verification contract. Do not duplicate its commands or treat raw SSH
+command execution as a remote agent. Launching a destination-native harness
+worker over the configured SSH transport — for example a Claude Code
+`claude -p` child with its own session identity in a fleet-verified checkout,
+under `agent-utilities:task-orchestrator`'s placement contract — is agent
+dispatch, not raw command execution, and is the supported Claude Code
+placement lane. A visible Codex task covers only ordinary native
 Windows work. Protected or logged-off Windows work requires fresh
 `privilege_broker` readiness from the enrolled `windows-sftp` route; never
 substitute the visible task, WSL, or another transport.

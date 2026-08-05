@@ -221,7 +221,7 @@ provenance, conversions, ambiguous scope, and sealed-plan mutations.
    integrity-verified release that predates this helper: after the marketplace
    upgrade, run exactly
    `codex plugin add machine-utilities@novotnyllc --json`, end that task, start a
-   fresh task, and verify the `0.2.19` executor and integrity manifest before any
+   fresh task, and verify the `0.2.20` executor and integrity manifest before any
    other mutation. Never use raw add as a fallback for another plugin or once
    the helper is available. For Claude local or
    SSH use `claude plugin marketplace update novotnyllc` followed by
